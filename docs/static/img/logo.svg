@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Order Management">
+  <path d="M8 20l24-12 24 12v24l-24 12-24-12z" fill="none" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M8 20l24 12 24-12M32 32v24" stroke="currentColor" stroke-width="3" opacity="0.55" fill="none"/>
+  <circle cx="32" cy="26" r="5" fill="currentColor"/>
+</svg>
