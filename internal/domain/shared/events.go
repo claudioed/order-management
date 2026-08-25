@@ -137,3 +137,31 @@ type OrderCancelled struct {
 func NewOrderCancelled(occurredAt time.Time, orderID OrderId, revoked int) OrderCancelled {
 	return OrderCancelled{base: newBase("OrderCancelled", occurredAt), OrderID: orderID, RevokedReservations: revoked}
 }
+
+// OrderAllocationPartiallyFailed: AllocateOrder hit a hard (non-business,
+// non-409) failure partway through allocating an order's lines —
+// AllocatedLines were genuinely reserved upstream before the failure, and
+// RemainingLines are still Pending. The already-succeeded reservations ARE
+// kept — this is deliberate (see ADR-0003): discarding them would strand
+// real reservations inside inventory-storage that nothing in this context
+// could then revoke, and a subsequent AllocateOrder call safely resumes by
+// skipping the already-Allocated lines. This event exists purely so that
+// outcome is operationally visible, rather than only discoverable by
+// reading a source code comment.
+type OrderAllocationPartiallyFailed struct {
+	base
+	OrderID        OrderId
+	AllocatedLines int
+	RemainingLines int
+	// Cause is a short, safe-to-log description of the failure (the
+	// error's Error() string, defensively truncated) — never the full
+	// error internals or an upstream response body.
+	Cause string
+}
+
+func NewOrderAllocationPartiallyFailed(occurredAt time.Time, orderID OrderId, allocatedLines, remainingLines int, cause string) OrderAllocationPartiallyFailed {
+	return OrderAllocationPartiallyFailed{
+		base:    newBase("OrderAllocationPartiallyFailed", occurredAt),
+		OrderID: orderID, AllocatedLines: allocatedLines, RemainingLines: remainingLines, Cause: cause,
+	}
+}

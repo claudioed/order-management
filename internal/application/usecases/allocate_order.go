@@ -27,7 +27,10 @@ import (
 // referencing them (and so nothing able to revoke them). Lines still
 // Pending stay Pending, so simply calling AllocateOrder again resumes
 // where it stopped — already-allocated lines are skipped, which is exactly
-// the "cannot allocate the same line twice" invariant doing its job.
+// the "cannot allocate the same line twice" invariant doing its job. When
+// this happens, an OrderAllocationPartiallyFailed event is published so the
+// resulting partial state is operationally visible rather than only
+// discoverable by reading this comment.
 type AllocateOrder struct {
 	Orders    ports.OrderRepo
 	Inventory ports.InventoryReservationClient
@@ -54,6 +57,16 @@ func (uc *AllocateOrder) Execute(ctx context.Context, id shared.OrderId) (*order
 			if saveErr := uc.Orders.Save(ctx, o); saveErr != nil {
 				return nil, errors.Join(allocErr, saveErr)
 			}
+			// Best-effort visibility: a failure publishing this event
+			// must never mask or replace allocErr, the use case's real
+			// failure — it is joined in exactly like the saveErr case
+			// above so errors.Is(err, allocErr) still holds.
+			remaining := len(o.LinesWithStatus(order.LinePending))
+			if pubErr := uc.Events.Publish(ctx, shared.NewOrderAllocationPartiallyFailed(
+				uc.Clock.Now(), o.ID(), outcome.allocated, remaining, truncateCause(allocErr.Error()),
+			)); pubErr != nil {
+				return nil, errors.Join(allocErr, pubErr)
+			}
 		}
 		return nil, allocErr
 	}
@@ -72,6 +85,21 @@ func (uc *AllocateOrder) setPromiseDate(o *order.Order) {
 	if d, ok := uc.Promise.PromiseDate(uc.Clock.Now(), o); ok {
 		o.SetPromiseDate(d)
 	}
+}
+
+// maxCauseLen bounds OrderAllocationPartiallyFailed.Cause so a verbose
+// upstream error (or an accidentally-embedded response body) never turns a
+// visibility event into an unbounded log payload.
+const maxCauseLen = 500
+
+// truncateCause defensively bounds an error string for safe logging. It
+// never returns more than maxCauseLen runes.
+func truncateCause(s string) string {
+	r := []rune(s)
+	if len(r) <= maxCauseLen {
+		return s
+	}
+	return string(r[:maxCauseLen]) + "…"
 }
 
 // allocationOutcome counts what one allocation pass achieved.
