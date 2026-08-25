@@ -141,3 +141,23 @@ write path has to remember.
 - **A stuck backorder needs a human or a scheduler.** Nothing in v1 retries
   automatically; `RetryAllocation` is an explicit command. That is the honest
   v1 position, not an oversight.
+
+## Update (operational visibility for the partial-allocation-on-failure outcome)
+
+The "harder" consequence above — *"Partial progress after a hard failure is a
+state a reader must understand"* — was, until now, discoverable only by
+reading the code comment on `AllocateOrder`. The decision itself is
+unchanged: a hard failure mid-pass still persists whatever was genuinely
+reserved and still fails the call. What changed is that this outcome is now
+also a first-class fact: when `AllocateOrder` returns a hard failure after
+persisting at least one newly-allocated line, it publishes
+`OrderAllocationPartiallyFailed` (`AllocatedLines`, `RemainingLines`, and a
+truncated `Cause`) alongside the existing `OrderLineAllocated` events. This
+does not change the fail-closed/idempotent behaviour above — deleting/
+compensating the partial reservations was considered and rejected again here
+for the same reason as BR2's "Easier" section: it would only move the
+failure risk to a second, itself-fallible call (`DELETE /reservations/{id}`)
+and would discard state a retry could otherwise use. Publishing this event is
+best-effort: if the publish itself fails, that failure is joined onto the
+original allocation error rather than replacing it, so the caller's real
+failure is never masked.

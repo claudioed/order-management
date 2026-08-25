@@ -3,12 +3,14 @@ package usecases_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/claudioed/order-management/internal/application/ports"
 	"github.com/claudioed/order-management/internal/application/usecases"
 	"github.com/claudioed/order-management/internal/domain/order"
+	"github.com/claudioed/order-management/internal/domain/shared"
 )
 
 func TestAllocateOrderHappyPath(t *testing.T) {
@@ -158,9 +160,55 @@ func TestAllocateOrderFailsClosedOnANonBusinessError(t *testing.T) {
 			assertLineStatuses(t, stored, order.LineAllocated, order.LinePending)
 
 			// No order-level allocation event was published for a run
-			// that did not complete.
-			assertEventNames(t, f.events, "OrderLineAllocated")
+			// that did not complete, but the partial-allocation
+			// visibility event WAS — the already-succeeded line 1 is
+			// kept, and this is how that becomes discoverable outside
+			// source code.
+			assertEventNames(t, f.events, "OrderLineAllocated", "OrderAllocationPartiallyFailed")
 		})
+	}
+}
+
+// The gap this event closes: a hard failure partway through allocation
+// leaves the order genuinely partially allocated (line 1 kept, line 2 still
+// Pending) — that outcome must be operationally visible via
+// OrderAllocationPartiallyFailed, not only discoverable by reading a
+// source code comment. See ADR-0003.
+func TestAllocateOrderPublishesPartialFailureVisibilityEvent(t *testing.T) {
+	f := newFixture()
+	f.inventory.reserveErrBySKU["SKU-2"] = errBoom
+	o := f.mustReceive(t, true, line("SKU-1", 1, "pick"), line("SKU-2", 1, "pick"))
+
+	_, err := f.allocateOrder().Execute(context.Background(), o.ID())
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("err = %v, want %v", err, errBoom)
+	}
+
+	stored, getErr := f.getOrder().Execute(context.Background(), o.ID())
+	if getErr != nil {
+		t.Fatalf("GetOrder: %v", getErr)
+	}
+	assertLineStatuses(t, stored, order.LineAllocated, order.LinePending)
+
+	events := f.events.events
+	if len(events) != 2 {
+		t.Fatalf("events = %v, want 2 (OrderLineAllocated, OrderAllocationPartiallyFailed)", f.events.names())
+	}
+	evt, ok := events[1].(shared.OrderAllocationPartiallyFailed)
+	if !ok {
+		t.Fatalf("events[1] = %T, want shared.OrderAllocationPartiallyFailed", events[1])
+	}
+	if evt.OrderID != o.ID() {
+		t.Fatalf("OrderID = %q, want %q", evt.OrderID, o.ID())
+	}
+	if evt.AllocatedLines != 1 {
+		t.Fatalf("AllocatedLines = %d, want 1", evt.AllocatedLines)
+	}
+	if evt.RemainingLines != 1 {
+		t.Fatalf("RemainingLines = %d, want 1", evt.RemainingLines)
+	}
+	if evt.Cause != errBoom.Error() {
+		t.Fatalf("Cause = %q, want %q", evt.Cause, errBoom.Error())
 	}
 }
 
@@ -196,6 +244,35 @@ func TestAllocateOrderPersistsRealReservationsBeforeFailing(t *testing.T) {
 	}
 	if skuOneCalls != 1 {
 		t.Fatalf("SKU-1 was reserved %d times, want exactly 1", skuOneCalls)
+	}
+}
+
+// Cause must be defensively bounded so a verbose or accidentally-embedded
+// upstream error never turns this event into an unbounded log payload.
+func TestAllocateOrderTruncatesLongCause(t *testing.T) {
+	f := newFixture()
+	longMsg := strings.Repeat("x", 600)
+	f.inventory.reserveErrBySKU["SKU-2"] = errors.New(longMsg)
+	o := f.mustReceive(t, true, line("SKU-1", 1, "pick"), line("SKU-2", 1, "pick"))
+
+	_, err := f.allocateOrder().Execute(context.Background(), o.ID())
+	if err == nil {
+		t.Fatal("Execute: want error, got nil")
+	}
+
+	events := f.events.events
+	if len(events) != 2 {
+		t.Fatalf("events = %v, want 2", f.events.names())
+	}
+	evt, ok := events[1].(shared.OrderAllocationPartiallyFailed)
+	if !ok {
+		t.Fatalf("events[1] = %T, want shared.OrderAllocationPartiallyFailed", events[1])
+	}
+	if len([]rune(evt.Cause)) > 501 { // maxCauseLen + the "…" marker
+		t.Fatalf("Cause length = %d, want truncated to <= 501 runes", len([]rune(evt.Cause)))
+	}
+	if evt.Cause == longMsg {
+		t.Fatal("Cause was not truncated")
 	}
 }
 
@@ -262,6 +339,31 @@ func TestAllocateOrderErrorPaths(t *testing.T) {
 		if !errors.Is(err, errBoom) {
 			t.Fatalf("err = %v, want %v", err, errBoom)
 		}
+	})
+
+	t.Run("publisher fails on the partial-failure visibility event", func(t *testing.T) {
+		f := newFixture()
+		o := f.mustReceive(t, true, line("SKU-1", 1, "pick"), line("SKU-2", 1, "pick"))
+		f.inventory.reserveErrBySKU["SKU-2"] = errBoom
+		// Let the first (OrderLineAllocated) event through, then fail
+		// the second (OrderAllocationPartiallyFailed) publish.
+		f.events.failAfter(1, errBoom)
+
+		_, err := f.allocateOrder().Execute(context.Background(), o.ID())
+		// The original allocation failure must still surface — the
+		// event-publish failure is joined in, never masks it.
+		if !errors.Is(err, errBoom) {
+			t.Fatalf("err = %v, want %v", err, errBoom)
+		}
+
+		// The genuinely-reserved line was still saved despite the
+		// publish failure — visibility is best-effort, persistence is
+		// not.
+		stored, getErr := f.getOrder().Execute(context.Background(), o.ID())
+		if getErr != nil {
+			t.Fatalf("GetOrder: %v", getErr)
+		}
+		assertLineStatuses(t, stored, order.LineAllocated, order.LinePending)
 	})
 
 	t.Run("re-allocating an already allocated order is a no-op", func(t *testing.T) {
