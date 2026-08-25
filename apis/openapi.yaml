@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Order Management API
-  version: "1.0.0"
+  version: "2.0.0"
   description: >
     The missing upstream Open Host Service for the warehouse-systems
     platform: it owns **Order** and **OrderLine** as first-class, validated
@@ -9,19 +9,26 @@ info:
     unowned, unvalidated string — `OrderRef` / `DemandRef` / `Reference` —
     independently reinvented by three different services. Here the OrderId
     is a real identity, and it is the value sent downstream as
-    inventory-storage's `demandRef` and wes-work-planning's `reference`.
+    inventory-storage's `demandRef`.
 
 
-    The lifecycle this API exposes is intake -> allocation -> release, with
-    cancellation legal up to the release boundary. **Allocation** reserves
-    stock per line through inventory-storage's published
-    `POST /reservations`; a `409` from that service is the business fact
-    "no usable stock", which backorders that one line, while any other
-    failure fails the whole call rather than silently recording a
-    backorder. **Release** enqueues each allocated line as work through
-    wes-work-planning's published `POST /paths/{pathId}/work-units`. This
-    service is a pure HTTP Customer of both: it holds no reservation or
-    work-unit state of its own, only the references it needs to revoke.
+    The lifecycle is intake -> allocation -> release, with cancellation
+    legal up to the release boundary — but as of this redesign, a caller
+    only ever expresses ONE intent: **place an order**
+    (`POST /orders`). Allocation and release are internal saga steps this
+    service performs automatically, right after intake, and again on
+    `retry-allocation` — they are no longer public REST verbs a caller
+    drives by hand. **Allocation** reserves stock per line through
+    inventory-storage's published `POST /reservations`; a `409` from that
+    service is the business fact "no usable stock", which backorders that
+    one line, while any other failure fails the whole allocation pass
+    rather than silently recording a backorder. **Release** is no longer a
+    synchronous call to any Supplier — it is announced as a fact on the
+    enriched `OrderAllocated` / `OrderPartiallyAllocated` Kafka integration
+    events (topic `warehouse.order-management.events`), which
+    wes-work-planning consumes to enqueue its own work asynchronously. This
+    service holds no reservation or work-unit state of its own, only the
+    references it needs to revoke.
 
 
     The order-level `status` is always DERIVED from the line statuses and
@@ -44,19 +51,18 @@ tags:
   - name: Orders
     description: >
       Order intake and reads. An order is received with its lines in
-      `Received` status; nothing is reserved and nothing is released until
-      the allocate and release commands are issued explicitly.
+      `Received` status, and this service immediately attempts
+      allocation-then-release in the SAME call — a caller expresses intent
+      by placing the order, not by separately driving internal saga steps.
   - name: Allocation
     description: >
-      Reserving stock per line through inventory-storage. A `409` from that
-      Supplier backorders a single line (a business fact); any other
-      failure fails the whole call (fail-closed on ambiguity). A
-      backordered line returns to `Allocated` only via retry-allocation.
-  - name: Release
-    description: >
-      Enqueuing allocated lines as work units on wes-work-planning process
-      paths. A ship-complete order (`allowPartialShipment: false`, the
-      default) releases nothing until every line is allocated.
+      Automatic allocation of stock per line through inventory-storage,
+      folded into `POST /orders` and `POST /orders/{id}/retry-allocation`.
+      A `409` from that Supplier backorders a single line (a business
+      fact); any other failure fails the whole allocation pass
+      (fail-closed on ambiguity). A backordered line returns to
+      `Allocated` only via retry-allocation, which also re-attempts
+      release for any lines it newly clears.
   - name: Health
     description: Liveness probe.
 
@@ -87,19 +93,34 @@ paths:
   /orders:
     post:
       operationId: receiveOrder
-      summary: Receive a new order
+      summary: Receive a new order — allocates and releases automatically
       description: >
         Intake — the ReceiveOrder use case. Validates every requested line
         (SKU non-empty, quantity > 0), mints an `OrderId`, and persists the
-        order in `Received` status. Publishes `OrderReceived`. Nothing is
-        reserved and nothing is released here: allocation is a separate,
-        explicitly invoked command, so intake never depends on a Supplier
-        being reachable.
+        order in `Received` status, publishing `OrderReceived`
+        unconditionally.
+
+
+        Immediately afterward, in the SAME call, this service attempts
+        allocation-then-release: it reserves stock per line via
+        inventory-storage's `POST /reservations` (see the Allocation tag),
+        and for every line that ends up `Allocated` and eligible under BR3
+        (see below), releases it — announced via the enriched
+        `OrderAllocated` / `OrderPartiallyAllocated` Kafka events, never a
+        second synchronous call. If that implicit allocation attempt hits
+        a hard (non-business) failure, this endpoint still returns `201`:
+        the order genuinely was received, and a caller expressing "place
+        an order" must never be told that failed just because an internal,
+        best-effort next step could not complete. The returned body
+        reflects whatever the allocation pass actually achieved.
 
 
         `allowPartialShipment` defaults to `false` — ship-complete (BR3).
-        A line's `pathId` defaults to `pick` when omitted, a documented v1
-        simplification.
+        Every line's `pathId` is always the internal default (`pick`) — a
+        caller placing an order has no business supplying
+        wes-work-planning's process-path vocabulary at intake; `pathId` is
+        visible on every line in the response, but not settable on the
+        request.
       tags: [Orders]
       requestBody:
         required: true
@@ -112,13 +133,17 @@ paths:
               lines:
                 - sku: SKU-1
                   quantity: 2
-                  pathId: pick
                 - sku: SKU-2
                   quantity: 1
                   giftWrap: true
       responses:
         "201":
-          description: Order received, in `Received` status.
+          description: >
+            Order received. Reflects whatever the immediate
+            allocation-then-release attempt achieved — `Received`,
+            `Backordered`, `PartiallyAllocated`/`PartiallyReleased`,
+            `Allocated`, or `Released` — a caller inspects `status`/line
+            `status` for the outcome rather than assuming `Received`.
           headers:
             Location:
               schema:
@@ -131,21 +156,24 @@ paths:
                 $ref: "#/components/schemas/Order"
               example:
                 id: ord-a1b2c3d4-0000-0000-0000-000000000001
-                status: Received
+                status: Released
                 allowPartialShipment: false
+                promiseDate: "2026-08-27T09:00:00Z"
                 lines:
                   - lineNo: 1
                     sku: SKU-1
                     quantity: 2
                     pathId: pick
                     giftWrap: false
-                    status: Pending
+                    status: Released
+                    reservationId: res-a1b2c3d4-0000-0000-0000-000000000009
                   - lineNo: 2
                     sku: SKU-2
                     quantity: 1
                     pathId: pick
                     giftWrap: true
-                    status: Pending
+                    status: Released
+                    reservationId: res-a1b2c3d4-0000-0000-0000-000000000010
         "400":
           $ref: "#/components/responses/BadRequest"
         "422":
@@ -250,180 +278,38 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
-  /orders/{id}/allocate:
-    post:
-      operationId: allocateOrder
-      summary: Allocate stock for every pending line
-      description: >
-        The AllocateOrder use case. Calls inventory-storage's
-        `POST /reservations` once per `Pending` line, using this order's id
-        as the `demandRef`, and computes the order's promise date from the
-        domain lead-time policy.
-
-
-        **The 409-vs-everything-else distinction (BR2):** a `409` from
-        inventory-storage is the business fact "not enough usable stock" —
-        that ONE line becomes `Backordered` and allocation continues.
-        Anything else (a transport failure, a 5xx, any other non-2xx) is
-        ambiguous, not a business fact: the whole call fails with `503` and
-        no line is silently marked backordered. Reservations that genuinely
-        succeeded before such a failure are persisted, so nothing is
-        stranded upstream and re-issuing this command resumes where it
-        stopped.
-
-
-        **BR3:** with `allowPartialShipment: false` (the default), any
-        backordered line puts the WHOLE order in `Backordered` and no line
-        proceeds to release until retry-allocation clears it. With
-        `allowPartialShipment: true`, allocated lines stay independently
-        releasable and the order reads `PartiallyAllocated`.
-
-
-        Publishes `OrderLineAllocated` / `OrderLineBackordered` per line,
-        then `OrderAllocated` or `OrderPartiallyAllocated`. Lines already
-        allocated are skipped, so re-issuing is safe.
-      tags: [Allocation]
-      parameters:
-        - $ref: "#/components/parameters/OrderId"
-      responses:
-        "200":
-          description: >
-            The order after the allocation pass. A backordered line is a
-            successful outcome, not an error — it is reported in the body's
-            line statuses.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Order"
-              example:
-                id: ord-a1b2c3d4-0000-0000-0000-000000000001
-                status: Backordered
-                allowPartialShipment: false
-                promiseDate: "2026-08-27T09:00:00Z"
-                lines:
-                  - lineNo: 1
-                    sku: SKU-1
-                    quantity: 2
-                    pathId: pick
-                    giftWrap: false
-                    status: Allocated
-                    reservationId: res-a1b2c3d4-0000-0000-0000-000000000009
-                  - lineNo: 2
-                    sku: SKU-2
-                    quantity: 1
-                    pathId: pick
-                    giftWrap: true
-                    status: Backordered
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "404":
-          $ref: "#/components/responses/OrderNotFound"
-        "503":
-          $ref: "#/components/responses/DownstreamUnavailable"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
   /orders/{id}/retry-allocation:
     post:
       operationId: retryAllocation
-      summary: Re-attempt allocation for backordered lines only
+      summary: Re-attempt allocation for backordered lines, then release
       description: >
         The RetryAllocation use case. Re-attempts allocation for the
         order's `Backordered` lines and ONLY those lines — it is the single
         sanctioned route from `Backordered` back to `Allocated`, and it is
-        what unblocks a ship-complete order held back by BR3.
+        what unblocks a ship-complete order held back by BR3. UNLIKE the
+        implicit allocation attempt folded into `POST /orders`, this is an
+        explicit, on-purpose operator/recovery action: a hard (non-409)
+        failure here fails the call with `503` rather than being swallowed
+        — invoking this endpoint IS asking for allocation right now.
 
 
         A line still short of stock stays `Backordered` (no error). The
-        same fail-closed rule as allocate applies to any non-409 failure.
-        An order with no backordered line at all is rejected with `409`:
-        retrying an order that is not backordered is a caller mistake, not
-        a no-op.
+        same fail-closed rule as intake's implicit allocation applies to
+        any non-409 failure. An order with no backordered line at all is
+        rejected with `409`: retrying an order that is not backordered is
+        a caller mistake, not a no-op.
+
+
+        On success, this ALSO attempts release in the same call — the same
+        allocation-then-release flow `POST /orders` uses — announced via
+        the enriched `OrderAllocated` / `OrderPartiallyAllocated` Kafka
+        events rather than any synchronous call to a Supplier.
       tags: [Allocation]
       parameters:
         - $ref: "#/components/parameters/OrderId"
       responses:
         "200":
-          description: The order after the retry pass.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Order"
-              example:
-                id: ord-a1b2c3d4-0000-0000-0000-000000000001
-                status: Allocated
-                allowPartialShipment: false
-                promiseDate: "2026-08-27T09:00:00Z"
-                lines:
-                  - lineNo: 1
-                    sku: SKU-1
-                    quantity: 2
-                    pathId: pick
-                    giftWrap: false
-                    status: Allocated
-                    reservationId: res-a1b2c3d4-0000-0000-0000-000000000009
-                  - lineNo: 2
-                    sku: SKU-2
-                    quantity: 1
-                    pathId: pick
-                    giftWrap: true
-                    status: Allocated
-                    reservationId: res-a1b2c3d4-0000-0000-0000-000000000010
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "404":
-          $ref: "#/components/responses/OrderNotFound"
-        "409":
-          description: This order has no backordered line to retry.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-              example:
-                type: https://errors.order-management.warehouse-systems.dev/no-backordered-lines
-                title: Order has no backordered lines to retry
-                status: 409
-                detail: order has no backordered lines to retry
-                instance: /orders/ord-a1b2c3d4-0000-0000-0000-000000000001/retry-allocation
-        "503":
-          $ref: "#/components/responses/DownstreamUnavailable"
-        "500":
-          $ref: "#/components/responses/InternalError"
-
-  /orders/{id}/release:
-    post:
-      operationId: releaseOrder
-      summary: Release allocated lines as work
-      description: >
-        The ReleaseOrder use case. Enqueues each `Allocated` line as a work
-        unit on wes-work-planning's process path for that line via
-        `POST /paths/{pathId}/work-units`, sending the order's promise date
-        as `cpt`, the order id as `reference`, and the line's `sku` and
-        `giftWrap` (both already-optional fields on that endpoint — nothing
-        in wes-work-planning changes for this context to exist).
-
-
-        The `workUnitId` is deterministic — `{orderId}-line-{lineNo}` —
-        so a duplicate release is a detectable `409` upstream rather than a
-        silently duplicated work unit.
-
-
-        **BR3 at the release boundary:** a ship-complete order releases
-        NOTHING while any line is still `Pending` or `Backordered`
-        (`409 ship-complete-blocked`). An order that allows partial
-        shipment releases its allocated lines independently and reads
-        `PartiallyReleased`.
-
-
-        Publishes `OrderLineReleased` per line, and `OrderReleased` once
-        every line is released. A line that is not `Allocated` is never
-        offered to the Supplier.
-      tags: [Release]
-      parameters:
-        - $ref: "#/components/parameters/OrderId"
-      responses:
-        "200":
-          description: The order after the release pass.
+          description: The order after the retry-then-release pass.
           content:
             application/json:
               schema:
@@ -441,25 +327,29 @@ paths:
                     giftWrap: false
                     status: Released
                     reservationId: res-a1b2c3d4-0000-0000-0000-000000000009
+                  - lineNo: 2
+                    sku: SKU-2
+                    quantity: 1
+                    pathId: pick
+                    giftWrap: true
+                    status: Released
+                    reservationId: res-a1b2c3d4-0000-0000-0000-000000000010
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/OrderNotFound"
         "409":
-          description: >
-            The order is ship-complete and not every line is allocated
-            (BR3), it has no allocated line left to release, or it has no
-            promise date because it was never allocated.
+          description: This order has no backordered line to retry.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
               example:
-                type: https://errors.order-management.warehouse-systems.dev/ship-complete-blocked
-                title: Ship-complete order cannot be released while any line is unallocated
+                type: https://errors.order-management.warehouse-systems.dev/no-backordered-lines
+                title: Order has no backordered lines to retry
                 status: 409
-                detail: ship-complete order cannot be released while any line is unallocated
-                instance: /orders/ord-a1b2c3d4-0000-0000-0000-000000000001/release
+                detail: order has no backordered lines to retry
+                instance: /orders/ord-a1b2c3d4-0000-0000-0000-000000000001/retry-allocation
         "503":
           $ref: "#/components/responses/DownstreamUnavailable"
         "500":
@@ -506,11 +396,10 @@ components:
 
     DownstreamUnavailable:
       description: >
-        A downstream Supplier (inventory-storage or wes-work-planning)
-        could not be reached, answered ambiguously, or is wired in
-        permissive (no-op) mode. Never papered over with a 2xx: allocating
-        real stock or releasing real work must not appear to succeed when
-        it did not.
+        inventory-storage could not be reached, answered ambiguously, or
+        is wired in permissive (no-op) mode. Never papered over with a
+        2xx: allocating real stock must not appear to succeed when it did
+        not.
       content:
         application/problem+json:
           schema:
@@ -520,7 +409,7 @@ components:
             title: A downstream service is running in permissive (no-op) mode
             status: 503
             detail: downstream client is running in permissive (no-op) mode and cannot perform this operation
-            instance: /orders/ord-a1b2c3d4-0000-0000-0000-000000000001/allocate
+            instance: /orders/ord-a1b2c3d4-0000-0000-0000-000000000001/retry-allocation
 
     InternalError:
       description: An unexpected internal error occurred.
@@ -604,23 +493,15 @@ components:
           minimum: 1
           description: Quantity ordered. Must be greater than zero.
           example: 2
-        pathId:
-          type: string
-          description: >
-            OPTIONAL wes-work-planning process path this line's work is
-            enqueued onto at release time. Defaults to `pick` when omitted
-            — a documented v1 simplification (path selection is not yet a
-            domain policy here).
-          default: pick
-          example: pick
         giftWrap:
           type: boolean
           default: false
           description: >
             OPTIONAL. Whether the requester asked the warehouse to produce
-            a gift package for this line. Passed straight through to
-            wes-work-planning's already-optional `giftWrap` field at
-            release time — a caller-stated characteristic, never looked up.
+            a gift package for this line. Passed straight through onto the
+            enriched `OrderAllocated`/`OrderPartiallyAllocated` Kafka
+            event's `lines[].gift_wrap` field — a caller-stated
+            characteristic, never looked up.
           example: true
 
     OrderStatus:
@@ -670,7 +551,12 @@ components:
           example: 2
         pathId:
           type: string
-          description: The process path this line's work is enqueued onto at release.
+          description: >
+            The process path assigned to this line, ALWAYS the internal
+            default (`pick`) — a caller placing an order has no business
+            supplying wes-work-planning's process-path vocabulary at
+            intake, so this is read-only: visible in every response, never
+            settable on the request.
           example: pick
         giftWrap:
           type: boolean

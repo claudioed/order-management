@@ -64,6 +64,7 @@ Typos, broken links and formatting are of course fair game.
 | [0002](./0002-http-consumer-of-inventory-and-wes-not-shared-code.md) | HTTP consumer of inventory-storage and wes-work-planning, not shared code | Accepted |
 | [0003](./0003-ship-complete-default-and-fail-closed-allocation.md) | Ship-complete by default and fail-closed allocation | Accepted |
 | [0004](./0004-cancellation-boundary-at-release.md) | The cancellation boundary is release | Accepted, with a documented known gap |
+| [0005](./0005-choreographed-release-via-kafka.md) | Choreographed release via Kafka, folded allocate-then-release, and pathId goes internal-only | Accepted |
 
 Each of these reconstructs a decision that is actually visible in this
 repository's `CLAUDE.md` and code — none is a generic placeholder.

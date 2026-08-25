@@ -49,18 +49,22 @@ internal/
     shared/                       OrderId, SKU, PathId, domain events, errors
   application/
     ports/                        OUT: OrderRepo, EventPublisher, Clock,
-                                  InventoryReservationClient, WorkReleaseClient
-    usecases/                     ReceiveOrder, AllocateOrder, RetryAllocation,
-                                  ReleaseOrder, CancelOrder, GetOrder
+                                  InventoryReservationClient
+    usecases/                     ReceiveOrder (allocates+releases
+                                  implicitly), RetryAllocation (retries+
+                                  releases), CancelOrder, GetOrder
   adapters/
     inbound/http/                 chi handlers, DTOs, RFC 7807 error mapping
     outbound/inventorystorage/    POST /reservations, DELETE /reservations/{id}
-    outbound/weswork/             POST /paths/{pathId}/work-units
     outbound/postgres/            pgxpool repo + golang-migrate runner
     outbound/memory/              in-memory repo + clocks for tests
-    outbound/events/              log publisher (Kafka-ready interface)
+    outbound/events/              log publisher (default, EVENT_PUBLISHER=log)
+    outbound/kafka/               Kafka integration-events publisher
+                                  (EVENT_PUBLISHER=kafka), topic
+                                  warehouse.order-management.events
 migrations/                       golang-migrate SQL files
-apis/openapi.yaml                 OpenAPI 3.0 spec for all six endpoints
+apis/openapi.yaml                 OpenAPI 3.0 spec for every endpoint
+docker-compose.kafka.yml          Local Kafka broker (KRaft, single node)
 docs/docs/adr/                    Architecture Decision Records
 ```
 
@@ -114,23 +118,24 @@ go run ./cmd/order                     # migrations run automatically at startup
 Migrations live in `migrations/` and are applied by `golang-migrate` on boot;
 there is no separate migrate step to remember.
 
-### 3. Wired to the real Suppliers
+### 3. Wired to the real Supplier
 
-Both outbound clients default to **permissive (no-op) mode**, so tests and CI
-never reach the network. Permissive here does *not* mean fail-open: allocating
-real stock or releasing real work must never appear to succeed against a
-no-op, so a permissive client refuses the operation with a clear
-`downstream-not-configured` problem response. Only `http` mode is suitable for
-a real integration test or deployment:
+The outbound inventory-storage client defaults to **permissive (no-op)
+mode**, so tests and CI never reach the network. Permissive here does
+*not* mean fail-open: allocating real stock must never appear to succeed
+against a no-op, so a permissive client refuses the operation with a clear
+`downstream-not-configured` problem response. Only `http` mode is suitable
+for a real integration test or deployment:
 
 ```bash
 export INVENTORY_STORAGE_MODE=http
 export INVENTORY_STORAGE_BASE_URL=http://localhost:8080
-export WES_WORK_PLANNING_MODE=http
-export WES_WORK_PLANNING_BASE_URL=http://localhost:8081
 export HTTP_ADDR=:8082
 go run ./cmd/order
 ```
+
+Release no longer calls any Supplier synchronously — see
+[Kafka integration](#kafka-integration) below.
 
 ### Configuration
 
@@ -141,26 +146,68 @@ go run ./cmd/order
 | `MIGRATIONS_PATH` | `migrations` | golang-migrate source directory. |
 | `INVENTORY_STORAGE_MODE` | `permissive` | `http` or `permissive`. |
 | `INVENTORY_STORAGE_BASE_URL` | *(unset)* | Required when mode is `http`. |
-| `WES_WORK_PLANNING_MODE` | `permissive` | `http` or `permissive`. |
-| `WES_WORK_PLANNING_BASE_URL` | *(unset)* | Required when mode is `http`. |
+| `EVENT_PUBLISHER` | `log` | `log` (default, in-memory/Postgres publisher) or `kafka` — forwards `OrderAllocated`/`OrderPartiallyAllocated` to Kafka. |
+| `KAFKA_BROKERS` | `localhost:9092` | Comma-separated broker addresses. Only read when `EVENT_PUBLISHER=kafka`. |
 | `PROMISE_DEFAULT_LEAD_TIME` | `48h` | Promise-date lead time for any unlisted path. |
 | `PROMISE_PATH_LEAD_TIMES` | *(unset)* | Per-path overrides, e.g. `pick=24h,singles=6h`. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
 
+## Kafka integration
+
+Per [ADR 0005](docs/docs/adr/0005-choreographed-release-via-kafka.md),
+release is no longer a synchronous HTTP call to `wes-work-planning`. It is
+announced as a Kafka integration event, which that service (or any other
+subscriber) consumes independently:
+
+- **Topic:** `warehouse.order-management.events`
+- **Forwarded events:** `OrderAllocated` and `OrderPartiallyAllocated`
+  only — every other domain event (`OrderReceived`, `OrderLineAllocated`,
+  `OrderLineBackordered`, `OrderLineReleased`, `OrderReleased`,
+  `OrderCancelled`, `OrderAllocationPartiallyFailed`) stays local-only,
+  mirroring `inventory-storage`'s own precedent of forwarding only two of
+  its several domain events.
+- **Payload (frozen, `data` field):**
+
+  ```json
+  {
+    "order_id": "ord-a1b2c3d4-0000-0000-0000-000000000001",
+    "promise_date": "2026-08-27T09:00:00Z",
+    "lines": [
+      {"line_no": 1, "sku": "SKU-1", "path_id": "pick", "gift_wrap": false}
+    ]
+  }
+  ```
+
+- **Opt-in, off by default.** Set `EVENT_PUBLISHER=kafka` (and, if not
+  `localhost:9092`, `KAFKA_BROKERS`) to publish for real; the default
+  `log` publisher requires no broker at all, so `go test ./...` and local
+  runs are unaffected either way.
+- **Local broker:** `docker compose -f docker-compose.kafka.yml up -d`
+  starts a single-node KRaft Kafka on `localhost:9092`, the same
+  `apache/kafka:3.8.0` image/config shape the fleet's shared
+  `docker-compose.kafka.yml` uses (this repo has its own copy rather than
+  a cross-repo reference).
+- **Fire-and-forget, deliberately.** There is no release-confirmation
+  reply event from `wes-work-planning` in v1 — see "Deferred (v1)" below.
+
 ## API
 
-Six endpoints plus a liveness probe. The full contract, including the RFC 7807
+Four endpoints plus a liveness probe. The full contract, including the RFC 7807
 error schema, is in [`apis/openapi.yaml`](apis/openapi.yaml).
 
 | Method | Path | Use case |
 | --- | --- | --- |
-| `POST` | `/orders` | ReceiveOrder |
+| `POST` | `/orders` | ReceiveOrder — allocates and releases automatically |
 | `GET` | `/orders/{id}` | GetOrder |
-| `POST` | `/orders/{id}/allocate` | AllocateOrder |
-| `POST` | `/orders/{id}/retry-allocation` | RetryAllocation |
-| `POST` | `/orders/{id}/release` | ReleaseOrder |
+| `POST` | `/orders/{id}/retry-allocation` | RetryAllocation — retries and releases automatically |
 | `DELETE` | `/orders/{id}` | CancelOrder |
 | `GET` | `/healthz` | Liveness probe |
+
+`POST /orders/{id}/allocate` and `POST /orders/{id}/release` no longer
+exist — see [ADR 0005](docs/docs/adr/0005-choreographed-release-via-kafka.md).
+A caller expresses ONE intent, placing an order, and this service
+internally attempts allocation-then-release automatically, right after
+intake and again on retry.
 
 Every error response is `application/problem+json` (RFC 7807), the same shape
 the other five services emit.
@@ -174,8 +221,9 @@ curl -s localhost:8080/healthz
 # {"status":"ok"}
 ```
 
-**ReceiveOrder** — `pathId` defaults to `pick`; `allowPartialShipment`
-defaults to `false` (ship-complete):
+**ReceiveOrder** — allocates and releases automatically, in the same call.
+`pathId` is never part of the request (every line gets the internal
+default); `allowPartialShipment` defaults to `false` (ship-complete):
 
 ```bash
 curl -s -X POST localhost:8080/orders \
@@ -183,14 +231,29 @@ curl -s -X POST localhost:8080/orders \
   -d '{
         "allowPartialShipment": false,
         "lines": [
-          {"sku": "SKU-1", "quantity": 2, "pathId": "pick"},
+          {"sku": "SKU-1", "quantity": 2},
           {"sku": "SKU-2", "quantity": 1, "giftWrap": true}
         ]
       }'
 # 201 Created, Location: /orders/ord-...
-# {"id":"ord-...","status":"Received","allowPartialShipment":false,
+# Both lines allocate and release in this SAME call when inventory-storage
+# has stock, so a ship-complete order typically comes back already
+# Released:
+# {"id":"ord-...","status":"Released","allowPartialShipment":false,
+#  "promiseDate":"2026-08-27T09:00:00Z",
 #  "lines":[{"lineNo":1,"sku":"SKU-1","quantity":2,"pathId":"pick",
-#            "giftWrap":false,"status":"Pending"}, ...]}
+#            "giftWrap":false,"status":"Released","reservationId":"res-..."}, ...]}
+```
+
+A `409` from inventory-storage backorders that one line instead — a
+business fact, not a call failure — and, per BR3, a ship-complete order
+with any backordered line stays `Backordered` and releases nothing until
+`retry-allocation` clears it:
+
+```bash
+# {"id":"ord-...","status":"Backordered","allowPartialShipment":false,
+#  "lines":[..., {"lineNo":2,"sku":"SKU-2","quantity":1,"pathId":"pick",
+#                 "giftWrap":true,"status":"Backordered"}]}
 ```
 
 **GetOrder:**
@@ -200,37 +263,13 @@ ORDER_ID=ord-...   # from the response above
 curl -s localhost:8080/orders/$ORDER_ID
 ```
 
-**AllocateOrder** — reserves each pending line against inventory-storage. A
-backordered line is a successful outcome reported in the body, not an error:
-
-```bash
-curl -s -X POST localhost:8080/orders/$ORDER_ID/allocate
-# 200 OK
-# {"id":"ord-...","status":"Allocated","promiseDate":"2026-08-27T09:00:00Z",
-#  "lines":[{"lineNo":1,...,"status":"Allocated","reservationId":"res-..."}, ...]}
-```
-
-**RetryAllocation** — re-attempts the backordered lines and only those:
+**RetryAllocation** — re-attempts the backordered lines and only those,
+then releases whatever it newly clears:
 
 ```bash
 curl -s -X POST localhost:8080/orders/$ORDER_ID/retry-allocation
-```
-
-**ReleaseOrder** — enqueues each allocated line as work on its process path:
-
-```bash
-curl -s -X POST localhost:8080/orders/$ORDER_ID/release
-# 200 OK — status becomes Released (or PartiallyReleased)
-```
-
-Blocked by BR3 while a ship-complete order still has an unallocated line:
-
-```bash
-curl -s -X POST localhost:8080/orders/$ORDER_ID/release
-# 409 Conflict, application/problem+json
-# {"type":"https://errors.order-management.warehouse-systems.dev/ship-complete-blocked",
-#  "title":"Ship-complete order cannot be released while any line is unallocated",
-#  "status":409,"detail":"...","instance":"/orders/ord-.../release"}
+# 200 OK — status becomes Released (or PartiallyReleased) once every
+# backorder clears and BR3 permits release
 ```
 
 **CancelOrder** — revokes every allocated line's reservation, then cancels:
@@ -240,7 +279,9 @@ curl -s -i -X DELETE localhost:8080/orders/$ORDER_ID
 # 204 No Content
 ```
 
-Rejected by BR6 once any line has been released:
+Rejected by BR6 once any line has been released — which, since a
+ship-complete order that allocates cleanly is released automatically
+inside `POST /orders`, can happen right after intake:
 
 ```bash
 curl -s -X DELETE localhost:8080/orders/$ORDER_ID
@@ -296,9 +337,15 @@ not a gap someone forgot about.
   The behavioural rules are covered by table-driven unit tests and the
   `httptest` suite instead.
 - **MCP inbound adapter.** HTTP is the only inbound adapter.
-- **Kafka integration events.** Domain events are published through the log
-  publisher only. `ports.EventPublisher` is deliberately the shape a Kafka
-  producer satisfies, so adding a broker later is purely additive.
+- **Kafka release-confirmation reply events from wes-work-planning.**
+  This service publishes `OrderAllocated`/`OrderPartiallyAllocated` to
+  Kafka fire-and-forget — it never learns whether wes-work-planning's
+  consumer actually processed the event or successfully enqueued its own
+  work. This is a deliberate v1 choice (mirroring inventory-storage's own
+  ADR 0004 stance on transactional guarantees), not an oversight: a
+  confirmation-loop pattern (e.g. this service subscribing to a
+  `WorkEnqueued` reply event) is real, scoped-down future work. See
+  [ADR 0005](docs/docs/adr/0005-choreographed-release-via-kafka.md).
 - **Postgres integration tests.** The `postgres` adapter has no
   `-tags=integration` suite and there is no `integration` CI job; that needs a
   live database in CI, which is a separate round of work.
@@ -342,9 +389,10 @@ GitHub Pages on every push to `main` that touches `docs/**`, publishing to
 ## Architecture Decision Records
 
 1. [0001 — Hexagonal (ports & adapters) architecture](docs/docs/adr/0001-hexagonal-ports-and-adapters.md)
-2. [0002 — HTTP consumer of inventory-storage and wes-work-planning, not shared code](docs/docs/adr/0002-http-consumer-of-inventory-and-wes-not-shared-code.md)
+2. [0002 — HTTP consumer of inventory-storage and wes-work-planning, not shared code](docs/docs/adr/0002-http-consumer-of-inventory-and-wes-not-shared-code.md) (partially superseded by 0005 for release)
 3. [0003 — Ship-complete by default and fail-closed allocation](docs/docs/adr/0003-ship-complete-default-and-fail-closed-allocation.md)
 4. [0004 — The cancellation boundary is release](docs/docs/adr/0004-cancellation-boundary-at-release.md)
+5. [0005 — Choreographed release via Kafka, folded allocate-then-release, and pathId goes internal-only](docs/docs/adr/0005-choreographed-release-via-kafka.md)
 
 ## License
 

@@ -71,31 +71,60 @@ func NewOrderLineBackordered(occurredAt time.Time, orderID OrderId, lineNo int, 
 	}
 }
 
-// OrderAllocated: every line on the order is allocated.
+// ReleasedLine is one line released as part of the same allocation pass
+// that produced an OrderAllocated or OrderPartiallyAllocated fact. Its
+// fields are part of the frozen wes-work-planning Kafka integration
+// contract (see the Kafka integration section of CLAUDE.md): field names
+// and shapes here are mirrored byte-for-byte by wes-work-planning's
+// consumer and must not be changed casually.
+type ReleasedLine struct {
+	LineNo   int
+	SKU      SKU
+	PathID   PathId
+	GiftWrap bool
+}
+
+// OrderAllocated: every line on the order is allocated — and, per the
+// choreographed-release redesign, every one of those lines that was
+// eligible for release (EnsureReleasable passed) was released as part of
+// this SAME fact. Lines carries exactly the lines released in this pass
+// (empty when release was blocked, e.g. a ship-complete order that just
+// became fully allocated but somehow could not release — in practice this
+// does not happen since a fully-Allocated order is always releasable, but
+// the field is never nil-vs-empty-ambiguous either way). This event is
+// also forwarded to Kafka as an integration event — see the Kafka
+// integration section of CLAUDE.md.
 type OrderAllocated struct {
 	base
 	OrderID     OrderId
 	PromiseDate time.Time
+	Lines       []ReleasedLine
 }
 
-func NewOrderAllocated(occurredAt time.Time, orderID OrderId, promiseDate time.Time) OrderAllocated {
-	return OrderAllocated{base: newBase("OrderAllocated", occurredAt), OrderID: orderID, PromiseDate: promiseDate}
+func NewOrderAllocated(occurredAt time.Time, orderID OrderId, promiseDate time.Time, lines []ReleasedLine) OrderAllocated {
+	return OrderAllocated{base: newBase("OrderAllocated", occurredAt), OrderID: orderID, PromiseDate: promiseDate, Lines: lines}
 }
 
 // OrderPartiallyAllocated: some lines allocated, some backordered, on an
-// order that allows partial shipment.
+// order that allows partial shipment. Lines carries only the lines
+// released THIS pass (i.e. o.LinesWithStatus(LineAllocated) restricted to
+// what was actually released now) — never previously-released lines from
+// an earlier pass, and never the still-Backordered lines. This event is
+// also forwarded to Kafka as an integration event — see the Kafka
+// integration section of CLAUDE.md.
 type OrderPartiallyAllocated struct {
 	base
 	OrderID          OrderId
 	AllocatedLines   int
 	BackorderedLines int
 	PromiseDate      time.Time
+	Lines            []ReleasedLine
 }
 
-func NewOrderPartiallyAllocated(occurredAt time.Time, orderID OrderId, allocated, backordered int, promiseDate time.Time) OrderPartiallyAllocated {
+func NewOrderPartiallyAllocated(occurredAt time.Time, orderID OrderId, allocated, backordered int, promiseDate time.Time, lines []ReleasedLine) OrderPartiallyAllocated {
 	return OrderPartiallyAllocated{
 		base:    newBase("OrderPartiallyAllocated", occurredAt),
-		OrderID: orderID, AllocatedLines: allocated, BackorderedLines: backordered, PromiseDate: promiseDate,
+		OrderID: orderID, AllocatedLines: allocated, BackorderedLines: backordered, PromiseDate: promiseDate, Lines: lines,
 	}
 }
 

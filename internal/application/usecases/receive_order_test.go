@@ -5,13 +5,14 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/claudioed/order-management/internal/application/ports"
 	"github.com/claudioed/order-management/internal/application/usecases"
 	"github.com/claudioed/order-management/internal/domain/order"
 	"github.com/claudioed/order-management/internal/domain/shared"
 )
 
 func TestReceiveOrder(t *testing.T) {
-	t.Run("creates an order in Received status and publishes OrderReceived", func(t *testing.T) {
+	t.Run("creates an order, publishes OrderReceived first, then attempts allocation-then-release", func(t *testing.T) {
 		f := newFixture()
 
 		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
@@ -22,18 +23,32 @@ func TestReceiveOrder(t *testing.T) {
 			t.Fatalf("Execute: %v", err)
 		}
 
-		if o.Status() != order.StatusReceived {
-			t.Fatalf("Status() = %q, want %q", o.Status(), order.StatusReceived)
+		// Both lines allocate cleanly against the fake inventory by
+		// default, so a ship-complete order proceeds straight through to
+		// Released in this single call — the folded flow this redesign
+		// introduces.
+		if o.Status() != order.StatusReleased {
+			t.Fatalf("Status() = %q, want %q", o.Status(), order.StatusReleased)
 		}
 		if o.AllowPartialShipment() {
 			t.Fatal("AllowPartialShipment must default to false (ship-complete, BR3)")
 		}
-		assertLineStatuses(t, o, order.LinePending, order.LinePending)
-		assertEventNames(t, f.events, "OrderReceived")
+		assertLineStatuses(t, o, order.LineReleased, order.LineReleased)
+
+		// OrderReceived fires FIRST, unconditionally, before allocation is
+		// even attempted — a caller creating an order always sees that
+		// fact regardless of what allocation does next.
+		names := f.events.names()
+		if len(names) == 0 || names[0] != "OrderReceived" {
+			t.Fatalf("events = %v, want OrderReceived first", names)
+		}
 
 		if !o.Lines()[1].GiftWrap() {
 			t.Fatal("gift wrap was lost between the request and the aggregate")
 		}
+		// PathID is still modeled internally exactly as before — this
+		// redesign only removed the caller's ability to SET it on public
+		// intake, not the domain/application layers' PathID field itself.
 		if o.Lines()[0].PathID() != "pick" || o.Lines()[1].PathID() != "singles" {
 			t.Fatalf("path ids were lost: %q, %q", o.Lines()[0].PathID(), o.Lines()[1].PathID())
 		}
@@ -48,19 +63,110 @@ func TestReceiveOrder(t *testing.T) {
 		}
 	})
 
-	t.Run("nothing is reserved or released at intake", func(t *testing.T) {
+	t.Run("a backordered line keeps a ship-complete order held back from release", func(t *testing.T) {
 		f := newFixture()
-		f.mustReceive(t, false, line("SKU-1", 1, "pick"))
+		f.inventory.reserveErrBySKU["SKU-2"] = ports.ErrInsufficientStock
 
-		if len(f.inventory.reserveCalls) != 0 {
-			t.Fatalf("intake called inventory-storage %d times, want 0", len(f.inventory.reserveCalls))
+		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			line("SKU-1", 1, "pick"), line("SKU-2", 1, "pick"),
+		}, false)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
 		}
-		if len(f.work.calls) != 0 {
-			t.Fatalf("intake called wes-work-planning %d times, want 0", len(f.work.calls))
+		if o.Status() != order.StatusBackordered {
+			t.Fatalf("Status() = %q, want %q", o.Status(), order.StatusBackordered)
 		}
+		assertLineStatuses(t, o, order.LineAllocated, order.LineBackordered)
+		assertEventNames(t, f.events, "OrderReceived", "OrderLineAllocated", "OrderLineBackordered")
 	})
 
-	t.Run("rejects invalid lines before touching the repository", func(t *testing.T) {
+	t.Run("partial shipment releases what allocates and leaves the rest backordered", func(t *testing.T) {
+		f := newFixture()
+		f.inventory.reserveErrBySKU["SKU-2"] = ports.ErrInsufficientStock
+
+		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			line("SKU-1", 1, "pick"), line("SKU-2", 1, "pick"),
+		}, true)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if o.Status() != order.StatusPartiallyReleased {
+			t.Fatalf("Status() = %q, want %q", o.Status(), order.StatusPartiallyReleased)
+		}
+		assertLineStatuses(t, o, order.LineReleased, order.LineBackordered)
+		assertEventNames(t, f.events, "OrderReceived", "OrderLineAllocated", "OrderLineBackordered", "OrderPartiallyAllocated")
+	})
+
+	// This is the DESIGN DECISION documented on ReceiveOrder: a hard
+	// (non-business) failure during the implicit allocation pass must
+	// never turn ReceiveOrder itself into a failure — the order was
+	// genuinely created and persisted before allocation was ever
+	// attempted.
+	t.Run("a hard failure during the implicit allocation pass does not fail ReceiveOrder", func(t *testing.T) {
+		f := newFixture()
+		f.inventory.reserveErrBySKU["SKU-2"] = errBoom
+
+		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			line("SKU-1", 1, "pick"), line("SKU-2", 1, "pick"),
+		}, true)
+		if err != nil {
+			t.Fatalf("Execute: want no error (the order WAS received), got %v", err)
+		}
+		if o == nil {
+			t.Fatal("Execute: want the received order, got nil")
+		}
+		// Line 1 allocated before line 2's hard failure halted the pass.
+		// allocateAndRelease only attempts release after allocateLines
+		// completes CLEANLY (allocErr == nil) — a hard mid-pass failure
+		// short-circuits before release ever runs, so line 1 stays
+		// Allocated (not yet Released) and line 2, never past Reserve,
+		// stays Pending.
+		assertLineStatuses(t, o, order.LineAllocated, order.LinePending)
+
+		// The visibility trail: OrderReceived unconditionally, then the
+		// line-1 progress, then the fail-closed OrderAllocationPartiallyFailed
+		// event — never silently swallowed.
+		names := f.events.names()
+		if len(names) != 3 || names[0] != "OrderReceived" || names[1] != "OrderLineAllocated" || names[2] != "OrderAllocationPartiallyFailed" {
+			t.Fatalf("events = %v, want [OrderReceived OrderLineAllocated OrderAllocationPartiallyFailed]", names)
+		}
+
+		// What is returned matches what is actually persisted.
+		stored, getErr := f.getOrder().Execute(context.Background(), o.ID())
+		if getErr != nil {
+			t.Fatalf("GetOrder: %v", getErr)
+		}
+		assertLineStatuses(t, stored, order.LineAllocated, order.LinePending)
+	})
+
+	// The zero-progress case: the very first line's reserve call hard-fails,
+	// so nothing was ever allocated. ReceiveOrder still succeeds and every
+	// line is left Pending — exactly the state a freshly-received order
+	// would have had before this redesign, ready for RetryAllocation-style
+	// recovery... except RetryAllocation only targets Backordered lines, so
+	// a fully-Pending order after a zero-progress hard failure has no
+	// automatic recovery path; it is a known, documented v1 gap noted in
+	// the type comment (no dedicated "retry a still-Pending line" command
+	// exists) — a human/operator would need direct intervention. This is
+	// unchanged from the ORIGINAL AllocateOrder's failure semantics: it
+	// never had that recovery path either.
+	t.Run("a zero-progress hard failure leaves every line Pending with no partial-failure event", func(t *testing.T) {
+		f := newFixture()
+		f.inventory.reserveErr = errBoom
+
+		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			line("SKU-1", 1, "pick"),
+		}, false)
+		if err != nil {
+			t.Fatalf("Execute: want no error, got %v", err)
+		}
+		assertLineStatuses(t, o, order.LinePending)
+		// No OrderAllocationPartiallyFailed: that event only fires when
+		// something was genuinely allocated before the failure.
+		assertEventNames(t, f.events, "OrderReceived")
+	})
+
+	t.Run("nothing is reserved or released for invalid lines", func(t *testing.T) {
 		tests := []struct {
 			name    string
 			lines   []usecases.NewLine
@@ -96,11 +202,14 @@ func TestReceiveOrder(t *testing.T) {
 					t.Fatalf("err = %v, want %v", err, tt.wantErr)
 				}
 				assertEventNames(t, f.events)
+				if len(f.inventory.reserveCalls) != 0 {
+					t.Fatalf("an invalid intake must never reach inventory-storage, calls = %d", len(f.inventory.reserveCalls))
+				}
 			})
 		}
 	})
 
-	t.Run("propagates repository failures", func(t *testing.T) {
+	t.Run("propagates repository failures during intake itself", func(t *testing.T) {
 		tests := []struct {
 			name string
 			repo *failingRepo
@@ -123,11 +232,50 @@ func TestReceiveOrder(t *testing.T) {
 		}
 	})
 
-	t.Run("propagates publisher failures", func(t *testing.T) {
+	t.Run("propagates a publisher failure on OrderReceived itself", func(t *testing.T) {
 		f := newFixture()
 		f.events.err = errBoom
 
 		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{line("SKU-1", 1, "pick")}, false)
+		if !errors.Is(err, errBoom) {
+			t.Fatalf("err = %v, want %v", err, errBoom)
+		}
+	})
+
+	// A publisher failure LATER in the implicit allocation-then-release
+	// pass (e.g. on the final OrderAllocated event, after OrderReceived
+	// and OrderLineAllocated already succeeded) is a hard failure of
+	// allocateAndRelease, which ReceiveOrder swallows exactly like any
+	// other hard allocation-phase failure — the order was genuinely
+	// received and that is what matters to ReceiveOrder's own caller.
+	t.Run("a publisher failure later in the implicit allocation pass does not fail ReceiveOrder", func(t *testing.T) {
+		f := newFixture()
+		f.events.failAfter(2, errBoom) // let OrderReceived + OrderLineAllocated through, then fail
+
+		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{line("SKU-1", 1, "pick")}, false)
+		if err != nil {
+			t.Fatalf("Execute: want no error (the order WAS received), got %v", err)
+		}
+		if o == nil {
+			t.Fatal("Execute: want the received order, got nil")
+		}
+	})
+
+	// After a hard allocation failure, ReceiveOrder re-reads the persisted
+	// order so what it returns never diverges from what is actually
+	// stored (see the type doc). If THAT re-read itself fails, that is a
+	// genuine infrastructure problem and must surface as an error — this
+	// is the one way ReceiveOrder's implicit allocation attempt CAN still
+	// produce a ReceiveOrder-level error, and it is not about allocation
+	// failing, it is about being unable to report reality afterward.
+	t.Run("a FindByID failure while re-reading after a hard allocation failure surfaces as an error", func(t *testing.T) {
+		f := newFixture()
+		f.inventory.reserveErrBySKU["SKU-2"] = errBoom
+		f.orders = &findFails{inner: f.orders, findErr: errBoom}
+
+		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			line("SKU-1", 1, "pick"), line("SKU-2", 1, "pick"),
+		}, true)
 		if !errors.Is(err, errBoom) {
 			t.Fatalf("err = %v, want %v", err, errBoom)
 		}

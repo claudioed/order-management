@@ -17,7 +17,7 @@ const sidebar: SidebarsConfig = {
         {
           type: "doc",
           id: "api-reference/rest/receive-order",
-          label: "Receive a new order",
+          label: "Receive a new order — allocates and releases automatically",
           className: "api-method post",
         },
         {
@@ -44,30 +44,8 @@ const sidebar: SidebarsConfig = {
       items: [
         {
           type: "doc",
-          id: "api-reference/rest/allocate-order",
-          label: "Allocate stock for every pending line",
-          className: "api-method post",
-        },
-        {
-          type: "doc",
           id: "api-reference/rest/retry-allocation",
-          label: "Re-attempt allocation for backordered lines only",
-          className: "api-method post",
-        },
-      ],
-    },
-    {
-      type: "category",
-      label: "Release",
-      link: {
-        type: "doc",
-        id: "api-reference/rest/release",
-      },
-      items: [
-        {
-          type: "doc",
-          id: "api-reference/rest/release-order",
-          label: "Release allocated lines as work",
+          label: "Re-attempt allocation for backordered lines, then release",
           className: "api-method post",
         },
       ],

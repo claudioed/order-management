@@ -120,8 +120,8 @@ func TestDomainEventsCarryNameAndTimestamp(t *testing.T) {
 		{"OrderReceived", shared.NewOrderReceived(at, "ord-1", 2), "OrderReceived"},
 		{"OrderLineAllocated", shared.NewOrderLineAllocated(at, "ord-1", 1, "SKU-1", 3, "res-1"), "OrderLineAllocated"},
 		{"OrderLineBackordered", shared.NewOrderLineBackordered(at, "ord-1", 2, "SKU-2", 4), "OrderLineBackordered"},
-		{"OrderAllocated", shared.NewOrderAllocated(at, "ord-1", promise), "OrderAllocated"},
-		{"OrderPartiallyAllocated", shared.NewOrderPartiallyAllocated(at, "ord-1", 1, 1, promise), "OrderPartiallyAllocated"},
+		{"OrderAllocated", shared.NewOrderAllocated(at, "ord-1", promise, nil), "OrderAllocated"},
+		{"OrderPartiallyAllocated", shared.NewOrderPartiallyAllocated(at, "ord-1", 1, 1, promise, nil), "OrderPartiallyAllocated"},
 		{"OrderLineReleased", shared.NewOrderLineReleased(at, "ord-1", 1, "pick", "wu-1"), "OrderLineReleased"},
 		{"OrderReleased", shared.NewOrderReleased(at, "ord-1"), "OrderReleased"},
 		{"OrderCancelled", shared.NewOrderCancelled(at, "ord-1", 2), "OrderCancelled"},
@@ -154,7 +154,7 @@ func TestEventPayloadsCarryTheirDetail(t *testing.T) {
 		t.Fatalf("OrderLineBackordered lost detail: %+v", backordered)
 	}
 
-	partial := shared.NewOrderPartiallyAllocated(at, "ord-7", 2, 1, promise)
+	partial := shared.NewOrderPartiallyAllocated(at, "ord-7", 2, 1, promise, nil)
 	if partial.AllocatedLines != 2 || partial.BackorderedLines != 1 || !partial.PromiseDate.Equal(promise) {
 		t.Fatalf("OrderPartiallyAllocated lost detail: %+v", partial)
 	}
@@ -169,9 +169,14 @@ func TestEventPayloadsCarryTheirDetail(t *testing.T) {
 		t.Fatalf("OrderCancelled lost detail: %+v", cancelled)
 	}
 
-	full := shared.NewOrderAllocated(at, "ord-7", promise)
+	full := shared.NewOrderAllocated(at, "ord-7", promise, []shared.ReleasedLine{
+		{LineNo: 1, SKU: "SKU-1", PathID: "pick", GiftWrap: true},
+	})
 	if !full.PromiseDate.Equal(promise) {
 		t.Fatalf("OrderAllocated lost promise date: %+v", full)
+	}
+	if len(full.Lines) != 1 || full.Lines[0].SKU != "SKU-1" || full.Lines[0].PathID != "pick" || !full.Lines[0].GiftWrap {
+		t.Fatalf("OrderAllocated lost lines detail: %+v", full.Lines)
 	}
 
 	received := shared.NewOrderReceived(at, "ord-7", 4)

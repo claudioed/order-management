@@ -17,9 +17,9 @@ import (
 	inboundhttp "github.com/claudioed/order-management/internal/adapters/inbound/http"
 	"github.com/claudioed/order-management/internal/adapters/outbound/events"
 	"github.com/claudioed/order-management/internal/adapters/outbound/inventorystorage"
+	kafkaadapter "github.com/claudioed/order-management/internal/adapters/outbound/kafka"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
 	"github.com/claudioed/order-management/internal/adapters/outbound/postgres"
-	"github.com/claudioed/order-management/internal/adapters/outbound/weswork"
 	"github.com/claudioed/order-management/internal/application/ports"
 	"github.com/claudioed/order-management/internal/application/usecases"
 	"github.com/claudioed/order-management/internal/domain/order"
@@ -41,14 +41,13 @@ func run() error {
 	databaseURL := os.Getenv("DATABASE_URL")
 	migrationsPath := getenv("MIGRATIONS_PATH", "migrations")
 
-	orders, publisher, closeAdapters, err := buildRepoAdapters(databaseURL, migrationsPath, logger)
+	orders, publisher, closeAdapters, err := buildRepoAdapters(databaseURL, migrationsPath, getenv("EVENT_PUBLISHER", "log"), logger)
 	if err != nil {
 		return err
 	}
 	defer closeAdapters()
 
 	inventory := buildInventoryClient(getenv("INVENTORY_STORAGE_MODE", "permissive"), os.Getenv("INVENTORY_STORAGE_BASE_URL"), logger)
-	work := buildWorkClient(getenv("WES_WORK_PLANNING_MODE", "permissive"), os.Getenv("WES_WORK_PLANNING_BASE_URL"), logger)
 
 	promise := order.NewLeadTimePolicy(
 		durationEnv("PROMISE_DEFAULT_LEAD_TIME", order.DefaultLeadTime, logger),
@@ -57,10 +56,8 @@ func run() error {
 
 	clock := memory.SystemClock{}
 	server := &inboundhttp.Server{
-		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock},
-		AllocateOrder:   &usecases.AllocateOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
+		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise},
 		RetryAllocation: &usecases.RetryAllocation{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
-		ReleaseOrder:    &usecases.ReleaseOrder{Orders: orders, Work: work, Events: publisher, Clock: clock},
 		CancelOrder:     &usecases.CancelOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock},
 		GetOrder:        &usecases.GetOrder{Orders: orders},
 	}
@@ -113,25 +110,55 @@ func newLogger(level string) *slog.Logger {
 
 // buildRepoAdapters wires the Postgres adapters when DATABASE_URL is set,
 // or falls back to the in-memory adapters for local development without a
-// database.
-func buildRepoAdapters(databaseURL, migrationsPath string, logger *slog.Logger) (
+// database. The event publisher defaults to that same memory/Postgres
+// choice ("log"), or can be switched to the Kafka integration-events
+// publisher via eventPublisher="kafka" (EVENT_PUBLISHER env), independent
+// of which repos are in use — mirroring inventory-storage's
+// EVENT_PUBLISHER=kafka|log pattern exactly.
+func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logger *slog.Logger) (
 	ports.OrderRepo, ports.EventPublisher, func(), error,
 ) {
 	noop := func() {}
 
+	var (
+		orders     ports.OrderRepo
+		defaultPub ports.EventPublisher
+		closeRepos = noop
+	)
+
 	if databaseURL == "" {
 		logger.Info("database url not configured; using in-memory adapters")
-		return memory.NewOrderRepo(), events.NewLogPublisher(logger), noop, nil
+		orders = memory.NewOrderRepo()
+		defaultPub = events.NewLogPublisher(logger)
+	} else {
+		if err := postgres.RunMigrations(databaseURL, migrationsPath); err != nil {
+			return nil, nil, noop, err
+		}
+		pool, err := postgres.NewPool(context.Background(), databaseURL)
+		if err != nil {
+			return nil, nil, noop, err
+		}
+		orders = postgres.NewOrderRepo(pool)
+		defaultPub = postgres.NewEventPublisher(pool)
+		closeRepos = pool.Close
 	}
 
-	if err := postgres.RunMigrations(databaseURL, migrationsPath); err != nil {
-		return nil, nil, noop, err
+	if !strings.EqualFold(eventPublisher, "kafka") {
+		return orders, defaultPub, closeRepos, nil
 	}
-	pool, err := postgres.NewPool(context.Background(), databaseURL)
-	if err != nil {
-		return nil, nil, noop, err
+
+	brokers := strings.Split(getenv("KAFKA_BROKERS", "localhost:9092"), ",")
+	writer := kafkaadapter.NewWriter(brokers...)
+	logger.Info("event publisher configured", "publisher", "kafka", "topic", kafkaadapter.Topic, "brokers", brokers)
+
+	closeAll := func() {
+		if err := writer.Close(); err != nil {
+			logger.Error("error closing kafka writer", "error", err)
+		}
+		closeRepos()
 	}
-	return postgres.NewOrderRepo(pool), postgres.NewEventPublisher(pool), pool.Close, nil
+
+	return orders, kafkaadapter.NewPublisher(writer), closeAll, nil
 }
 
 // buildInventoryClient selects the outbound InventoryReservationClient via
@@ -140,24 +167,12 @@ func buildRepoAdapters(databaseURL, migrationsPath string, logger *slog.Logger) 
 // fail-open: it refuses to allocate rather than fabricating a reservation.
 func buildInventoryClient(mode, baseURL string, logger *slog.Logger) ports.InventoryReservationClient {
 	if !strings.EqualFold(mode, "http") {
-		logger.Warn("inventory-storage client in permissive (no-op) mode; AllocateOrder and CancelOrder will refuse to run",
+		logger.Warn("inventory-storage client in permissive (no-op) mode; allocation will refuse to run",
 			"hint", "set INVENTORY_STORAGE_MODE=http and INVENTORY_STORAGE_BASE_URL for a real deployment")
 		return inventorystorage.NewPermissiveClient()
 	}
 	logger.Info("inventory-storage client configured", "mode", "http", "base_url", baseURL)
 	return inventorystorage.NewClient(baseURL, nil)
-}
-
-// buildWorkClient selects the outbound WorkReleaseClient via
-// WES_WORK_PLANNING_MODE (http|permissive), on the same terms.
-func buildWorkClient(mode, baseURL string, logger *slog.Logger) ports.WorkReleaseClient {
-	if !strings.EqualFold(mode, "http") {
-		logger.Warn("wes-work-planning client in permissive (no-op) mode; ReleaseOrder will refuse to run",
-			"hint", "set WES_WORK_PLANNING_MODE=http and WES_WORK_PLANNING_BASE_URL for a real deployment")
-		return weswork.NewPermissiveClient()
-	}
-	logger.Info("wes-work-planning client configured", "mode", "http", "base_url", baseURL)
-	return weswork.NewClient(baseURL, nil)
 }
 
 // durationEnv reads a Go duration (e.g. "48h", "90m") from key, falling

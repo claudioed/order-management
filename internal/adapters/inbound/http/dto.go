@@ -6,9 +6,6 @@ package http
 type receiveOrderLineRequest struct {
 	SKU      string `json:"sku"`
 	Quantity int    `json:"quantity"`
-	// PathID is optional: an omitted value defaults to the domain's
-	// DefaultPathId ("pick"), a documented v1 simplification.
-	PathID   string `json:"pathId,omitempty"`
 	GiftWrap bool   `json:"giftWrap,omitempty"`
 }
 
@@ -22,6 +19,11 @@ type orderLineResponse struct {
 	LineNo   int    `json:"lineNo"`
 	SKU      string `json:"sku"`
 	Quantity int    `json:"quantity"`
+	// PathID reflects an internally-assigned value (see
+	// shared.DefaultPathId / shared.NewPathIdOrDefault) — a caller placing
+	// an order has no business supplying wes-work-planning's process-path
+	// vocabulary at intake, so this is read-only on the wire: it can be
+	// seen in every response but never set on the request.
 	PathID   string `json:"pathId"`
 	GiftWrap bool   `json:"giftWrap"`
 	Status   string `json:"status"`

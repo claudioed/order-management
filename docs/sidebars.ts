@@ -57,6 +57,7 @@ const sidebars: SidebarsConfig = {
         'adr/0002-http-consumer-of-inventory-and-wes-not-shared-code',
         'adr/0003-ship-complete-default-and-fail-closed-allocation',
         'adr/0004-cancellation-boundary-at-release',
+        'adr/0005-choreographed-release-via-kafka',
       ],
     },
   ],

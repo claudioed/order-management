@@ -16,7 +16,7 @@ import (
 )
 
 // errBoom stands in for any infrastructure failure that is not a business
-// fact — the exact case AllocateOrder must NOT turn into a backorder.
+// fact — the exact case allocation must NOT turn into a backorder.
 var errBoom = errors.New("boom")
 
 // fakeInventory is a scripted ports.InventoryReservationClient. Per-SKU
@@ -65,34 +65,6 @@ func (f *fakeInventory) RevokeReservation(_ context.Context, id string) error {
 
 func reservationID(n int) string {
 	return fmt.Sprintf("res-%d", n)
-}
-
-// fakeWork is a scripted ports.WorkReleaseClient.
-type fakeWork struct {
-	mu sync.Mutex
-
-	enqueueErrBySKU map[shared.SKU]error
-	enqueueErr      error
-
-	calls []ports.WorkUnitRequest
-}
-
-func newFakeWork() *fakeWork {
-	return &fakeWork{enqueueErrBySKU: map[shared.SKU]error{}}
-}
-
-func (f *fakeWork) EnqueueWorkUnit(_ context.Context, req ports.WorkUnitRequest) (ports.WorkUnitResult, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, req)
-
-	if err, ok := f.enqueueErrBySKU[req.SKU]; ok {
-		return ports.WorkUnitResult{}, err
-	}
-	if f.enqueueErr != nil {
-		return ports.WorkUnitResult{}, f.enqueueErr
-	}
-	return ports.WorkUnitResult{WorkUnitID: req.WorkUnitID}, nil
 }
 
 // recordingPublisher captures published events so a test can assert the
@@ -168,12 +140,32 @@ func (r *failingRepo) NextID(ctx context.Context) (shared.OrderId, error) {
 	return r.inner.NextID(ctx)
 }
 
+// findFails wraps a real repo whose FindByID call always fails. Used to
+// model ReceiveOrder's post-hard-failure re-read hitting its own
+// infrastructure problem (a separate concern from the allocation failure
+// that triggered the re-read in the first place).
+type findFails struct {
+	inner   ports.OrderRepo
+	findErr error
+}
+
+func (r *findFails) Save(ctx context.Context, o *order.Order) error {
+	return r.inner.Save(ctx, o)
+}
+
+func (r *findFails) FindByID(context.Context, shared.OrderId) (*order.Order, error) {
+	return nil, r.findErr
+}
+
+func (r *findFails) NextID(ctx context.Context) (shared.OrderId, error) {
+	return r.inner.NextID(ctx)
+}
+
 // fixture bundles everything a use-case test needs, wired to in-memory and
 // fake adapters. No test in this package touches a real network or DB.
 type fixture struct {
 	orders    ports.OrderRepo
 	inventory *fakeInventory
-	work      *fakeWork
 	events    *recordingPublisher
 	clock     *memory.FixedClock
 	promise   order.LeadTimePolicy
@@ -187,7 +179,6 @@ func newFixture() *fixture {
 	return &fixture{
 		orders:    memory.NewOrderRepo(),
 		inventory: newFakeInventory(),
-		work:      newFakeWork(),
 		events:    &recordingPublisher{},
 		clock:     memory.NewFixedClock(now()),
 		promise: order.NewLeadTimePolicy(24*time.Hour, map[shared.PathId]time.Duration{
@@ -197,19 +188,11 @@ func newFixture() *fixture {
 }
 
 func (f *fixture) receiveOrder() *usecases.ReceiveOrder {
-	return &usecases.ReceiveOrder{Orders: f.orders, Events: f.events, Clock: f.clock}
-}
-
-func (f *fixture) allocateOrder() *usecases.AllocateOrder {
-	return &usecases.AllocateOrder{Orders: f.orders, Inventory: f.inventory, Events: f.events, Clock: f.clock, Promise: f.promise}
+	return &usecases.ReceiveOrder{Orders: f.orders, Events: f.events, Clock: f.clock, Inventory: f.inventory, Promise: f.promise}
 }
 
 func (f *fixture) retryAllocation() *usecases.RetryAllocation {
 	return &usecases.RetryAllocation{Orders: f.orders, Inventory: f.inventory, Events: f.events, Clock: f.clock, Promise: f.promise}
-}
-
-func (f *fixture) releaseOrder() *usecases.ReleaseOrder {
-	return &usecases.ReleaseOrder{Orders: f.orders, Work: f.work, Events: f.events, Clock: f.clock}
 }
 
 func (f *fixture) cancelOrder() *usecases.CancelOrder {
@@ -221,6 +204,13 @@ func (f *fixture) getOrder() *usecases.GetOrder {
 }
 
 // mustReceive creates an order through the real ReceiveOrder use case.
+// Since ReceiveOrder now ALSO attempts allocation-then-release implicitly
+// (the choreographed-release redesign), callers that want a purely
+// Received/Pending order must make sure inventory has nothing scripted to
+// succeed with yet, or must accept whatever allocation outcome the current
+// fixture state produces. Most existing tests build up fixture state
+// (e.g. reserveErrBySKU) BEFORE calling mustReceive precisely so the
+// resulting order lands in the state the test wants to assert against.
 func (f *fixture) mustReceive(t *testing.T, allowPartialShipment bool, lines ...usecases.NewLine) *order.Order {
 	t.Helper()
 	o, err := f.receiveOrder().Execute(context.Background(), lines, allowPartialShipment)
@@ -235,6 +225,56 @@ func (p *recordingPublisher) reset() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.events = nil
+}
+
+// allocatedFixture returns a fixture whose order has every requested line
+// Allocated but NOT Released, built by direct domain manipulation rather
+// than through ReceiveOrder. Since the choreographed-release redesign, the
+// "Allocated but not yet released" window is no longer reachable through
+// any public use case for a fully-allocatable ship-complete order — a
+// line that allocates successfully is released in the SAME call — so
+// tests that need to exercise that window (CancelOrder's revoke path in
+// particular) build it directly: block ReceiveOrder's implicit allocation
+// entirely (so every line stays Pending), then allocate each line by hand
+// via the pure domain transition and persist the result.
+func allocatedFixture(t *testing.T, allowPartialShipment bool, lines ...usecases.NewLine) (*fixture, *order.Order) {
+	t.Helper()
+	f := newFixture()
+	f.inventory.reserveErr = errBoom
+	o := f.mustReceive(t, allowPartialShipment, lines...)
+	f.inventory.reserveErr = nil
+
+	for _, l := range o.Lines() {
+		result, err := f.inventory.Reserve(context.Background(), ports.ReservationRequest{
+			SKU: l.SKU(), Quantity: l.Quantity(), DemandRef: o.ID(),
+		})
+		if err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+		if err := o.Allocate(l.LineNo(), result.ReservationID); err != nil {
+			t.Fatalf("Allocate(%d): %v", l.LineNo(), err)
+		}
+	}
+	if err := f.orders.Save(context.Background(), o); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	f.events.reset()
+	return f, o
+}
+
+// backorderedFixture returns a fixture whose order has line 1 allocated
+// (and, when allowPartialShipment is true, immediately released too — see
+// Order.EnsureReleasable, which always permits release on a
+// partial-shipment order regardless of other lines' state) and line 2
+// backordered, built through the real ReceiveOrder use case so its
+// implicit allocation-then-release flow runs exactly as it would in
+// production.
+func backorderedFixture(t *testing.T, allowPartialShipment bool) (*fixture, *order.Order) {
+	t.Helper()
+	f := newFixture()
+	f.inventory.reserveErrBySKU["SKU-2"] = ports.ErrInsufficientStock
+	o := f.mustReceive(t, allowPartialShipment, line("SKU-1", 1, "pick"), line("SKU-2", 1, "pick"))
+	return f, o
 }
 
 func line(sku shared.SKU, qty int, pathID shared.PathId) usecases.NewLine {

@@ -1,1 +1,0 @@
-{"parameters":[{"name":"id","in":"path","required":true,"description":"The order's identifier, as returned by receiveOrder.","schema":{"type":"string","minLength":1},"example":"ord-a1b2c3d4-0000-0000-0000-000000000001"}]}

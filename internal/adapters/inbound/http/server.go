@@ -21,9 +21,7 @@ const DefaultServiceName = "order-management"
 // Server holds every use case the HTTP adapter depends on.
 type Server struct {
 	ReceiveOrder    *usecases.ReceiveOrder
-	AllocateOrder   *usecases.AllocateOrder
 	RetryAllocation *usecases.RetryAllocation
-	ReleaseOrder    *usecases.ReleaseOrder
 	CancelOrder     *usecases.CancelOrder
 	GetOrder        *usecases.GetOrder
 }
@@ -43,9 +41,7 @@ func NewRouter(s *Server, logger *slog.Logger) http.Handler {
 	r.Get("/healthz", s.handleHealthz)
 	r.Post("/orders", s.handleReceiveOrder)
 	r.Get("/orders/{id}", s.handleGetOrder)
-	r.Post("/orders/{id}/allocate", s.handleAllocateOrder)
 	r.Post("/orders/{id}/retry-allocation", s.handleRetryAllocation)
-	r.Post("/orders/{id}/release", s.handleReleaseOrder)
 	r.Delete("/orders/{id}", s.handleCancelOrder)
 
 	return r
@@ -72,7 +68,11 @@ func (s *Server) handleReceiveOrder(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, err)
 			return
 		}
-		pathID, err := shared.NewPathIdOrDefault(l.PathID)
+		// PathId is never caller-supplied on this public intake DTO — see
+		// receiveOrderLineRequest's doc comment. Every line unconditionally
+		// gets the internal default; NewPathIdOrDefault("") always resolves
+		// to shared.DefaultPathId.
+		pathID, err := shared.NewPathIdOrDefault("")
 		if err != nil {
 			writeError(w, r, err)
 			return
@@ -105,38 +105,12 @@ func (s *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toOrderResponse(o))
 }
 
-func (s *Server) handleAllocateOrder(w http.ResponseWriter, r *http.Request) {
-	id, ok := orderIDParam(w, r)
-	if !ok {
-		return
-	}
-	o, err := s.AllocateOrder.Execute(r.Context(), id)
-	if err != nil {
-		writeError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, toOrderResponse(o))
-}
-
 func (s *Server) handleRetryAllocation(w http.ResponseWriter, r *http.Request) {
 	id, ok := orderIDParam(w, r)
 	if !ok {
 		return
 	}
 	o, err := s.RetryAllocation.Execute(r.Context(), id)
-	if err != nil {
-		writeError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, toOrderResponse(o))
-}
-
-func (s *Server) handleReleaseOrder(w http.ResponseWriter, r *http.Request) {
-	id, ok := orderIDParam(w, r)
-	if !ok {
-		return
-	}
-	o, err := s.ReleaseOrder.Execute(r.Context(), id)
 	if err != nil {
 		writeError(w, r, err)
 		return
