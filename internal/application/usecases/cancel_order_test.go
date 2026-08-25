@@ -31,7 +31,9 @@ func TestCancelOrderRevokesEveryAllocatedReservation(t *testing.T) {
 
 func TestCancelOrderBeforeAllocationRevokesNothing(t *testing.T) {
 	f := newFixture()
+	f.inventory.reserveErr = errBoom // block the implicit allocation entirely
 	o := f.mustReceive(t, false, line("SKU-1", 1, "pick"))
+	assertLineStatuses(t, o, order.LinePending)
 
 	got, err := f.cancelOrder().Execute(context.Background(), o.ID())
 	if err != nil {
@@ -46,7 +48,12 @@ func TestCancelOrderBeforeAllocationRevokesNothing(t *testing.T) {
 }
 
 func TestCancelOrderSkipsBackorderedLines(t *testing.T) {
-	f, o := backorderedFixture(t, true)
+	// A ship-complete order (allowPartialShipment=false) blocks release
+	// while line 2 is still Backordered (BR3), so line 1 stays merely
+	// Allocated — exactly the state this test needs to exercise
+	// CancelOrder revoking only the allocated line's reservation.
+	f, o := backorderedFixture(t, false)
+	assertLineStatuses(t, o, order.LineAllocated, order.LineBackordered)
 
 	if _, err := f.cancelOrder().Execute(context.Background(), o.ID()); err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -56,58 +63,82 @@ func TestCancelOrderSkipsBackorderedLines(t *testing.T) {
 	}
 }
 
+// partiallyReleasedFixture builds an order with line 1 Released and line 2
+// merely Allocated (not released), directly via domain calls — the
+// choreographed-release redesign releases every eligible line in the SAME
+// pass as allocation, so this specific in-between state is no longer
+// reachable through any public use case and must be constructed by hand
+// for a test that needs to exercise BR6's boundary against it.
+func partiallyReleasedFixture(t *testing.T) (*fixture, *order.Order) {
+	t.Helper()
+	f := newFixture()
+	f.inventory.reserveErr = errBoom
+	o := f.mustReceive(t, true, line("SKU-1", 1, "pick"), line("SKU-2", 1, "pick"))
+	f.inventory.reserveErr = nil
+
+	for _, l := range o.Lines() {
+		result, err := f.inventory.Reserve(context.Background(), ports.ReservationRequest{
+			SKU: l.SKU(), Quantity: l.Quantity(), DemandRef: o.ID(),
+		})
+		if err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+		if err := o.Allocate(l.LineNo(), result.ReservationID); err != nil {
+			t.Fatalf("Allocate(%d): %v", l.LineNo(), err)
+		}
+	}
+	if err := o.Release(1); err != nil {
+		t.Fatalf("Release(1): %v", err)
+	}
+	if err := f.orders.Save(context.Background(), o); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	f.events.reset()
+	return f, o
+}
+
 // BR6: cancellation is illegal once ANY line has been released, and the
 // check happens BEFORE anything is revoked upstream.
 func TestCancelOrderIsRejectedOnceALineIsReleased(t *testing.T) {
-	tests := []struct {
-		name                 string
-		allowPartialShipment bool
-		lines                []usecases.NewLine
-	}{
-		{
-			name:  "a fully released order",
-			lines: []usecases.NewLine{line("SKU-1", 1, "pick")},
-		},
-		{
-			name:                 "a partially released order still has an allocated line",
-			allowPartialShipment: true,
-			lines:                []usecases.NewLine{line("SKU-1", 1, "pick"), line("SKU-2", 1, "pick")},
-		},
-	}
+	t.Run("a fully released order", func(t *testing.T) {
+		// A single-line ship-complete order releases automatically inside
+		// ReceiveOrder once its one line allocates cleanly.
+		f := newFixture()
+		o := f.mustReceive(t, false, line("SKU-1", 1, "pick"))
+		if o.Status() != order.StatusReleased {
+			t.Fatalf("Status() = %q, want %q", o.Status(), order.StatusReleased)
+		}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			f, o := allocatedFixture(t, tt.allowPartialShipment, tt.lines...)
-			if tt.allowPartialShipment && len(tt.lines) > 1 {
-				// Release only line 1 by failing the enqueue for line 2.
-				f.work.enqueueErrBySKU["SKU-2"] = errBoom
-				if _, err := f.releaseOrder().Execute(context.Background(), o.ID()); !errors.Is(err, errBoom) {
-					t.Fatalf("ReleaseOrder: %v", err)
-				}
-			} else if _, err := f.releaseOrder().Execute(context.Background(), o.ID()); err != nil {
-				t.Fatalf("ReleaseOrder: %v", err)
-			}
-			f.events.reset()
+		_, err := f.cancelOrder().Execute(context.Background(), o.ID())
+		if !errors.Is(err, order.ErrOrderAlreadyReleased) {
+			t.Fatalf("err = %v, want %v", err, order.ErrOrderAlreadyReleased)
+		}
+		if len(f.inventory.revokeCalls) != 0 {
+			t.Fatalf("a rejected cancellation must not touch inventory-storage, got %v", f.inventory.revokeCalls)
+		}
+	})
 
-			_, err := f.cancelOrder().Execute(context.Background(), o.ID())
-			if !errors.Is(err, order.ErrOrderAlreadyReleased) {
-				t.Fatalf("err = %v, want %v", err, order.ErrOrderAlreadyReleased)
-			}
-			// The boundary is checked before any upstream side effect.
-			if len(f.inventory.revokeCalls) != 0 {
-				t.Fatalf("a rejected cancellation must not touch inventory-storage, got %v", f.inventory.revokeCalls)
-			}
-			assertEventNames(t, f.events)
+	t.Run("a partially released order still has an allocated line", func(t *testing.T) {
+		f, o := partiallyReleasedFixture(t)
 
-			stored, getErr := f.getOrder().Execute(context.Background(), o.ID())
-			if getErr != nil {
-				t.Fatalf("GetOrder: %v", getErr)
-			}
-			if stored.Status() == order.StatusCancelled {
-				t.Fatal("the order must not be cancelled")
-			}
-		})
-	}
+		_, err := f.cancelOrder().Execute(context.Background(), o.ID())
+		if !errors.Is(err, order.ErrOrderAlreadyReleased) {
+			t.Fatalf("err = %v, want %v", err, order.ErrOrderAlreadyReleased)
+		}
+		// The boundary is checked before any upstream side effect.
+		if len(f.inventory.revokeCalls) != 0 {
+			t.Fatalf("a rejected cancellation must not touch inventory-storage, got %v", f.inventory.revokeCalls)
+		}
+		assertEventNames(t, f.events)
+
+		stored, getErr := f.getOrder().Execute(context.Background(), o.ID())
+		if getErr != nil {
+			t.Fatalf("GetOrder: %v", getErr)
+		}
+		if stored.Status() == order.StatusCancelled {
+			t.Fatal("the order must not be cancelled")
+		}
+	})
 }
 
 func TestCancelOrderErrorPaths(t *testing.T) {
