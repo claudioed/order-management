@@ -23,9 +23,8 @@ The **aggregate root**. Carries `OrderId`, `OrderLine[]`,
 ### OrderLine
 
 A single requested item within an `Order`. Carries `SKU`, `Quantity`,
-`PathId` (defaults to `"pick"` if not supplied — a documented v1
-simplification, same spirit as fulfillment-execution's `path_id`-prefix
-convention), `GiftWrap bool`, `LineStatus`
+`PathId` (ALWAYS the internal default `"pick"` — see the note below;
+never caller-supplied), `GiftWrap bool`, `LineStatus`
 (`Pending`/`Allocated`/`Backordered`/`Released`/`Cancelled`), and
 `ReservationId *string` (set once allocated; needed to cancel).
 
@@ -48,14 +47,25 @@ This service does **not** model a local `Reservation` aggregate — it only
 stores the `ReservationId` reference. inventory-storage remains the sole
 owner/source-of-truth for reservation state.
 
-*Code:* `internal/application/usecases.AllocateOrder`
+*Code:* `internal/application/usecases.allocateLines` /
+`allocateAndRelease`, called from `ReceiveOrder` and `RetryAllocation` —
+no longer a standalone public use case (see
+[ADR 0005](/docs/adr/0005-choreographed-release-via-kafka)).
 
 ### Release
 
-Enqueuing an allocated line as work via wes-work-planning's
-`POST /paths/{pathId}/work-units`.
+Marking an allocated line `Released` (`Order.Release`, a pure domain
+transition) once it clears BR3's `EnsureReleasable` check, then announcing
+that fact on the enriched `OrderAllocated`/`OrderPartiallyAllocated` Kafka
+integration event. **No longer a synchronous call to
+wes-work-planning** — see
+[ADR 0005](/docs/adr/0005-choreographed-release-via-kafka). Release is
+folded into the same `allocateAndRelease` flow as Allocation, run
+automatically right after a successful allocation pass inside
+`ReceiveOrder`/`RetryAllocation` — never a public verb of its own.
 
-*Code:* `internal/application/usecases.ReleaseOrder`
+*Code:* `internal/application/usecases.allocateAndRelease`,
+`internal/adapters/outbound/kafka`
 
 ### Promise date
 
@@ -82,7 +92,7 @@ fail the call outright rather than silently marking a line backordered
 | --- | --- |
 | `OrderId` | The order's identity — this bounded context's contribution to the platform. |
 | `SKU` | Non-empty string identifying a stock keeping unit. |
-| `PathId` | Non-empty string identifying the wes-work-planning process path a line's work is enqueued onto. Defaults to `pick` when omitted. |
+| `PathId` | Non-empty string identifying the wes-work-planning process path a line's work is enqueued onto. ALWAYS the internal default (`pick`) — never caller-supplied on intake (see [ADR 0005](/docs/adr/0005-choreographed-release-via-kafka)). |
 | `Quantity` | Must be > 0 for every requested line. |
 
 ## States

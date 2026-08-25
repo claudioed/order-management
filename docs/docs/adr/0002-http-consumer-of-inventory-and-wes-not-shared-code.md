@@ -10,7 +10,17 @@ description: ADR 0002 — consume the Suppliers' published REST contracts only; 
 
 ## Status
 
-Accepted. Established with the initial implementation of this bounded context.
+Accepted. Established with the initial implementation of this bounded
+context. **Partially superseded by
+[ADR 0005](./0005-choreographed-release-via-kafka.md):** the
+release-orchestration portion of this decision (this service calling
+`wes-work-planning`'s `POST /paths/{pathId}/work-units` synchronously) no
+longer holds — release is now announced via a Kafka integration event.
+The allocation portion (this service calling `inventory-storage`'s
+`POST /reservations` synchronously) is UNCHANGED and this record's
+reasoning for it still applies in full, as does everything below about the
+bounded-context boundary itself (no shared Go module, no shared database,
+no imported packages from either Supplier).
 
 ## Context
 

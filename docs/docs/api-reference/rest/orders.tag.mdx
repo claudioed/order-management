@@ -7,7 +7,7 @@ custom_edit_url: null
 
 
 
-Order intake and reads. An order is received with its lines in `Received` status; nothing is reserved and nothing is released until the allocate and release commands are issued explicitly.
+Order intake and reads. An order is received with its lines in `Received` status, and this service immediately attempts allocation-then-release in the SAME call — a caller expresses intent by placing the order, not by separately driving internal saga steps.
 
 
 
