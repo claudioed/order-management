@@ -1,0 +1,71 @@
+---
+id: receive-order
+title: "Receive a new order"
+description: "Intake — the ReceiveOrder use case. Validates every requested line (SKU non-empty, quantity > 0), mints an `OrderId`, and persists the order in `Received` status. Publishes `OrderReceived`. Nothing is reserved and nothing is released here: allocation is a separate, explicitly invoked command, so intake never depends on a Supplier being reachable."
+sidebar_label: "Receive a new order"
+hide_title: true
+hide_table_of_contents: true
+api: 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
+sidebar_class_name: "post api-method"
+info_path: docs/api-reference/rest/order-management-api
+custom_edit_url: null
+hide_send_button: true
+---
+
+import MethodEndpoint from "@theme/ApiExplorer/MethodEndpoint";
+import ParamsDetails from "@theme/ParamsDetails";
+import RequestSchema from "@theme/RequestSchema";
+import StatusCodes from "@theme/StatusCodes";
+import OperationTabs from "@theme/OperationTabs";
+import TabItem from "@theme/TabItem";
+import Heading from "@theme/Heading";
+import Translate from "@docusaurus/Translate";
+
+<Heading
+  as={"h1"}
+  className={"openapi__heading"}
+  children={"Receive a new order"}
+>
+</Heading>
+
+<MethodEndpoint
+  method={"post"}
+  path={"/orders"}
+  context={"endpoint"}
+>
+  
+</MethodEndpoint>
+
+
+
+Intake — the ReceiveOrder use case. Validates every requested line (SKU non-empty, quantity > 0), mints an `OrderId`, and persists the order in `Received` status. Publishes `OrderReceived`. Nothing is reserved and nothing is released here: allocation is a separate, explicitly invoked command, so intake never depends on a Supplier being reachable.
+
+`allowPartialShipment` defaults to `false` — ship-complete (BR3). A line's `pathId` defaults to `pick` when omitted, a documented v1 simplification.
+
+
+<Heading
+  id={"request"}
+  as={"h2"}
+  className={"openapi-tabs__heading"}
+>
+  <Translate id="theme.openapi.request.title">Request</Translate>
+</Heading>
+
+<ParamsDetails>
+  
+</ParamsDetails>
+
+<RequestSchema
+  {...require("./receive-order.RequestSchema.json")}
+>
+  
+</RequestSchema>
+
+<StatusCodes
+  {...require("./receive-order.StatusCodes.json")}
+>
+  
+</StatusCodes>
+
+
+      

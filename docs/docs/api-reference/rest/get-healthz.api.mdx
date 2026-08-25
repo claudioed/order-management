@@ -1,0 +1,61 @@
+---
+id: get-healthz
+title: "Liveness probe"
+description: "Returns 200 with a static status body if the process is up. Does not check downstream dependencies (Postgres, inventory-storage, wes-work-planning) — it is a liveness check, not a readiness check."
+sidebar_label: "Liveness probe"
+hide_title: true
+hide_table_of_contents: true
+api: eJzdVttuGzcQ/ZUBX2Krq0uDAklVoIATu7GBFDYUp32IDWjEndUy4pIbDleyKgjoR/QL+yXFkLqlzkOf6weveJvbOXPZKN9SwGi8uynVWM0pXhPaWP+hClUS62BaOVRjNaHYBcfwcjSClYk1IHDEaHT6dAwzX67BVBBrgjZ4TcxgGLp2AJeeGJyPoGvSCyj9ynEMhA2U1JIryWlDDGd3nuM8EBdg3JJc9GHd5+gDzqmAFXF/5cOi31p0zrj5Ofz9519gomhBsGZJTnQmHUVShxAIS3PcHjw4VaiIc1bjTyq7qh4LFYhb75hYjTfq5Wgkn6/d/0BhaTQlXaJqoAqlvYvkolzGtrVGp0AOP7O82CjWNTUov+K6JTVWfvaZdFSFaoOEPZqsL8fv5B7HYNxcFYqesGlterpQ2+3JxvFVPpK/QjUUa7/DUdRgrNVYDesDpExhSUGc36guWDVWdYzteDi0XqOtPcfx69Hr0TPw38sxlLQk69tGfN4+ijTdBRPXavzpsVDGVT45YWIy+TaUFOBXdDgneQIXdzeqUKI/C/1+MBo8V3VfEzSG2bg5dO2OJrctObj2HGGPQ+VDYtoKA9W+Y+rzmiM1DK3FWPnQjIUawjTo9ZItvR6gK/er98aR7DBUJnDsa4vMBSzRmhIjlYDzeaA5RuIBvKHKB4JYG+F550oqIaH/FIGeDEcqC3hQ6MCL7AcFK2T43HEEdNA5v3Jyo3NH8RnkROFpMmhC1RSGML2kBl25X02ookBO0zSz3e0zJto1BMp5QiXM1hDrQASlqdKLCJxDxQO4pmQ8QVJ0U+aMCYQWjIgycV2k2ORkkptLtB0Bi5yTdEV+npkvGKbl0WYR8yxV5U44eDJ4cA9OcLamIr3WdhfZi7sboKfWM6XKYVzEBUH/Z0Ar/BSCyCqQJWSpCFKGNDpN1uZTS3O00LUQffJidzVjhmE9gF7v4iCs14NAKSUYOHq9gJYCWOPEnuC7ef1Nb9tuZg3XVML07vbDPQyzkCSSpz8BwvSH0Y9TqIJvINZ4QGIf21nHuSZVqCM8KOehY5xZylY8qAJWtdE1zFAvEqE4y/GOknnp3BKgW4OPNQWo0NguUPpmJavaWwKN1kLAdCfW6ICN3XNH+1AKBfGoR+IzyTHr9YDcl446YiDU9R4EKnOEkEEgPkTqW5g/i5RUJB5u5HNTbofpfudM5OkA7oUCJ5FCaMWj6/v7O3jbcfQNBfAVzHysU27X3pbSVuAk/uADHKSmzkTyxkSWUlCAd3a9Y8aOjSyiHFHJQppAS7+gA0FTUPpW6h5Mc8Wd5hawwjXD5dXk5reryz3SGZxdPyTOGcXgaElBoA1SA9iLQo1OGlQZTBXBd1GM5LXTmdN7Uck27poGg2HiZNZtvhxPovWCDwRPgSn37VYidKRwAa2Rztii/OfatIWES/DKUJ7F2jMBBvpP/Tf5V3W2MtZKge/TE+lOUDg/VJODKY0vyUqbTp1k8jViv/uw+CiAHWruAK5C8AEOjRlQB898LBQdE0x+eQuvXo9ewdn0tAG3wc8sNd9JI56ew11ewiVFyY48A0j1Rp16t8Pmm/3q7B05CkYPP3Rt60MUl9/siv/bXPzPU1duPccG3Yms9/thREyhf/e4zXFy+F+NVXl6kbgMW4vGqW2Rp4zNbhT5pPajyGOhZNqQrc1mhkwfg91uZftLR2E3USwxGCmLstoW8rakkGaXBa3VWF1oTa0MOqlZqfHzKUymlMNQ9O7qXm23/wBlF+d0
+sidebar_class_name: "get api-method"
+info_path: docs/api-reference/rest/order-management-api
+custom_edit_url: null
+hide_send_button: true
+---
+
+import MethodEndpoint from "@theme/ApiExplorer/MethodEndpoint";
+import ParamsDetails from "@theme/ParamsDetails";
+import RequestSchema from "@theme/RequestSchema";
+import StatusCodes from "@theme/StatusCodes";
+import OperationTabs from "@theme/OperationTabs";
+import TabItem from "@theme/TabItem";
+import Heading from "@theme/Heading";
+import Translate from "@docusaurus/Translate";
+
+<Heading
+  as={"h1"}
+  className={"openapi__heading"}
+  children={"Liveness probe"}
+>
+</Heading>
+
+<MethodEndpoint
+  method={"get"}
+  path={"/healthz"}
+  context={"endpoint"}
+>
+  
+</MethodEndpoint>
+
+
+
+Returns 200 with a static status body if the process is up. Does not check downstream dependencies (Postgres, inventory-storage, wes-work-planning) — it is a liveness check, not a readiness check.
+
+
+<ParamsDetails>
+  
+</ParamsDetails>
+
+<RequestSchema
+  {...require("./get-healthz.RequestSchema.json")}
+>
+  
+</RequestSchema>
+
+<StatusCodes
+  {...require("./get-healthz.StatusCodes.json")}
+>
+  
+</StatusCodes>
+
+
+      

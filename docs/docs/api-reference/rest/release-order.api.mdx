@@ -1,0 +1,77 @@
+---
+id: release-order
+title: "Release allocated lines as work"
+description: "The ReleaseOrder use case. Enqueues each `Allocated` line as a work unit on wes-work-planning's process path for that line via `POST /paths/{pathId}/work-units`, sending the order's promise date as `cpt`, the order id as `reference`, and the line's `sku` and `giftWrap` (both already-optional fields on that endpoint — nothing in wes-work-planning changes for this context to exist)."
+sidebar_label: "Release allocated lines as work"
+hide_title: true
+hide_table_of_contents: true
+api: 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
+sidebar_class_name: "post api-method"
+info_path: docs/api-reference/rest/order-management-api
+custom_edit_url: null
+hide_send_button: true
+---
+
+import MethodEndpoint from "@theme/ApiExplorer/MethodEndpoint";
+import ParamsDetails from "@theme/ParamsDetails";
+import RequestSchema from "@theme/RequestSchema";
+import StatusCodes from "@theme/StatusCodes";
+import OperationTabs from "@theme/OperationTabs";
+import TabItem from "@theme/TabItem";
+import Heading from "@theme/Heading";
+import Translate from "@docusaurus/Translate";
+
+<Heading
+  as={"h1"}
+  className={"openapi__heading"}
+  children={"Release allocated lines as work"}
+>
+</Heading>
+
+<MethodEndpoint
+  method={"post"}
+  path={"/orders/{id}/release"}
+  context={"endpoint"}
+>
+  
+</MethodEndpoint>
+
+
+
+The ReleaseOrder use case. Enqueues each `Allocated` line as a work unit on wes-work-planning's process path for that line via `POST /paths/{pathId}/work-units`, sending the order's promise date as `cpt`, the order id as `reference`, and the line's `sku` and `giftWrap` (both already-optional fields on that endpoint — nothing in wes-work-planning changes for this context to exist).
+
+The `workUnitId` is deterministic — `{orderId}-line-{lineNo}` — so a duplicate release is a detectable `409` upstream rather than a silently duplicated work unit.
+
+**BR3 at the release boundary:** a ship-complete order releases NOTHING while any line is still `Pending` or `Backordered` (`409 ship-complete-blocked`). An order that allows partial shipment releases its allocated lines independently and reads `PartiallyReleased`.
+
+Publishes `OrderLineReleased` per line, and `OrderReleased` once every line is released. A line that is not `Allocated` is never offered to the Supplier.
+
+
+<Heading
+  id={"request"}
+  as={"h2"}
+  className={"openapi-tabs__heading"}
+>
+  <Translate id="theme.openapi.request.title">Request</Translate>
+</Heading>
+
+<ParamsDetails
+  {...require("./release-order.ParamsDetails.json")}
+>
+  
+</ParamsDetails>
+
+<RequestSchema
+  {...require("./release-order.RequestSchema.json")}
+>
+  
+</RequestSchema>
+
+<StatusCodes
+  {...require("./release-order.StatusCodes.json")}
+>
+  
+</StatusCodes>
+
+
+      

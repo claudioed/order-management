@@ -1,0 +1,21 @@
+---
+id: allocation
+title: "Allocation"
+description: "Allocation"
+custom_edit_url: null
+---
+
+
+
+Reserving stock per line through inventory-storage. A `409` from that Supplier backorders a single line (a business fact); any other failure fails the whole call (fail-closed on ambiguity). A backordered line returns to `Allocated` only via retry-allocation.
+
+
+
+
+```mdx-code-block
+import DocCardList from '@theme/DocCardList';
+import {useCurrentSidebarCategory} from '@docusaurus/theme-common';
+
+<DocCardList items={useCurrentSidebarCategory().items}/>
+```
+      
