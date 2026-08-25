@@ -1,0 +1,52 @@
+---
+id: order-management-api
+title: "Order Management API"
+description: "The missing upstream Open Host Service for the warehouse-systems platform: it owns **Order** and **OrderLine** as first-class, validated aggregates. Before this bounded context existed, 'an order' was just an unowned, unvalidated string — `OrderRef` / `DemandRef` / `Reference` — independently reinvented by three different services. Here the OrderId is a real identity, and it is the value sent downstream as inventory-storage's `demandRef` and wes-work-planning's `reference`."
+sidebar_label: Introduction
+sidebar_position: 0
+hide_title: true
+custom_edit_url: null
+---
+
+import ApiLogo from "@theme/ApiLogo";
+import Heading from "@theme/Heading";
+import SchemaTabs from "@theme/SchemaTabs";
+import TabItem from "@theme/TabItem";
+import Export from "@theme/ApiExplorer/Export";
+
+<span
+  className={"theme-doc-version-badge badge badge--secondary"}
+  children={"Version: 1.0.0"}
+>
+</span>
+
+<Heading
+  as={"h1"}
+  className={"openapi__heading"}
+  children={"Order Management API"}
+>
+</Heading>
+
+
+
+The missing upstream Open Host Service for the warehouse-systems platform: it owns **Order** and **OrderLine** as first-class, validated aggregates. Before this bounded context existed, "an order" was just an unowned, unvalidated string — `OrderRef` / `DemandRef` / `Reference` — independently reinvented by three different services. Here the OrderId is a real identity, and it is the value sent downstream as inventory-storage's `demandRef` and wes-work-planning's `reference`.
+
+The lifecycle this API exposes is intake -&gt; allocation -&gt; release, with cancellation legal up to the release boundary. **Allocation** reserves stock per line through inventory-storage's published `POST /reservations`; a `409` from that service is the business fact "no usable stock", which backorders that one line, while any other failure fails the whole call rather than silently recording a backorder. **Release** enqueues each allocated line as work through wes-work-planning's published `POST /paths/{pathId}/work-units`. This service is a pure HTTP Customer of both: it holds no reservation or work-unit state of its own, only the references it needs to revoke.
+
+The order-level `status` is always DERIVED from the line statuses and is never stored, so it cannot drift out of sync with the lines it summarises.
+
+Out of this service's boundary: it does not hold inventory, pick, pack, ship, or plan work (those are inventory-storage, wes-work-planning and fulfillment-execution), and it does not model a local Reservation or WorkUnit aggregate. Error responses across this API use RFC 7807 (`application/problem+json`) Problem Details.
+
+
+<div
+  style={{"display":"flex","flexDirection":"column","marginBottom":"var(--ifm-paragraph-margin-bottom)"}}
+>
+  <h3
+    style={{"marginBottom":"0.25rem"}}
+  >
+    Contact
+  </h3><span>
+    Order Management (Generic/Supporting Bounded Context): 
+  </span>
+</div>
+      

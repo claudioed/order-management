@@ -1,0 +1,73 @@
+---
+id: retry-allocation
+title: "Re-attempt allocation for backordered lines only"
+description: "The RetryAllocation use case. Re-attempts allocation for the order's `Backordered` lines and ONLY those lines — it is the single sanctioned route from `Backordered` back to `Allocated`, and it is what unblocks a ship-complete order held back by BR3."
+sidebar_label: "Re-attempt allocation for backordered lines only"
+hide_title: true
+hide_table_of_contents: true
+api: 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
+sidebar_class_name: "post api-method"
+info_path: docs/api-reference/rest/order-management-api
+custom_edit_url: null
+hide_send_button: true
+---
+
+import MethodEndpoint from "@theme/ApiExplorer/MethodEndpoint";
+import ParamsDetails from "@theme/ParamsDetails";
+import RequestSchema from "@theme/RequestSchema";
+import StatusCodes from "@theme/StatusCodes";
+import OperationTabs from "@theme/OperationTabs";
+import TabItem from "@theme/TabItem";
+import Heading from "@theme/Heading";
+import Translate from "@docusaurus/Translate";
+
+<Heading
+  as={"h1"}
+  className={"openapi__heading"}
+  children={"Re-attempt allocation for backordered lines only"}
+>
+</Heading>
+
+<MethodEndpoint
+  method={"post"}
+  path={"/orders/{id}/retry-allocation"}
+  context={"endpoint"}
+>
+  
+</MethodEndpoint>
+
+
+
+The RetryAllocation use case. Re-attempts allocation for the order's `Backordered` lines and ONLY those lines — it is the single sanctioned route from `Backordered` back to `Allocated`, and it is what unblocks a ship-complete order held back by BR3.
+
+A line still short of stock stays `Backordered` (no error). The same fail-closed rule as allocate applies to any non-409 failure. An order with no backordered line at all is rejected with `409`: retrying an order that is not backordered is a caller mistake, not a no-op.
+
+
+<Heading
+  id={"request"}
+  as={"h2"}
+  className={"openapi-tabs__heading"}
+>
+  <Translate id="theme.openapi.request.title">Request</Translate>
+</Heading>
+
+<ParamsDetails
+  {...require("./retry-allocation.ParamsDetails.json")}
+>
+  
+</ParamsDetails>
+
+<RequestSchema
+  {...require("./retry-allocation.RequestSchema.json")}
+>
+  
+</RequestSchema>
+
+<StatusCodes
+  {...require("./retry-allocation.StatusCodes.json")}
+>
+  
+</StatusCodes>
+
+
+      

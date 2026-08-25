@@ -320,12 +320,24 @@ not a gap someone forgot about.
 
 ### Docusaurus site
 
-The four ADRs under `docs/docs/adr/` are written with the same Docusaurus
-frontmatter (`id`, `slug`, `title`, `sidebar_label`, `description`) the sibling
-repositories use, so they drop straight into a site when one is set up here.
-**There is no Docusaurus project in this repository yet** — no
-`docusaurus.config.ts`, no `package.json`, no `sidebars.ts` — so `npm run build`
-does not apply. The ADR markdown is the deliverable for v1.
+**The Docusaurus site now exists**, mirroring the other five
+`warehouse-systems` repositories' exact structure (Docusaurus 3.10.2,
+`docusaurus-plugin-openapi-docs`/`docusaurus-theme-openapi-docs`, the same
+six-category sidebar minus "AI Ecosystem (MCP)", which is deferred — no MCP
+adapter exists yet). It lives under `docs/` and builds cleanly:
+
+```bash
+cd docs
+npm ci
+npm run gen-api-docs   # generates docs/docs/api-reference/rest/ from apis/openapi.yaml
+npm run build          # onBrokenLinks / onBrokenAnchors are both 'throw'
+```
+
+The four ADRs under `docs/docs/adr/` are wired into the sidebar's
+"Architecture Decision Records" category alongside a new `adr/about.md`
+index page. `.github/workflows/docs.yml` builds and deploys the site to
+GitHub Pages on every push to `main` that touches `docs/**`, publishing to
+**https://claudioed.github.io/order-management/**.
 
 ## Architecture Decision Records
 
