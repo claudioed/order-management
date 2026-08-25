@@ -46,21 +46,6 @@ func (s *stubInventory) RevokeReservation(context.Context, string) error {
 	return s.revokeErr
 }
 
-// stubWork is a scripted ports.WorkReleaseClient.
-type stubWork struct {
-	mu  sync.Mutex
-	err error
-}
-
-func (s *stubWork) EnqueueWorkUnit(_ context.Context, req ports.WorkUnitRequest) (ports.WorkUnitResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.err != nil {
-		return ports.WorkUnitResult{}, s.err
-	}
-	return ports.WorkUnitResult{WorkUnitID: req.WorkUnitID}, nil
-}
-
 type nopPublisher struct{}
 
 func (nopPublisher) Publish(context.Context, shared.DomainEvent) error { return nil }
@@ -69,7 +54,6 @@ type testEnv struct {
 	handler   http.Handler
 	orders    ports.OrderRepo
 	inventory *stubInventory
-	work      *stubWork
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -77,16 +61,13 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	orders := memory.NewOrderRepo()
 	inventory := &stubInventory{}
-	work := &stubWork{}
 	publisher := nopPublisher{}
 	clock := memory.NewFixedClock(time.Date(2026, 8, 25, 9, 0, 0, 0, time.UTC))
 	promise := order.NewLeadTimePolicy(24*time.Hour, nil)
 
 	server := &inboundhttp.Server{
-		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock},
-		AllocateOrder:   &usecases.AllocateOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
+		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise},
 		RetryAllocation: &usecases.RetryAllocation{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
-		ReleaseOrder:    &usecases.ReleaseOrder{Orders: orders, Work: work, Events: publisher, Clock: clock},
 		CancelOrder:     &usecases.CancelOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock},
 		GetOrder:        &usecases.GetOrder{Orders: orders},
 	}
@@ -99,7 +80,6 @@ func newTestEnv(t *testing.T) *testEnv {
 		handler:   inboundhttp.NewRouter(server, logger),
 		orders:    orders,
 		inventory: inventory,
-		work:      work,
 	}
 }
 
@@ -177,10 +157,13 @@ func assertProblem(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int)
 	return body
 }
 
-// receiveOrder posts a two-line order and returns its id.
+// receiveOrder posts a two-line order and returns its id. By default both
+// lines allocate cleanly against the stub inventory, so — per the
+// choreographed-release redesign — a ship-complete (allowPartialShipment
+// false) order comes back already Released.
 func (e *testEnv) receiveOrder(t *testing.T, allowPartialShipment bool) string {
 	t.Helper()
-	body := `{"lines":[{"sku":"SKU-1","quantity":2,"pathId":"pick"},{"sku":"SKU-2","quantity":1,"giftWrap":true}],"allowPartialShipment":` +
+	body := `{"lines":[{"sku":"SKU-1","quantity":2},{"sku":"SKU-2","quantity":1,"giftWrap":true}],"allowPartialShipment":` +
 		map[bool]string{true: "true", false: "false"}[allowPartialShipment] + `}`
 	rec := e.do(t, http.MethodPost, "/orders", body)
 	if rec.Code != http.StatusCreated {
@@ -206,39 +189,77 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestPostOrders(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
+	t.Run("success — both lines allocate cleanly, so a partial-shipment order comes back released", func(t *testing.T) {
 		e := newTestEnv(t)
 		rec := e.do(t, http.MethodPost, "/orders",
-			`{"lines":[{"sku":"SKU-1","quantity":2,"pathId":"singles","giftWrap":true},{"sku":"SKU-2","quantity":1}]}`)
+			`{"lines":[{"sku":"SKU-1","quantity":2,"giftWrap":true},{"sku":"SKU-2","quantity":1}],"allowPartialShipment":true}`)
 
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
 		}
 		body := decodeOrder(t, rec)
-		if body.Status != string(order.StatusReceived) {
-			t.Fatalf("status = %q, want %q", body.Status, order.StatusReceived)
+		if body.Status != string(order.StatusReleased) {
+			t.Fatalf("status = %q, want %q", body.Status, order.StatusReleased)
 		}
-		if body.AllowPartialShipment {
-			t.Fatal("allowPartialShipment must default to false (ship-complete)")
+		if !body.AllowPartialShipment {
+			t.Fatal("allowPartialShipment must reflect what was requested")
 		}
 		if len(body.Lines) != 2 {
 			t.Fatalf("lines = %d, want 2", len(body.Lines))
 		}
-		if body.Lines[0].PathID != "singles" || !body.Lines[0].GiftWrap {
+		if !body.Lines[0].GiftWrap {
 			t.Fatalf("line 1 = %+v", body.Lines[0])
 		}
-		// An omitted pathId defaults to "pick".
+		// pathId is never caller-supplied any more: every line gets the
+		// internal default regardless of what the request DTO says (the
+		// DTO no longer even has a pathId field to set).
+		if body.Lines[0].PathID != string(shared.DefaultPathId) {
+			t.Fatalf("line 1 pathId = %q, want %q (internal default, never caller-supplied)", body.Lines[0].PathID, shared.DefaultPathId)
+		}
 		if body.Lines[1].PathID != string(shared.DefaultPathId) {
 			t.Fatalf("line 2 pathId = %q, want %q", body.Lines[1].PathID, shared.DefaultPathId)
 		}
-		if body.Lines[0].ReservationID != nil {
-			t.Fatal("a received order's lines must have no reservation id")
+		if body.Lines[0].ReservationID == nil || *body.Lines[0].ReservationID != "res-stub" {
+			t.Fatalf("a released order's lines must still carry their reservation id, got %v", body.Lines[0].ReservationID)
 		}
-		if body.PromiseDate != nil {
-			t.Fatal("a received order must have no promise date")
+		if body.PromiseDate == nil {
+			t.Fatal("an allocated (and released) order must have a promise date")
+		}
+		if _, err := time.Parse(time.RFC3339, *body.PromiseDate); err != nil {
+			t.Fatalf("promiseDate %q is not RFC 3339: %v", *body.PromiseDate, err)
 		}
 		if loc := rec.Header().Get("Location"); loc != "/orders/"+body.ID {
 			t.Fatalf("Location = %q, want /orders/%s", loc, body.ID)
+		}
+	})
+
+	t.Run("success: a request pathId field is rejected as unknown JSON, not silently accepted", func(t *testing.T) {
+		// The public intake DTO no longer has a pathId field at all —
+		// sending one is simply ignored by json.Decode (unknown fields
+		// are not rejected by default), proving the caller has no way to
+		// influence the internally-assigned value.
+		e := newTestEnv(t)
+		rec := e.do(t, http.MethodPost, "/orders", `{"lines":[{"sku":"SKU-1","quantity":1,"pathId":"singles"}]}`)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+		}
+		body := decodeOrder(t, rec)
+		if body.Lines[0].PathID != string(shared.DefaultPathId) {
+			t.Fatalf("line pathId = %q, want %q — a caller-supplied pathId must be ignored", body.Lines[0].PathID, shared.DefaultPathId)
+		}
+	})
+
+	t.Run("success: a hard allocation failure does not fail intake", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.inventory.reserveErr = ports.ErrDownstreamNotConfigured
+
+		rec := e.do(t, http.MethodPost, "/orders", `{"lines":[{"sku":"SKU-1","quantity":1}]}`)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 — the order was genuinely received (body: %s)", rec.Code, rec.Body.String())
+		}
+		body := decodeOrder(t, rec)
+		if body.Status != string(order.StatusReceived) {
+			t.Fatalf("status = %q, want %q — allocation never got past the first line", body.Status, order.StatusReceived)
 		}
 	})
 
@@ -282,6 +303,7 @@ func TestPostOrders(t *testing.T) {
 func TestGetOrder(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		e := newTestEnv(t)
+		e.inventory.reserveErr = ports.ErrDownstreamNotConfigured // keep the order in Received for this assertion
 		id := e.receiveOrder(t, false)
 
 		rec := e.do(t, http.MethodGet, "/orders/"+id, "")
@@ -307,61 +329,33 @@ func TestGetOrder(t *testing.T) {
 	})
 }
 
-func TestPostAllocate(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
+func TestPostReceiveOrderAllocatesAndReleasesAutomatically(t *testing.T) {
+	t.Run("ship-complete order allocates and releases in the same call", func(t *testing.T) {
 		e := newTestEnv(t)
 		id := e.receiveOrder(t, false)
 
-		rec := e.do(t, http.MethodPost, "/orders/"+id+"/allocate", "")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
-		}
+		rec := e.do(t, http.MethodGet, "/orders/"+id, "")
 		body := decodeOrder(t, rec)
-		if body.Status != string(order.StatusAllocated) {
-			t.Fatalf("status = %q, want %q", body.Status, order.StatusAllocated)
-		}
-		if body.PromiseDate == nil {
-			t.Fatal("an allocated order must carry a promise date")
-		}
-		if _, err := time.Parse(time.RFC3339, *body.PromiseDate); err != nil {
-			t.Fatalf("promiseDate %q is not RFC 3339: %v", *body.PromiseDate, err)
+		if body.Status != string(order.StatusReleased) {
+			t.Fatalf("status = %q, want %q", body.Status, order.StatusReleased)
 		}
 		for _, l := range body.Lines {
-			if l.ReservationID == nil || *l.ReservationID != "res-stub" {
-				t.Fatalf("line %d reservationId = %v, want res-stub", l.LineNo, l.ReservationID)
+			if l.Status != string(order.LineReleased) {
+				t.Fatalf("line %d status = %q, want %q", l.LineNo, l.Status, order.LineReleased)
 			}
 		}
 	})
 
-	t.Run("success: a 409 from inventory-storage backorders the order", func(t *testing.T) {
+	t.Run("a 409 from inventory-storage backorders the order and blocks release", func(t *testing.T) {
 		e := newTestEnv(t)
-		id := e.receiveOrder(t, false)
 		e.inventory.reserveErr = ports.ErrInsufficientStock
 
-		rec := e.do(t, http.MethodPost, "/orders/"+id+"/allocate", "")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200 — a backorder is a business fact, not an error", rec.Code)
+		rec := e.do(t, http.MethodPost, "/orders", `{"lines":[{"sku":"SKU-1","quantity":1}]}`)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 — a backorder is a business fact, not an error (body: %s)", rec.Code, rec.Body.String())
 		}
 		if body := decodeOrder(t, rec); body.Status != string(order.StatusBackordered) {
 			t.Fatalf("status = %q, want %q", body.Status, order.StatusBackordered)
-		}
-	})
-
-	t.Run("error: unknown order", func(t *testing.T) {
-		e := newTestEnv(t)
-		rec := e.do(t, http.MethodPost, "/orders/ord-missing/allocate", "")
-		assertProblem(t, rec, http.StatusNotFound)
-	})
-
-	t.Run("error: downstream not configured", func(t *testing.T) {
-		e := newTestEnv(t)
-		id := e.receiveOrder(t, false)
-		e.inventory.reserveErr = ports.ErrDownstreamNotConfigured
-
-		rec := e.do(t, http.MethodPost, "/orders/"+id+"/allocate", "")
-		p := assertProblem(t, rec, http.StatusServiceUnavailable)
-		if !strings.HasSuffix(p.Type, "downstream-not-configured") {
-			t.Fatalf("problem.type = %q", p.Type)
 		}
 	})
 }
@@ -369,10 +363,10 @@ func TestPostAllocate(t *testing.T) {
 func TestPostRetryAllocation(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		e := newTestEnv(t)
-		id := e.receiveOrder(t, false)
 		e.inventory.reserveErr = ports.ErrInsufficientStock
-		if rec := e.do(t, http.MethodPost, "/orders/"+id+"/allocate", ""); rec.Code != http.StatusOK {
-			t.Fatalf("allocate status = %d", rec.Code)
+		id := e.receiveOrder(t, false)
+		if rec := e.do(t, http.MethodGet, "/orders/"+id, ""); decodeOrder(t, rec).Status != string(order.StatusBackordered) {
+			t.Fatalf("setup: order must start Backordered")
 		}
 
 		e.inventory.reserveErr = nil
@@ -380,8 +374,10 @@ func TestPostRetryAllocation(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
 		}
-		if body := decodeOrder(t, rec); body.Status != string(order.StatusAllocated) {
-			t.Fatalf("status = %q, want %q", body.Status, order.StatusAllocated)
+		// A retry that clears the last backorder on a ship-complete order
+		// also releases it, in the same call.
+		if body := decodeOrder(t, rec); body.Status != string(order.StatusReleased) {
+			t.Fatalf("status = %q, want %q", body.Status, order.StatusReleased)
 		}
 	})
 
@@ -395,50 +391,20 @@ func TestPostRetryAllocation(t *testing.T) {
 			t.Fatalf("problem.type = %q", p.Type)
 		}
 	})
-}
 
-func TestPostRelease(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
+	t.Run("error: unknown order", func(t *testing.T) {
 		e := newTestEnv(t)
-		id := e.receiveOrder(t, false)
-		if rec := e.do(t, http.MethodPost, "/orders/"+id+"/allocate", ""); rec.Code != http.StatusOK {
-			t.Fatalf("allocate status = %d", rec.Code)
-		}
-
-		rec := e.do(t, http.MethodPost, "/orders/"+id+"/release", "")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
-		}
-		body := decodeOrder(t, rec)
-		if body.Status != string(order.StatusReleased) {
-			t.Fatalf("status = %q, want %q", body.Status, order.StatusReleased)
-		}
+		rec := e.do(t, http.MethodPost, "/orders/ord-missing/retry-allocation", "")
+		assertProblem(t, rec, http.StatusNotFound)
 	})
 
-	t.Run("error: ship-complete order with a backordered line", func(t *testing.T) {
+	t.Run("error: fails closed on a non-business error", func(t *testing.T) {
 		e := newTestEnv(t)
-		id := e.receiveOrder(t, false)
 		e.inventory.reserveErr = ports.ErrInsufficientStock
-		if rec := e.do(t, http.MethodPost, "/orders/"+id+"/allocate", ""); rec.Code != http.StatusOK {
-			t.Fatalf("allocate status = %d", rec.Code)
-		}
-
-		rec := e.do(t, http.MethodPost, "/orders/"+id+"/release", "")
-		p := assertProblem(t, rec, http.StatusConflict)
-		if !strings.HasSuffix(p.Type, "ship-complete-blocked") {
-			t.Fatalf("problem.type = %q", p.Type)
-		}
-	})
-
-	t.Run("error: wes-work-planning failure", func(t *testing.T) {
-		e := newTestEnv(t)
 		id := e.receiveOrder(t, false)
-		if rec := e.do(t, http.MethodPost, "/orders/"+id+"/allocate", ""); rec.Code != http.StatusOK {
-			t.Fatalf("allocate status = %d", rec.Code)
-		}
-		e.work.err = ports.ErrDownstreamNotConfigured
 
-		rec := e.do(t, http.MethodPost, "/orders/"+id+"/release", "")
+		e.inventory.reserveErr = ports.ErrDownstreamNotConfigured
+		rec := e.do(t, http.MethodPost, "/orders/"+id+"/retry-allocation", "")
 		assertProblem(t, rec, http.StatusServiceUnavailable)
 	})
 }
@@ -446,10 +412,8 @@ func TestPostRelease(t *testing.T) {
 func TestDeleteOrder(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		e := newTestEnv(t)
+		e.inventory.reserveErr = ports.ErrDownstreamNotConfigured // keep every line Pending, nothing to revoke
 		id := e.receiveOrder(t, false)
-		if rec := e.do(t, http.MethodPost, "/orders/"+id+"/allocate", ""); rec.Code != http.StatusOK {
-			t.Fatalf("allocate status = %d", rec.Code)
-		}
 
 		rec := e.do(t, http.MethodDelete, "/orders/"+id, "")
 		if rec.Code != http.StatusNoContent {
@@ -465,16 +429,12 @@ func TestDeleteOrder(t *testing.T) {
 		}
 	})
 
-	// BR6 over the wire.
+	// BR6 over the wire: a ship-complete order that allocated cleanly is
+	// released automatically inside ReceiveOrder, so cancelling it right
+	// after intake already hits the release boundary.
 	t.Run("error: already released", func(t *testing.T) {
 		e := newTestEnv(t)
 		id := e.receiveOrder(t, false)
-		if rec := e.do(t, http.MethodPost, "/orders/"+id+"/allocate", ""); rec.Code != http.StatusOK {
-			t.Fatalf("allocate status = %d", rec.Code)
-		}
-		if rec := e.do(t, http.MethodPost, "/orders/"+id+"/release", ""); rec.Code != http.StatusOK {
-			t.Fatalf("release status = %d", rec.Code)
-		}
 
 		rec := e.do(t, http.MethodDelete, "/orders/"+id, "")
 		p := assertProblem(t, rec, http.StatusConflict)
@@ -494,10 +454,11 @@ func TestDeleteOrder(t *testing.T) {
 // bare panic or an empty body.
 func TestUnmappedErrorBecomesAProblem500(t *testing.T) {
 	e := newTestEnv(t)
+	e.inventory.reserveErr = ports.ErrInsufficientStock
 	id := e.receiveOrder(t, false)
-	e.inventory.reserveErr = errUnmapped
 
-	rec := e.do(t, http.MethodPost, "/orders/"+id+"/allocate", "")
+	e.inventory.reserveErr = errUnmapped
+	rec := e.do(t, http.MethodPost, "/orders/"+id+"/retry-allocation", "")
 	p := assertProblem(t, rec, http.StatusInternalServerError)
 	if !strings.HasSuffix(p.Type, "internal-error") {
 		t.Fatalf("problem.type = %q", p.Type)
