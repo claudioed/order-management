@@ -2,7 +2,6 @@ package usecases
 
 import (
 	"context"
-	"errors"
 
 	"github.com/claudioed/order-management/internal/application/ports"
 	"github.com/claudioed/order-management/internal/domain/order"
@@ -19,8 +18,18 @@ import (
 // successful retry is the event that clears it.
 //
 // A line that is still short of stock stays Backordered; the same
-// 409-is-a-business-fact / anything-else-is-ambiguous rule as
-// AllocateOrder applies.
+// 409-is-a-business-fact / anything-else-is-ambiguous rule as allocation
+// applies.
+//
+// Per the choreographed-release redesign (ADR 0005), RetryAllocation now
+// ALSO attempts release in the same call once allocation succeeds — the
+// same allocateAndRelease flow ReceiveOrder uses. UNLIKE ReceiveOrder,
+// RetryAllocation is an explicit, on-purpose operator/recovery action: its
+// caller's whole intent IS "attempt allocation (and, if that clears BR3,
+// release) right now". So — unlike ReceiveOrder's best-effort, error-
+// swallowing treatment of a hard failure — RetryAllocation keeps
+// propagating a hard failure to its own caller exactly as it did
+// pre-redesign, matching its existing error-return behaviour.
 type RetryAllocation struct {
 	Orders    ports.OrderRepo
 	Inventory ports.InventoryReservationClient
@@ -43,29 +52,9 @@ func (uc *RetryAllocation) Execute(ctx context.Context, id shared.OrderId) (*ord
 		return nil, ErrNoBackorderedLines
 	}
 
-	outcome, allocErr := allocateLines(ctx, uc.Inventory, uc.Events, uc.Clock, o, backordered, true)
-	if allocErr != nil {
-		if outcome.allocated > 0 {
-			uc.setPromiseDate(o)
-			if saveErr := uc.Orders.Save(ctx, o); saveErr != nil {
-				return nil, errors.Join(allocErr, saveErr)
-			}
-		}
-		return nil, allocErr
-	}
-
-	uc.setPromiseDate(o)
-	if err := uc.Orders.Save(ctx, o); err != nil {
-		return nil, err
-	}
-	if err := publishOrderAllocationOutcome(ctx, uc.Events, uc.Clock, o, outcome); err != nil {
+	deps := allocationDeps{Orders: uc.Orders, Inventory: uc.Inventory, Events: uc.Events, Clock: uc.Clock, Promise: uc.Promise}
+	if _, err := allocateAndRelease(ctx, deps, o, backordered, true); err != nil {
 		return nil, err
 	}
 	return o, nil
-}
-
-func (uc *RetryAllocation) setPromiseDate(o *order.Order) {
-	if d, ok := uc.Promise.PromiseDate(uc.Clock.Now(), o); ok {
-		o.SetPromiseDate(d)
-	}
 }

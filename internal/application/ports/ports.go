@@ -2,12 +2,18 @@
 // depends on. Adapters implement these; the application never imports an
 // adapter package.
 //
-// Two of these ports — InventoryReservationClient and WorkReleaseClient —
-// are cross-context calls into OTHER services' published HTTP contracts
-// (inventory-storage and wes-work-planning). They are expressed in this
-// context's own types on purpose: Order Management is the Customer in a
-// Customer/Supplier relationship and does not import a single Go package
-// from either Supplier. See ADR 0002.
+// InventoryReservationClient is a cross-context call into inventory-
+// storage's published HTTP contract. It is expressed in this context's own
+// types on purpose: Order Management is the Customer in a Customer/Supplier
+// relationship and does not import a single Go package from that Supplier.
+// See ADR 0002.
+//
+// Release, by contrast, is no longer a synchronous outbound call at all —
+// since the choreographed-release redesign (see ADR 0005), a released line
+// is announced as a fact on the enriched OrderAllocated /
+// OrderPartiallyAllocated integration events, published to Kafka via
+// ports.EventPublisher. There is deliberately no WorkReleaseClient-shaped
+// port here any more.
 package ports
 
 import (
@@ -81,30 +87,4 @@ type ReservationResult struct {
 type InventoryReservationClient interface {
 	Reserve(ctx context.Context, req ReservationRequest) (ReservationResult, error)
 	RevokeReservation(ctx context.Context, reservationID string) error
-}
-
-// WorkUnitRequest is this context's request shape for wes-work-planning's
-// POST /paths/{pathId}/work-units. CPT is the order's promise date;
-// Reference is the OrderId; SKU and GiftWrap are the optional fields that
-// endpoint already accepts today.
-type WorkUnitRequest struct {
-	PathID     shared.PathId
-	WorkUnitID string
-	CPT        time.Time
-	Reference  shared.OrderId
-	SKU        shared.SKU
-	GiftWrap   bool
-}
-
-// WorkUnitResult carries back wes-work-planning's identifier for the
-// enqueued work. This context stores nothing from it beyond what it emits
-// on the OrderLineReleased event — WorkUnit state is owned upstream.
-type WorkUnitResult struct {
-	WorkUnitID string
-}
-
-// WorkReleaseClient is the outbound port for wes-work-planning's published
-// work-unit contract.
-type WorkReleaseClient interface {
-	EnqueueWorkUnit(ctx context.Context, req WorkUnitRequest) (WorkUnitResult, error)
 }
