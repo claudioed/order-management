@@ -56,6 +56,30 @@ migrations/                   golang-migrate SQL files
 apis/openapi.yaml
 ```
 
+## Analytics data product (ADR-0006)
+
+Additive read side built from this service's OWN domain events. The OLTP
+domain/application layers are NOT modified and must NOT import the analytics
+store. `internal/analytics/report/` depends on nothing. (Note: this repo's
+`check-all` has no arch-test/bdd target as the others do — isolation is
+maintained structurally; consider adding those CI jobs for parity.)
+
+- Events are fanned to a SEPARATE topic `warehouse.order-management.analytics`
+  by a new outbound adapter; the integration topic/publisher are untouched.
+  Selected by `EVENT_PUBLISHER=kafka` (fan-out alongside the integration
+  publisher). NOTE: the "Domain events" section below still says "log publisher
+  only in v1, no Kafka" — that predates the Kafka integration + analytics work
+  and is now stale; a Kafka publisher and analytics fan-out both exist.
+- Separate analytical Postgres (`ANALYTICS_DATABASE_URL`), own migrations
+  (`migrations/analytics/`), read-only reader role.
+- Three processes: `cmd/order` (OLTP), `cmd/order-projector` (the ONLY writer;
+  consumes from FirstOffset, idempotent on event_id), `cmd/order-reports`
+  (read-only reader, `GET /reports/...`).
+- Report: **Order Funnel & Allocation Health**, keyed per path × hour
+  (received→allocated→released funnel; cancels/backorders/allocation-fails as
+  leakage; order-level events enriched with their path via an OrderRepo lookup).
+- `GET /reports/.../freshness` reports projection lag.
+
 ## Ubiquitous Language (use these exact names)
 
 - **Order** — the aggregate root. `OrderId`, `OrderLine[]`,
