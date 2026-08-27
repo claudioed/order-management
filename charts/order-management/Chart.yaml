@@ -1,0 +1,12 @@
+apiVersion: v2
+name: order-management
+description: Order Management — the warehouse-systems fleet's Open Host Service for order intake, per-line stock allocation, promise-date calculation, and release
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/claudioed/order-management
+keywords:
+  - ddd
+  - hexagonal-architecture
+  - warehouse-management-system
+  - golang

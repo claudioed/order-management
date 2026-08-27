@@ -1,0 +1,37 @@
+{{ .Chart.Name }} has been deployed.
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+Service:   {{ include "order-management.fullname" . }} ({{ .Values.service.type }}, port {{ .Values.service.port }})
+
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+Ingress:   http://{{ .host }}{{ (index .paths 0).path }}
+{{- end }}
+{{- else }}
+To reach it locally:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "order-management.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://localhost:8080/healthz
+{{- end }}
+
+{{- if not (or .Values.database.url .Values.database.existingSecret) }}
+
+NOTE: no database.url / database.existingSecret was set — running with
+IN-MEMORY adapters (state is lost on pod restart).
+{{- end }}
+
+{{- if eq .Values.config.eventPublisher "kafka" }}
+NOTE: config.eventPublisher is "kafka" — domain events publish to
+kafka.brokers ({{ .Values.kafka.brokers }}). Point it at a reachable broker.
+{{- else }}
+NOTE: config.eventPublisher is "log" — domain events are only logged, not
+published to Kafka.
+{{- end }}
+
+{{- if ne .Values.inventoryStorage.mode "http" }}
+NOTE: inventoryStorage.mode is "{{ .Values.inventoryStorage.mode }}" (not
+"http") — AllocateOrder/CancelOrder will refuse to run against inventory-storage
+rather than fabricate a fake success. Set inventoryStorage.mode=http and
+inventoryStorage.baseUrl for real allocation.
+{{- end }}
