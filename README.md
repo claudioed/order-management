@@ -146,8 +146,11 @@ Release no longer calls any Supplier synchronously — see
 | `MIGRATIONS_PATH` | `migrations` | golang-migrate source directory. |
 | `INVENTORY_STORAGE_MODE` | `permissive` | `http` or `permissive`. |
 | `INVENTORY_STORAGE_BASE_URL` | *(unset)* | Required when mode is `http`. |
-| `EVENT_PUBLISHER` | `log` | `log` (default, in-memory/Postgres publisher) or `kafka` — forwards `OrderAllocated`/`OrderPartiallyAllocated` to Kafka. |
+| `EVENT_PUBLISHER` | `log` | `log` (default, in-memory/Postgres publisher) or `kafka` — forwards `OrderAllocated`/`OrderPartiallyAllocated` to the integration topic **and** fans the full report-input event set out to the analytics topic (ADR 0006). |
 | `KAFKA_BROKERS` | `localhost:9092` | Comma-separated broker addresses. Only read when `EVENT_PUBLISHER=kafka`. |
+| `ANALYTICS_DATABASE_URL` | *(unset)* | Analytical Postgres DSN. **Required** by `cmd/order-projector` (writer) and `cmd/order-reports` (read-only reader); never read by the OLTP binary. |
+| `ANALYTICS_MIGRATIONS_PATH` | `migrations/analytics` | Analytical golang-migrate source directory (writer only). |
+| `ADMIN_ADDR` | `:8091` | `cmd/order-projector` admin/health listen address. |
 | `PROMISE_DEFAULT_LEAD_TIME` | `48h` | Promise-date lead time for any unlisted path. |
 | `PROMISE_PATH_LEAD_TIMES` | *(unset)* | Per-path overrides, e.g. `pick=24h,singles=6h`. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
@@ -189,6 +192,62 @@ subscriber) consumes independently:
   a cross-repo reference).
 - **Fire-and-forget, deliberately.** There is no release-confirmation
   reply event from `wes-work-planning` in v1 — see "Deferred (v1)" below.
+
+## Analytics data product
+
+Per [ADR 0006](docs/docs/adr/0006-analytical-data-product.md), this service
+additionally owns an **analytical read model** — the *Order Funnel & Allocation
+Health* report — built from its own domain events. It is a lightweight data mesh
+with **no central data platform**: a separate analytics topic, a separate
+analytical database, and two extra binaries, all owned by this repo. The report
+contract is documented at
+[`docs/docs/analytics/order-funnel-report.md`](docs/docs/analytics/order-funnel-report.md).
+
+- **Separate topic:** `warehouse.order-management.analytics` — distinct from the
+  integration topic, so widening the report's inputs never risks an integration
+  consumer. A **new** analytics publisher emits the full report-input event set
+  under Envelope v1 (keyed by `order_id`); the integration publisher is
+  untouched. When `EVENT_PUBLISHER=kafka`, the OLTP binary fans out to both.
+- **Separate analytical database:** its own `ANALYTICS_DATABASE_URL`, its own
+  migrations in `migrations/analytics/`, and a **read-only role** for the reader.
+- **Three processes, one writer:**
+  - `cmd/order` — the OLTP binary (unchanged; fans out to the analytics topic
+    when `EVENT_PUBLISHER=kafka`).
+  - `cmd/order-projector` — the **only** writer. Consumes the analytics topic
+    from the earliest offset, applies idempotent projections, runs the
+    analytical migrations on start. Admin health on `:8091`.
+  - `cmd/order-reports` — the **read-only** reader. Serves the report over REST
+    on `:8092`; never writes, never migrates.
+
+Run the writer and reader locally against the local Kafka and an analytical
+database:
+
+```bash
+# Start the local broker (same as the Kafka integration section).
+docker compose -f docker-compose.kafka.yml up -d
+
+export ANALYTICS_DATABASE_URL='postgres://order:***@localhost:5434/order_analytics?sslmode=disable'
+export KAFKA_BROKERS=localhost:9092
+
+# 1. The writer — consumes the analytics topic, projects into the analytical DB,
+#    and runs its migrations on start.
+go run ./cmd/order-projector
+
+# 2. The reader — serves the report read-only from the analytical DB.
+go run ./cmd/order-reports
+# then:
+curl -s 'localhost:8092/reports/funnel?from=2026-06-01T00:00:00Z&to=2026-06-02T00:00:00Z'
+curl -s localhost:8092/reports/funnel/freshness
+
+# 3. Drive an order lifecycle through the OLTP binary with kafka fan-out on,
+#    and watch the report reflect it within the freshness SLA.
+EVENT_PUBLISHER=kafka go run ./cmd/order
+```
+
+The report is **eventually consistent** by design — a projection of the event
+stream to a freshness SLA (p95 event-to-report lag < 30s), not a real-time view.
+There is **no MCP report tool** in this service: no MCP adapter exists in v1, so
+the curated tool the estate's pilot added is a deferred follow-up.
 
 ## API
 
