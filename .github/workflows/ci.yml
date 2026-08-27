@@ -17,9 +17,10 @@ defaults:
   run:
     shell: bash
 
-# v1 runs exactly two jobs. `mutation`, `bdd`, `integration`, `api-lint`,
-# `helm-lint`, `docker-publish` and `release` are deliberately deferred — see
-# the README's "Deferred (v1)" section, and CLAUDE.md's v1 scope.
+# v1 ran only `lint` and `test`. `helm-lint`, `docker-publish`, and `release`
+# are now onboarded (see CLAUDE.md's v1 scope note and the
+# docker-helm-release PR) — `mutation`, `bdd`, `integration`, and `api-lint`
+# remain deliberately deferred.
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -84,3 +85,132 @@ jobs:
         with:
           name: coverage
           path: coverage.out
+
+  helm-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.16.4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+      - uses: helm/chart-testing-action@v2.8.0
+      - name: Run chart-testing (lint)
+        run: ct lint --charts charts/order-management --validate-maintainers=false --check-version-increment=false
+
+  docker-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint, test, helm-lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set image tag (short SHA)
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/claudioed/order-management:latest
+            ghcr.io/claudioed/order-management:${{ env.SHORT_SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Cuts a GitHub Release (+ matching git tag + versioned Docker tag) on every
+  # merge to main. Runs only after docker-publish actually succeeded, so a
+  # release always points at an image that is genuinely live on GHCR.
+  # Versioning: simple auto-increment patch (vX.Y.Z -> vX.Y.(Z+1)), starting
+  # at v0.1.0 if no tag exists yet. No commit-message parsing.
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [docker-publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Compute next version
+        id: version
+        run: |
+          git fetch origin --tags --force
+          latest=$(git tag -l 'v*.*.*' | sort -V | tail -n1)
+          if [ -z "$latest" ]; then
+            new="v0.1.0"
+          else
+            IFS='.' read -r major minor patch <<< "${latest#v}"
+            patch=$((patch + 1))
+            new="v${major}.${minor}.${patch}"
+          fi
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+      - name: Set image tag (short SHA)
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag the already-published image with the release version
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/claudioed/order-management:${{ steps.version.outputs.version }} \
+            ghcr.io/claudioed/order-management:${{ env.SHORT_SHA }}
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.16.4
+      - name: Package and publish the Helm chart for this release
+        run: |
+          CHART_VERSION="${{ steps.version.outputs.version }}"
+          CHART_VERSION="${CHART_VERSION#v}"
+          mkdir -p /tmp/chart-out
+          helm package charts/order-management \
+            --version "$CHART_VERSION" \
+            --app-version "$CHART_VERSION" \
+            -d /tmp/chart-out
+          echo "CHART_TGZ=/tmp/chart-out/order-management-${CHART_VERSION}.tgz" >> "$GITHUB_ENV"
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin
+          helm push "/tmp/chart-out/order-management-${CHART_VERSION}.tgz" \
+            oci://ghcr.io/claudioed
+      - name: Create and push the git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.version }}
+          git push origin ${{ steps.version.outputs.version }}
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: ${{ env.CHART_TGZ }}
+          body: |
+            Docker image: `ghcr.io/claudioed/order-management:${{ steps.version.outputs.version }}`
+            (also tagged `latest` and `${{ env.SHORT_SHA }}`)
+
+            Helm chart: `oci://ghcr.io/claudioed/order-management:${{ steps.version.outputs.version }}`
+            (also attached below as a `.tgz`)
