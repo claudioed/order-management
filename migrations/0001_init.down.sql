@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS events;
+DROP TABLE IF EXISTS order_lines;
+DROP TABLE IF EXISTS orders;

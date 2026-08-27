@@ -1,0 +1,73 @@
+---
+id: receive-order
+title: "Receive a new order — allocates and releases automatically"
+description: "Intake — the ReceiveOrder use case. Validates every requested line (SKU non-empty, quantity > 0), mints an `OrderId`, and persists the order in `Received` status, publishing `OrderReceived` unconditionally."
+sidebar_label: "Receive a new order — allocates and releases automatically"
+hide_title: true
+hide_table_of_contents: true
+api: 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
+sidebar_class_name: "post api-method"
+info_path: docs/api-reference/rest/order-management-api
+custom_edit_url: null
+hide_send_button: true
+---
+
+import MethodEndpoint from "@theme/ApiExplorer/MethodEndpoint";
+import ParamsDetails from "@theme/ParamsDetails";
+import RequestSchema from "@theme/RequestSchema";
+import StatusCodes from "@theme/StatusCodes";
+import OperationTabs from "@theme/OperationTabs";
+import TabItem from "@theme/TabItem";
+import Heading from "@theme/Heading";
+import Translate from "@docusaurus/Translate";
+
+<Heading
+  as={"h1"}
+  className={"openapi__heading"}
+  children={"Receive a new order — allocates and releases automatically"}
+>
+</Heading>
+
+<MethodEndpoint
+  method={"post"}
+  path={"/orders"}
+  context={"endpoint"}
+>
+  
+</MethodEndpoint>
+
+
+
+Intake — the ReceiveOrder use case. Validates every requested line (SKU non-empty, quantity > 0), mints an `OrderId`, and persists the order in `Received` status, publishing `OrderReceived` unconditionally.
+
+Immediately afterward, in the SAME call, this service attempts allocation-then-release: it reserves stock per line via inventory-storage's `POST /reservations` (see the Allocation tag), and for every line that ends up `Allocated` and eligible under BR3 (see below), releases it — announced via the enriched `OrderAllocated` / `OrderPartiallyAllocated` Kafka events, never a second synchronous call. If that implicit allocation attempt hits a hard (non-business) failure, this endpoint still returns `201`: the order genuinely was received, and a caller expressing "place an order" must never be told that failed just because an internal, best-effort next step could not complete. The returned body reflects whatever the allocation pass actually achieved.
+
+`allowPartialShipment` defaults to `false` — ship-complete (BR3). Every line's `pathId` is always the internal default (`pick`) — a caller placing an order has no business supplying wes-work-planning's process-path vocabulary at intake; `pathId` is visible on every line in the response, but not settable on the request.
+
+
+<Heading
+  id={"request"}
+  as={"h2"}
+  className={"openapi-tabs__heading"}
+>
+  <Translate id="theme.openapi.request.title">Request</Translate>
+</Heading>
+
+<ParamsDetails>
+  
+</ParamsDetails>
+
+<RequestSchema
+  {...require("./receive-order.RequestSchema.json")}
+>
+  
+</RequestSchema>
+
+<StatusCodes
+  {...require("./receive-order.StatusCodes.json")}
+>
+  
+</StatusCodes>
+
+
+      

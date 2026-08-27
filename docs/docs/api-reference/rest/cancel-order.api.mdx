@@ -1,0 +1,75 @@
+---
+id: cancel-order
+title: "Cancel an order and revoke its reservations"
+description: "The CancelOrder use case. Revokes every allocated line's reservation on inventory-storage via `DELETE /reservations/{id}`, then cancels every line. Publishes `OrderCancelled`."
+sidebar_label: "Cancel an order and revoke its reservations"
+hide_title: true
+hide_table_of_contents: true
+api: eJztWl9vG7kR/yoDvsRWV7KS+P7pgALO2dcLLhcbitOiiAOI4o60PHPJDcmVLBgC+iH6CftJihnuaiVLaYO7lzzIDxak5XL+/2Y4nEfhKvQyamdf52IklLQKzbXP0YtM5BiU1xU9FSNxWyD81D2HOiAoGXAAY1y4ewyAC/QrkMY4JSPmYLTFZwE8BvQLJgLOgrYLtNH5VT9E5+UcYaElTC6v3lzdXsHZ1upw9qjz9SSDWKCFxFtLhfYewE09NToUGGDCTCX+DOaTwZ29s73eq/G38J9//Zt2aDYwiZGpq20u/WrU60EsdAAdwOBcGrh+++afsCy0QbCO6UAhSQqpCsxhMkaDMhAJIJW0G9EGqkB1jzm8uvr5enwF0q52hNe0C6kqzyA4kODxd1SkqR3WDMoFhgN6Uq6sDEY0K6htdDXxM4Brq5BJMatMIzGYweI55A4DvL2+BWXkEqZS3bMu2jWwdP6eNSQhR6On5A2YQe5UXaIl3uaygpOACBeXYxgOh+enGVgXQVpwC/RBz4vI2r6AmdQG80ZI/haY2rJw5on+pc1bQWmFSy7VSsX68Rj9Sts5yRTkDAd3VmQiynkQow+C7R3Ex0xU0ssSI30bfXgUVpYoRkLnIhOaHLeSsRCZ8Pip1h5zMYq+xkPezUw8C6BztFHPNPoM2PKx9hZzmJI5FeoFMvGByERQBZZSjB5FXFVENkSv7VxkotT2Ddp5LMTo+ToT+CDJeGIknM/78vn0hXqZn/eHw+Hwyb/m77lYfySmQ+VswEAkXgzP6WOX8RSMqnX8H/eicNsDl3LjggOxzsT5cLi/4y37x6caQ4Spy1fgPJAOYaNoskgpzcz5EnN6rO1CGp2TRpSzEW2kbWVVGa2Y8lnl3dRg+ZffA9F43Fecm1Is7KHO+Oef4Lvvh9/ByU3aAS4xsmPNnIdfbm9v4OLmdTgF9N55CIWsMCNsynlBUoZ1tv/i4QFabYJU3oWQAp+0oxVuYCLIEtM+yTNjgR5meoHtSgrN9GplZCQlAJY6JvfsvOxDkiwTUUdDnyHKWAeWkCRg1/WEv1En+yZN7LsSkZBRjETt9Z6CLuD9+HXrshwuxHXSBjnA3PkVnDAMUNRaxBwiBVdwZoGnA3hv9acaoUIPuQ5RWxWfvt7K2yggSdp5dBFjFUZnZ/xWGHAY9Utp5RwJQwZL6bFwdcB+WIWIZRjkuDhLy6yL/RlBKLlj0tQBDeyK/LN+IIgo6lLavkeZy6lBCHVZEg672QENDHYYTjFD6tiQbozT0dY24pzT4Eb92saXL/a4uayTlzdIxi6ZdgPlciQEkZT1eDs42Th04ymkodMd9s6H5+uNk/xfZVC0hgqVnmnVCF1iCJQvKADYbk6p2nu0Cnf14Pb1oG2IhCVfRriFCYaHWMgIlXd5rcjHiDDzs0sz2T3QR5+8kj0AH3SIYt25gGiiXWxD54ajP+ZwWFZx1Q/3tejIvPv1PZR1iKyEKQKv6WJ1dD4cdqYQ4b4+uLpTWiueWK/XjK8HEPuta9IdlRWp9jgi5xE5j8h5RM6vFDmfOlxH7Kk/bCPn+RZyPtXXIcw8LFiC0R/2YfQi0gEiRHAWu2OaNOTWK5gi2u6Uc/Jq/O3pEWOPGHvE2CPGfs0Y28BXv0WuPaht8S21pBp4I/QL3FJR0nLXylky5xS7xsAONP+wB81/Zt/PQPmXNTkY4L851Ie4sFBbfKhSi4xc1FtpGi9qnOZYOB9B/QjqR1D/SkG9Ba0+v7YF5l+EbVuQ/c1OH2LrVZnLijqy1GyvPf6vZsQ3w5f7IHvolqE2edvhaG49MpA2LNETwXKq57Wrg1ll3PoNsCT0oYit0Jc6BAKuE+v6rjqF0uU4gLcEilDJiregawNY6liAhBcPD6O2WU1I4lEaCNGp+67TIqsKpScICbVShCZLuhDSEXLNnCZ0OKaBYxo4poFjGvj60kDuljZEj7JkmsrZmZ7Xfqe8v4Bu1QYZ6Da3tpYvQT8Lrztp4uVWmtjaUBmNNn7Zfm3BT9ap0DPMJGO2swJ/ruY/44vdfgv6znJ+WmeixFg4GkPIka65RZaubjsKNA5A0qJftLe9tTeNWUZnZ7ShKVyIo++H3w/3/OYNPYYcF2hcRebiK9aAqvY6rsTow0eSa+bY3junrt82FibMF5ngi2/e9MVgONgnRS7KurVzqKvGCNcVWvjFhQjvGvumOEHYc5sNwI8ozZEdoddjXno9tk/z7Y22SL8EmGkfYl8ZGUIGfBvLt79yPvc4J4wYwCucOY/Jljy2QJMHlDQfInAcELbdCbrYp73vBN8X/05pWFK94paWVtS22z5FKGewNIExxtkEzmByiaW0efttjDNkFJjwUm1zrNBS5jB0p56KkHTDHguPCLme8Rtxk/oG8Av6lBiZ0OucvFmmgiElobjKWDeaHZ1WLqSpKXvauB1d8sBwxbMAk3zDM88zkA2NnqFaKcOhqG2U9wj9v0Lnu/StOS9nqaZ5MstBIyV1RYlva+6imxohdUzrSDxx+uD5jRyDntsMJChpDHpw1qy4ogB8qDyGgAGu314xtts4gl6vMpLHQJLpej04mdxcv7uFJnQmpwO46JgmLbWsSI9dARrkXEKIWD0pURocCCDr6EoZNTG2ysDT9AfIGQ8FsHqSCeRcap72mTwN9klb7qyYctdUqGiWR8H46t0tLNBPQyd+7jUNikypPWHzAfR6nSy9XjPhgKGpG6me4H5wLLyr58VBY1fN5FAOjZ62544mP4KEyfnwhwnMvCtTftnCZLLktA7UHQkwkyrCnbAO6pDKAeLiTmQ0RKQKnrlJRkj7tO3qrBkyotGdptRLNfze4MyWt1UyBPCSl8dCWgjatFGknM8pGGVHklTVzCv1esR5p24JYWVV4Z11VC9IY8hHiZl3NVXP6FOocixRMqgtJVeqKZLIzqZqx3qdBqM4LC/auROOe/7pRvqoyV22nv0qZ/cylSYppZB32xjgJLpKK5hsEHE/x6aVk9NWwUsMfRpj6ldGptymnA11SWWRA7SfaqwRdAyEo2ngSW7JblY0yLXl64UzOWtqZ3DN85v92urIRRZSvDabZilAU4A3SBdIdVTzhlT00tDNBlaSTIYyEUxS8p6wns1SrgJcXo1f//3qsnW+5nojrWsacmRLBgRy6WZgSsc2bedezyK4OhKTJGuCpnYr5i1VrTpgYLau0+LtqH8WujE5Pm21pTxpqIuqDCqt7jOoJP0Pha74YEjWSNo+iYXbAM2TUMwOmI/km9Vmpo0hg/fxAVVNVjjd4PuGFSpYDEjg1A/jXYv9w/n792SwTRYcwBUXqpu5qp0D2cXNax5r7I5+k8+dJCen8ORY2B1CpeJDaDOItldBnPwNLXqtzijQnOdj76smHf+U0vEpV6SVC7GUdmuvNN+4gfkGx3najlxxG8OeliSP3fn4OMp5HOX8KkY505mKHP6sMlJbOnNxQf/YVP4fRNPBysRI59S3oOqefn98nMqA771Zr+nnTzX6poJfSK8pD/PxINeck3MxmkkTnk59bsfEybjpn5zCH5wFPShO86O0NCfE5agYCZGJe1ylIdX1x3UmCpQ0ck0cpwcXSmEVt175bEeLjjCbg1OKPLFe/xdJpyzu
+sidebar_class_name: "delete api-method"
+info_path: docs/api-reference/rest/order-management-api
+custom_edit_url: null
+hide_send_button: true
+---
+
+import MethodEndpoint from "@theme/ApiExplorer/MethodEndpoint";
+import ParamsDetails from "@theme/ParamsDetails";
+import RequestSchema from "@theme/RequestSchema";
+import StatusCodes from "@theme/StatusCodes";
+import OperationTabs from "@theme/OperationTabs";
+import TabItem from "@theme/TabItem";
+import Heading from "@theme/Heading";
+import Translate from "@docusaurus/Translate";
+
+<Heading
+  as={"h1"}
+  className={"openapi__heading"}
+  children={"Cancel an order and revoke its reservations"}
+>
+</Heading>
+
+<MethodEndpoint
+  method={"delete"}
+  path={"/orders/{id}"}
+  context={"endpoint"}
+>
+  
+</MethodEndpoint>
+
+
+
+The CancelOrder use case. Revokes every allocated line's reservation on inventory-storage via `DELETE /reservations/{id}`, then cancels every line. Publishes `OrderCancelled`.
+
+**BR6 — the cancellation boundary:** this is legal ONLY while no line has reached `Released`. The boundary is checked BEFORE any reservation is revoked, so a rejected cancellation leaves inventory-storage completely untouched. Once any line is released, v1 does NOT claw back the released work — a deliberate, documented gap (see ADR 0004), not an oversight.
+
+A failed revoke fails the whole cancellation and leaves the order untouched, so retrying is safe.
+
+
+<Heading
+  id={"request"}
+  as={"h2"}
+  className={"openapi-tabs__heading"}
+>
+  <Translate id="theme.openapi.request.title">Request</Translate>
+</Heading>
+
+<ParamsDetails
+  {...require("./cancel-order.ParamsDetails.json")}
+>
+  
+</ParamsDetails>
+
+<RequestSchema
+  {...require("./cancel-order.RequestSchema.json")}
+>
+  
+</RequestSchema>
+
+<StatusCodes
+  {...require("./cancel-order.StatusCodes.json")}
+>
+  
+</StatusCodes>
+
+
+      

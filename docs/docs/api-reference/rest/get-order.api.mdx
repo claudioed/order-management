@@ -1,0 +1,71 @@
+---
+id: get-order
+title: "Read an order's current state"
+description: "The GetOrder use case. Returns the order with every line's current status, its reservation reference where allocated, and the promise date once allocation has computed one. The order-level `status` in this response is derived from the line statuses at read time — it is not a stored field."
+sidebar_label: "Read an order's current state"
+hide_title: true
+hide_table_of_contents: true
+api: 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
+sidebar_class_name: "get api-method"
+info_path: docs/api-reference/rest/order-management-api
+custom_edit_url: null
+hide_send_button: true
+---
+
+import MethodEndpoint from "@theme/ApiExplorer/MethodEndpoint";
+import ParamsDetails from "@theme/ParamsDetails";
+import RequestSchema from "@theme/RequestSchema";
+import StatusCodes from "@theme/StatusCodes";
+import OperationTabs from "@theme/OperationTabs";
+import TabItem from "@theme/TabItem";
+import Heading from "@theme/Heading";
+import Translate from "@docusaurus/Translate";
+
+<Heading
+  as={"h1"}
+  className={"openapi__heading"}
+  children={"Read an order's current state"}
+>
+</Heading>
+
+<MethodEndpoint
+  method={"get"}
+  path={"/orders/{id}"}
+  context={"endpoint"}
+>
+  
+</MethodEndpoint>
+
+
+
+The GetOrder use case. Returns the order with every line's current status, its reservation reference where allocated, and the promise date once allocation has computed one. The order-level `status` in this response is derived from the line statuses at read time — it is not a stored field.
+
+
+<Heading
+  id={"request"}
+  as={"h2"}
+  className={"openapi-tabs__heading"}
+>
+  <Translate id="theme.openapi.request.title">Request</Translate>
+</Heading>
+
+<ParamsDetails
+  {...require("./get-order.ParamsDetails.json")}
+>
+  
+</ParamsDetails>
+
+<RequestSchema
+  {...require("./get-order.RequestSchema.json")}
+>
+  
+</RequestSchema>
+
+<StatusCodes
+  {...require("./get-order.StatusCodes.json")}
+>
+  
+</StatusCodes>
+
+
+      

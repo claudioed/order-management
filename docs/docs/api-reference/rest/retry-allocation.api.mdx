@@ -1,0 +1,75 @@
+---
+id: retry-allocation
+title: "Re-attempt allocation for backordered lines, then release"
+description: "The RetryAllocation use case. Re-attempts allocation for the order's `Backordered` lines and ONLY those lines — it is the single sanctioned route from `Backordered` back to `Allocated`, and it is what unblocks a ship-complete order held back by BR3. UNLIKE the implicit allocation attempt folded into `POST /orders`, this is an explicit, on-purpose operator/recovery action: a hard (non-409) failure here fails the call with `503` rather than being swallowed — invoking this endpoint IS asking for allocation right now."
+sidebar_label: "Re-attempt allocation for backordered lines, then release"
+hide_title: true
+hide_table_of_contents: true
+api: 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
+sidebar_class_name: "post api-method"
+info_path: docs/api-reference/rest/order-management-api
+custom_edit_url: null
+hide_send_button: true
+---
+
+import MethodEndpoint from "@theme/ApiExplorer/MethodEndpoint";
+import ParamsDetails from "@theme/ParamsDetails";
+import RequestSchema from "@theme/RequestSchema";
+import StatusCodes from "@theme/StatusCodes";
+import OperationTabs from "@theme/OperationTabs";
+import TabItem from "@theme/TabItem";
+import Heading from "@theme/Heading";
+import Translate from "@docusaurus/Translate";
+
+<Heading
+  as={"h1"}
+  className={"openapi__heading"}
+  children={"Re-attempt allocation for backordered lines, then release"}
+>
+</Heading>
+
+<MethodEndpoint
+  method={"post"}
+  path={"/orders/{id}/retry-allocation"}
+  context={"endpoint"}
+>
+  
+</MethodEndpoint>
+
+
+
+The RetryAllocation use case. Re-attempts allocation for the order's `Backordered` lines and ONLY those lines — it is the single sanctioned route from `Backordered` back to `Allocated`, and it is what unblocks a ship-complete order held back by BR3. UNLIKE the implicit allocation attempt folded into `POST /orders`, this is an explicit, on-purpose operator/recovery action: a hard (non-409) failure here fails the call with `503` rather than being swallowed — invoking this endpoint IS asking for allocation right now.
+
+A line still short of stock stays `Backordered` (no error). The same fail-closed rule as intake's implicit allocation applies to any non-409 failure. An order with no backordered line at all is rejected with `409`: retrying an order that is not backordered is a caller mistake, not a no-op.
+
+On success, this ALSO attempts release in the same call — the same allocation-then-release flow `POST /orders` uses — announced via the enriched `OrderAllocated` / `OrderPartiallyAllocated` Kafka events rather than any synchronous call to a Supplier.
+
+
+<Heading
+  id={"request"}
+  as={"h2"}
+  className={"openapi-tabs__heading"}
+>
+  <Translate id="theme.openapi.request.title">Request</Translate>
+</Heading>
+
+<ParamsDetails
+  {...require("./retry-allocation.ParamsDetails.json")}
+>
+  
+</ParamsDetails>
+
+<RequestSchema
+  {...require("./retry-allocation.RequestSchema.json")}
+>
+  
+</RequestSchema>
+
+<StatusCodes
+  {...require("./retry-allocation.StatusCodes.json")}
+>
+  
+</StatusCodes>
+
+
+      

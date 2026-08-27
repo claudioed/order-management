@@ -1,0 +1,21 @@
+---
+id: orders
+title: "Orders"
+description: "Orders"
+custom_edit_url: null
+---
+
+
+
+Order intake and reads. An order is received with its lines in `Received` status, and this service immediately attempts allocation-then-release in the SAME call — a caller expresses intent by placing the order, not by separately driving internal saga steps.
+
+
+
+
+```mdx-code-block
+import DocCardList from '@theme/DocCardList';
+import {useCurrentSidebarCategory} from '@docusaurus/theme-common';
+
+<DocCardList items={useCurrentSidebarCategory().items}/>
+```
+      

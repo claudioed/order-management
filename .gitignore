@@ -1,4 +1,6 @@
 /order-management
+/order-projector
+/order-reports
 *.out
 .env
 coverage.out
