@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+
 	inboundhttp "github.com/claudioed/order-management/internal/adapters/inbound/http"
 	"github.com/claudioed/order-management/internal/adapters/outbound/events"
 	"github.com/claudioed/order-management/internal/adapters/outbound/inventorystorage"
@@ -148,17 +150,34 @@ func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logge
 	}
 
 	brokers := strings.Split(getenv("KAFKA_BROKERS", "localhost:9092"), ",")
+
+	// Integration publisher: forwards OrderAllocated/OrderPartiallyAllocated
+	// onto warehouse.order-management.events. Left exactly as-is.
 	writer := kafkaadapter.NewWriter(brokers...)
-	logger.Info("event publisher configured", "publisher", "kafka", "topic", kafkaadapter.Topic, "brokers", brokers)
+	integration := kafkaadapter.NewPublisher(writer)
+
+	// Analytics publisher: forwards the full report-input event set onto the
+	// SEPARATE warehouse.order-management.analytics topic for the data product
+	// (ADR-0006). It enriches each event with its process path via the order
+	// repo. A single OLTP event stream fans out to both publishers.
+	analytics := kafkaadapter.NewAnalyticsPublisher(brokers, orders, uuid.NewString)
+
+	logger.Info("event publisher configured", "publisher", "kafka",
+		"integration_topic", kafkaadapter.Topic, "analytics_topic", kafkaadapter.AnalyticsTopic, "brokers", brokers)
+
+	fanOut := kafkaadapter.NewFanOutPublisher(integration, analytics)
 
 	closeAll := func() {
+		if err := analytics.Close(); err != nil {
+			logger.Error("error closing analytics kafka writer", "error", err)
+		}
 		if err := writer.Close(); err != nil {
 			logger.Error("error closing kafka writer", "error", err)
 		}
 		closeRepos()
 	}
 
-	return orders, kafkaadapter.NewPublisher(writer), closeAll, nil
+	return orders, fanOut, closeAll, nil
 }
 
 // buildInventoryClient selects the outbound InventoryReservationClient via

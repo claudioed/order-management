@@ -5,11 +5,11 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 import apiSidebar from './docs/api-reference/rest/sidebar';
 
 /**
- * Five top-level categories, mirroring the pattern shared across the
+ * Top-level categories, mirroring the pattern shared across the
  * warehouse-systems documentation sites: Overview, Business Context,
- * Domain-Driven Design, API Reference, Ecosystem, Architecture Decision
- * Records. This service has no "AI Ecosystem (MCP)" category yet — no MCP
- * adapter exists in v1 (see CLAUDE.md's deferred scope).
+ * Domain-Driven Design, API Reference, Ecosystem, Analytics, Architecture
+ * Decision Records. This service has no "AI Ecosystem (MCP)" category yet —
+ * no MCP adapter exists in v1 (see CLAUDE.md's deferred scope).
  */
 const sidebars: SidebarsConfig = {
   docsSidebar: [
@@ -50,6 +50,12 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Analytics',
+      collapsed: false,
+      items: ['analytics/order-funnel-report'],
+    },
+    {
+      type: 'category',
       label: 'Architecture Decision Records',
       link: {type: 'doc', id: 'adr/about'},
       items: [
@@ -58,6 +64,7 @@ const sidebars: SidebarsConfig = {
         'adr/0003-ship-complete-default-and-fail-closed-allocation',
         'adr/0004-cancellation-boundary-at-release',
         'adr/0005-choreographed-release-via-kafka',
+        'adr/0006-analytical-data-product',
       ],
     },
   ],
