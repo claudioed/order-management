@@ -168,6 +168,27 @@ OrderPartiallyAllocated, OrderLineReleased, OrderReleased, OrderCancelled.
 
 JSON DTOs live in the http adapter; never leak domain structs.
 
+CORS middleware (`go-chi/cors`) is enabled on every route, allowing
+`CORS_ALLOWED_ORIGINS` (env, default `http://localhost:5173,http://localhost:5181`
+— the `warehouse-console` shell and this service's own `order-mgmt-mfe`
+remote) — added for the fleet's browser console (see "Frontend
+micro-frontend remote" below); no other behavior change.
+
+## Frontend micro-frontend remote (`web/`)
+
+This repo also owns `web/`: `order-mgmt-mfe`, a Vite + React Module
+Federation **remote** consumed by the separate `warehouse-console` shell
+repo. It is a plain browser client of this service's own REST API above
+— nothing in `web/` talks to any other bounded context, and nothing in
+`internal/` knows `web/` exists. Screens here (order search/lookup) are
+this repo's own responsibility to design and maintain, same as the REST
+API itself. See ADR-0002 in `warehouse-ops-agent`'s docs (the fleet-wide
+canonical record) and this repo's own adoption-record ADR under
+`docs/docs/adr/` for the full rationale. `web/` has its own `package.json`,
+build, and dev server (`:5181`); it does not participate in this repo's
+Go quality gate (`make check`/`check-all`) and is not part of the Go
+module.
+
 ## Outbound HTTP contracts this service consumes (EXACT — verified against the live repos, do not guess a different shape)
 
 **inventory-storage** (base URL via env `INVENTORY_STORAGE_BASE_URL`):
