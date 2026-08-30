@@ -48,3 +48,28 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- include "order-management.fullname" . }}-database
 {{- end }}
 {{- end }}
+
+{{/*
+Fully qualified name of the analytics projector deployment (ADR-0006).
+*/}}
+{{- define "order-management.projectorFullname" -}}
+{{- include "order-management.fullname" . }}-projector
+{{- end }}
+
+{{/*
+Fully qualified name of the analytics reports deployment/service (ADR-0006).
+*/}}
+{{- define "order-management.reportsFullname" -}}
+{{- include "order-management.fullname" . }}-reports
+{{- end }}
+
+{{/*
+Name of the Secret holding the analytics DSNs, when the chart creates its own.
+*/}}
+{{- define "order-management.analyticsSecretName" -}}
+{{- if .Values.analytics.database.existingSecret }}
+{{- .Values.analytics.database.existingSecret }}
+{{- else }}
+{{- include "order-management.fullname" . }}-analytics
+{{- end }}
+{{- end }}
