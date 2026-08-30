@@ -110,3 +110,66 @@ readinessProbe:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# Deployment environment, exported as the deployment.environment.name OTel
+# resource attribute where consumed. Only the analytics projector/reports
+# containers below reference this today (see the otel block note).
+environment: "local"
+
+# OpenTelemetry. NOTE: unlike wes-work-planning, order-management's own
+# cmd/order, cmd/order-projector, and cmd/order-reports binaries do not
+# currently read OTEL_EXPORTER_OTLP_ENDPOINT (verified against the Go
+# source; see CLAUDE.md's analytics section). This block exists solely so
+# the analytics projector/reports templates below (copied verbatim from
+# wes-work-planning, which DOES support OTLP) have a value to guard on. It
+# stays disabled by default and renders no OTEL env vars unless flipped on;
+# flipping it on today would set env vars the binaries simply ignore.
+otel:
+  enabled: false
+  endpoint: "http://otel-collector.observability.svc.cluster.local:4317"
+  serviceName: "order-management"
+
+# --- analytics data product (ADR-0006) ---
+# The per-service "Order Funnel & Allocation Health" report: a separate
+# analytics topic, a writer (projector) and a read-only reader (reports),
+# backed by a separate analytical database. Disabled by default so existing
+# releases are unaffected; set analytics.enabled=true to deploy the two extra
+# processes.
+analytics:
+  enabled: false
+  # Directory (inside the image) of the analytical *.up.sql migrations the
+  # projector applies on start.
+  migrationsPath: "migrations/analytics"
+  database:
+    # The projector's read-write analytical DSN.
+    projectorUrl: ""
+    # The reader's DSN — a read-only role where possible; falls back to the
+    # projector DSN when empty (local/dev).
+    reportsUrl: ""
+    # Name of an existing Secret with ANALYTICS_DATABASE_URL and
+    # ANALYTICS_READER_DATABASE_URL keys. Takes precedence over the URLs above.
+    existingSecret: ""
+  projector:
+    replicaCount: 1
+    adminAddr: ":8091"
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+  reports:
+    replicaCount: 1
+    httpAddr: ":8092"
+    service:
+      type: ClusterIP
+      port: 80
+      targetPort: 8092
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
