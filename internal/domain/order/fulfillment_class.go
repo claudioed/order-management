@@ -59,3 +59,5 @@ func classify(lines []*OrderLine) FulfillmentClass {
 func (o *Order) FulfillmentClass() FulfillmentClass {
 	return classify(o.lines)
 }
+
+func (c FulfillmentClass) String() string { return string(c) }

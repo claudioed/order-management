@@ -86,6 +86,20 @@ fail the call outright rather than silently marking a line backordered
 
 *Code:* `order.LineStatusBackordered`
 
+### FulfillmentClass
+
+The order's **demand-shape classifier** — `SINGLE`, `SAME_SKU_MULTI`, or
+`MULTI_LINE_MULTI` — derived from line count and per-line quantity, never
+stored. It is a value about the shipment's composition, not an
+identity, and it carries no opinion about which process path (Pick,
+Pack, SLAM, or a future Rebin) any line is dispatched to downstream —
+see [ADR 0008](/docs/adr/0008-fulfillment-class-demand-shape-classifier).
+Propagated additively on `shared.ReleasedLine` and the
+`OrderAllocated`/`OrderPartiallyAllocated` Kafka payload's
+`fulfillment_class` field, the same mechanism `GiftWrap` already uses.
+
+*Code:* `internal/domain/order.Order.FulfillmentClass()`
+
 ## Value objects
 
 | Term | Rule |

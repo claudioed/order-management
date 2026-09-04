@@ -307,3 +307,20 @@ func assertEventNames(t *testing.T, p *recordingPublisher, want ...string) {
 		}
 	}
 }
+
+// findOrderAllocated returns the first shared.OrderAllocated event
+// published to p, failing the test if none was published. Use this
+// instead of assertEventNames when a test needs to inspect an event's
+// payload (e.g. Lines[].FulfillmentClass), not just confirm it fired.
+func findOrderAllocated(t *testing.T, p *recordingPublisher) shared.OrderAllocated {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range p.events {
+		if a, ok := e.(shared.OrderAllocated); ok {
+			return a
+		}
+	}
+	t.Fatalf("no OrderAllocated event was published; events = %v", p.names())
+	return shared.OrderAllocated{}
+}

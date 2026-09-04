@@ -43,10 +43,11 @@ type envelope struct {
 }
 
 type releasedLineData struct {
-	LineNo   int    `json:"line_no"`
-	SKU      string `json:"sku"`
-	PathID   string `json:"path_id"`
-	GiftWrap bool   `json:"gift_wrap"`
+	LineNo           int    `json:"line_no"`
+	SKU              string `json:"sku"`
+	PathID           string `json:"path_id"`
+	GiftWrap         bool   `json:"gift_wrap"`
+	FulfillmentClass string `json:"fulfillment_class"`
 }
 
 type allocationData struct {
@@ -62,8 +63,8 @@ func TestPublisher_OrderAllocated_EnvelopeShape(t *testing.T) {
 	occurredAt := time.Date(2026, 8, 25, 9, 0, 0, 0, time.UTC)
 	promiseDate := occurredAt.Add(24 * time.Hour)
 	lines := []shared.ReleasedLine{
-		{LineNo: 1, SKU: "SKU-1", PathID: "pick", GiftWrap: true},
-		{LineNo: 2, SKU: "SKU-2", PathID: "singles", GiftWrap: false},
+		{LineNo: 1, SKU: "SKU-1", PathID: "pick", GiftWrap: true, FulfillmentClass: "MULTI_LINE_MULTI"},
+		{LineNo: 2, SKU: "SKU-2", PathID: "singles", GiftWrap: false, FulfillmentClass: "MULTI_LINE_MULTI"},
 	}
 	event := shared.NewOrderAllocated(occurredAt, "ord-42", promiseDate, lines)
 
@@ -106,11 +107,11 @@ func TestPublisher_OrderAllocated_EnvelopeShape(t *testing.T) {
 	if len(data.Lines) != 2 {
 		t.Fatalf("data.lines = %v, want 2 entries", data.Lines)
 	}
-	if data.Lines[0].LineNo != 1 || data.Lines[0].SKU != "SKU-1" || data.Lines[0].PathID != "pick" || !data.Lines[0].GiftWrap {
-		t.Errorf("data.lines[0] = %+v, want {1 SKU-1 pick true}", data.Lines[0])
+	if data.Lines[0].LineNo != 1 || data.Lines[0].SKU != "SKU-1" || data.Lines[0].PathID != "pick" || !data.Lines[0].GiftWrap || data.Lines[0].FulfillmentClass != "MULTI_LINE_MULTI" {
+		t.Errorf("data.lines[0] = %+v, want {1 SKU-1 pick true MULTI_LINE_MULTI}", data.Lines[0])
 	}
-	if data.Lines[1].LineNo != 2 || data.Lines[1].SKU != "SKU-2" || data.Lines[1].PathID != "singles" || data.Lines[1].GiftWrap {
-		t.Errorf("data.lines[1] = %+v, want {2 SKU-2 singles false}", data.Lines[1])
+	if data.Lines[1].LineNo != 2 || data.Lines[1].SKU != "SKU-2" || data.Lines[1].PathID != "singles" || data.Lines[1].GiftWrap || data.Lines[1].FulfillmentClass != "MULTI_LINE_MULTI" {
+		t.Errorf("data.lines[1] = %+v, want {2 SKU-2 singles false MULTI_LINE_MULTI}", data.Lines[1])
 	}
 }
 

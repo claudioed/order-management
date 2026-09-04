@@ -78,10 +78,11 @@ func NewOrderLineBackordered(occurredAt time.Time, orderID OrderId, lineNo int, 
 // and shapes here are mirrored byte-for-byte by wes-work-planning's
 // consumer and must not be changed casually.
 type ReleasedLine struct {
-	LineNo   int
-	SKU      SKU
-	PathID   PathId
-	GiftWrap bool
+	LineNo           int
+	SKU              SKU
+	PathID           PathId
+	GiftWrap         bool
+	FulfillmentClass string
 }
 
 // OrderAllocated: every line on the order is allocated — and, per the

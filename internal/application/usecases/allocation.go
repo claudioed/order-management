@@ -241,12 +241,14 @@ func allocateAndRelease(
 	// pass) is eligible and is released right here, in the same flow.
 	var released []shared.ReleasedLine
 	if err := o.EnsureReleasable(); err == nil {
+		class := o.FulfillmentClass().String()
 		for _, line := range o.LinesWithStatus(order.LineAllocated) {
 			if err := o.Release(line.LineNo()); err != nil {
 				return outcome, err
 			}
 			released = append(released, shared.ReleasedLine{
 				LineNo: line.LineNo(), SKU: line.SKU(), PathID: line.PathID(), GiftWrap: line.GiftWrap(),
+				FulfillmentClass: class,
 			})
 		}
 	}

@@ -59,11 +59,18 @@ type envelope struct {
 // verbatim with wes-work-planning's Kafka consumer (see CLAUDE.md's Kafka
 // integration section). Field names are snake_case per the fleet's
 // existing wire convention (e.g. inventory-storage's demand_ref).
+//
+// fulfillment_class is additive: it carries Order.FulfillmentClass()
+// (SINGLE / SAME_SKU_MULTI / MULTI_LINE_MULTI), the same value for every
+// line released in one pass since it classifies the whole order, not the
+// individual line. Consumers that predate this field can safely ignore
+// it — see ADR-0008.
 type releasedLineData struct {
-	LineNo   int    `json:"line_no"`
-	SKU      string `json:"sku"`
-	PathID   string `json:"path_id"`
-	GiftWrap bool   `json:"gift_wrap"`
+	LineNo           int    `json:"line_no"`
+	SKU              string `json:"sku"`
+	PathID           string `json:"path_id"`
+	GiftWrap         bool   `json:"gift_wrap"`
+	FulfillmentClass string `json:"fulfillment_class"`
 }
 
 // allocationData is the `data` payload shape for both OrderAllocated and
@@ -102,6 +109,7 @@ func toReleasedLineData(lines []shared.ReleasedLine) []releasedLineData {
 	for _, l := range lines {
 		out = append(out, releasedLineData{
 			LineNo: l.LineNo, SKU: l.SKU.String(), PathID: l.PathID.String(), GiftWrap: l.GiftWrap,
+			FulfillmentClass: l.FulfillmentClass,
 		})
 	}
 	return out
