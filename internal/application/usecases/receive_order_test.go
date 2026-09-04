@@ -63,6 +63,32 @@ func TestReceiveOrder(t *testing.T) {
 		}
 	})
 
+	t.Run("stamps the order's computed FulfillmentClass onto every released line", func(t *testing.T) {
+		f := newFixture()
+
+		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			line("SKU-1", 2, "pick"),
+			{SKU: "SKU-2", Quantity: 1, PathID: "singles", GiftWrap: true},
+		}, false)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		wantClass := o.FulfillmentClass().String()
+		if wantClass != string(order.ClassMultiLineMulti) {
+			t.Fatalf("test setup: want a MultiLineMulti order, got %q", wantClass)
+		}
+
+		allocated := findOrderAllocated(t, f.events)
+		if len(allocated.Lines) != 2 {
+			t.Fatalf("OrderAllocated.Lines = %v, want 2 entries", allocated.Lines)
+		}
+		for _, l := range allocated.Lines {
+			if l.FulfillmentClass != wantClass {
+				t.Errorf("released line %+v has FulfillmentClass %q, want %q", l, l.FulfillmentClass, wantClass)
+			}
+		}
+	})
+
 	t.Run("a backordered line keeps a ship-complete order held back from release", func(t *testing.T) {
 		f := newFixture()
 		f.inventory.reserveErrBySKU["SKU-2"] = ports.ErrInsufficientStock
