@@ -67,6 +67,7 @@ const sidebars: SidebarsConfig = {
         'adr/0006-analytical-data-product',
         'adr/0007-adopt-fleet-micro-frontend-console',
         'adr/0008-fulfillment-class-demand-shape-classifier',
+        'adr/0009-standard-metrics-convention',
       ],
     },
   ],
