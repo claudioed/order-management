@@ -66,6 +66,8 @@ Typos, broken links and formatting are of course fair game.
 | [0004](./0004-cancellation-boundary-at-release.md) | The cancellation boundary is release | Accepted, with a documented known gap |
 | [0005](./0005-choreographed-release-via-kafka.md) | Choreographed release via Kafka, folded allocate-then-release, and pathId goes internal-only | Accepted |
 | [0006](./0006-analytical-data-product.md) | Per-service analytical data product (report) via a separate analytics topic | Accepted |
+| [0007](./0007-adopt-fleet-micro-frontend-console.md) | Adopt the fleet's micro-frontend console architecture (`order-mgmt-mfe`) | Accepted |
+| [0008](./0008-fulfillment-class-demand-shape-classifier.md) | FulfillmentClass — a demand-shape classifier, not a process-path name | Accepted |
 
 Each of these reconstructs a decision that is actually visible in this
 repository's `CLAUDE.md` and code — none is a generic placeholder.

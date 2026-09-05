@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "order-management.fullname" . }}
+  labels:
+    {{- include "order-management.labels" . | nindent 4 }}
+data:
+  HTTP_ADDR: {{ .Values.config.httpAddr | quote }}
+  EVENT_PUBLISHER: {{ .Values.config.eventPublisher | quote }}
+  {{- if eq .Values.config.eventPublisher "kafka" }}
+  KAFKA_BROKERS: {{ .Values.kafka.brokers | quote }}
+  {{- end }}
+  INVENTORY_STORAGE_MODE: {{ .Values.inventoryStorage.mode | quote }}
+  {{- if .Values.inventoryStorage.baseUrl }}
+  INVENTORY_STORAGE_BASE_URL: {{ .Values.inventoryStorage.baseUrl | quote }}
+  {{- end }}

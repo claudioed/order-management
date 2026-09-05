@@ -1,0 +1,71 @@
+# Dependency-drift sensor. Keeps the Go module graph and the pinned GitHub
+# Actions / go-version from silently ageing into known-vulnerable territory
+# between govulncheck runs.
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "gomod"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "go"
+    groups:
+      # One PR per week for the low-risk bumps; majors still come separately
+      # so they get a human read.
+      go-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # docs/ is a separate npm workspace (Docusaurus site) that gomod/govulncheck
+  # never see — without this, npm CVEs here go undetected until someone
+  # manually runs `npm audit` (see the 2026-08-29 remediation: 7 alerts were
+  # unnoticed for this reason before this ecosystem was added).
+  - package-ecosystem: "npm"
+    directory: "/docs"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "npm"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "npm"
+      - "docs"
+    groups:
+      npm-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"

@@ -29,6 +29,10 @@ flowchart TB
     subgraph GENERIC["Generic subdomain"]
         FL["<b>facility-layout</b>"]
     end
+    subgraph CONSOLE["Fleet console (ADR-0007)"]
+        BFF["<b>warehouse-ops-agent</b><br/>console-bff"]
+        MFE["<b>order-mgmt-mfe</b><br/>(this repo's web/)"]
+    end
 
     OM ==>|"HTTP POST /reservations<br/>HTTP DELETE /reservations/{id}"| INV
     OM ==>|"HTTP POST /paths/{pathId}/work-units"| WP
@@ -36,20 +40,47 @@ flowchart TB
     WM -->|"warehouse.workforce.events"| WP
     WP -->|"warehouse.work-planning.events"| FE
     FE -->|"warehouse.fulfillment.events"| WP
+    BFF -.->|"HTTP GET /orders/{id}<br/>(CORS-only, no new endpoint)"| OM
+    MFE -.->|"HTTP GET (own REST API)"| OM
 
     classDef this fill:#1d4ed8,stroke:#1e3a8a,color:#fff,stroke-width:4px;
     classDef core fill:#1e3a8a,stroke:#1e293b,color:#fff;
     classDef supp fill:#6d28d9,stroke:#4c1d95,color:#fff;
     classDef gen fill:#475569,stroke:#94a3b8,color:#fff,stroke-dasharray: 6 4;
+    classDef console fill:#0f766e,stroke:#134e4a,color:#fff,stroke-dasharray: 3 3;
     class OM this;
     class INV,WP,FE core;
     class WM supp;
     class FL gen;
+    class BFF,MFE console;
 ```
 
 **Bold edges are this context's own live HTTP calls.** Thin edges are the
 pre-existing Kafka topics between the other five services — this context
-does not participate in any of them.
+does not participate in any of them. **Dashed teal edges are new inbound
+callers** added by adopting the fleet's micro-frontend console architecture
+(see [ADR-0007](../adr/0007-adopt-fleet-micro-frontend-console.md)): the
+`warehouse-ops-agent` console-bff calls this service's existing
+`GET /orders/{id}` as the first hop of its cross-service Order Lifecycle
+fan-out, and this repo's own `order-mgmt-mfe` remote calls this service's
+REST API directly for its own operator screens. Both are inbound HTTP only —
+neither changes this context's own outbound Customer/Supplier calls below.
+
+## New inbound callers (ADR-0007)
+
+Per [ADR-0007](../adr/0007-adopt-fleet-micro-frontend-console.md), this
+context adopted the fleet-wide micro-frontend console architecture defined in
+`warehouse-ops-agent`'s own ADR-0002. Two new inbound HTTP callers exist as a
+result — both **read-only**, both hitting endpoints that already existed:
+
+| Caller | Call | Notes |
+| --- | --- | --- |
+| `warehouse-ops-agent` console-bff | `GET /orders/{id}` | First hop of the cross-cutting Order Lifecycle screen's fan-out. No new endpoint — the BFF already has the order id and calls this service's existing aggregate-root lookup. |
+| `order-mgmt-mfe` (this repo's `web/`) | This service's full REST API | This context's own Module Federation remote, serving its own operator screens (order intake, allocation/release status, backorder visibility). |
+
+Enabling both required adding `go-chi/cors` middleware to this service's
+existing HTTP adapter (`CORS_ALLOWED_ORIGINS`, additive, no gateway) — the
+only backend change this adoption required.
 
 ## This service's edges
 

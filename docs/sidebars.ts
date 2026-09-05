@@ -65,6 +65,8 @@ const sidebars: SidebarsConfig = {
         'adr/0004-cancellation-boundary-at-release',
         'adr/0005-choreographed-release-via-kafka',
         'adr/0006-analytical-data-product',
+        'adr/0007-adopt-fleet-micro-frontend-console',
+        'adr/0008-fulfillment-class-demand-shape-classifier',
       ],
     },
   ],

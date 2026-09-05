@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 
 	"github.com/claudioed/order-management/internal/application/usecases"
 	"github.com/claudioed/order-management/internal/domain/order"
@@ -37,6 +40,7 @@ func NewRouter(s *Server, logger *slog.Logger) http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(RequestLogger(logger))
 	r.Use(middleware.Recoverer)
+	r.Use(corsMiddleware())
 
 	r.Get("/healthz", s.handleHealthz)
 	r.Post("/orders", s.handleReceiveOrder)
@@ -202,4 +206,23 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// corsMiddleware allows the warehouse-console browser SPA (and this
+// service's own future MFE remote dev origin) to call this API directly
+// from the browser. Static-bearer-key auth, not cookies, so credentials
+// are never needed here. CORS_ALLOWED_ORIGINS overrides the local-dev
+// default (comma-separated) for staging/prod deployments.
+func corsMiddleware() func(http.Handler) http.Handler {
+	origins := []string{"http://localhost:5173", "http://localhost:5181"}
+	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
+		origins = strings.Split(v, ",")
+	}
+	return cors.Handler(cors.Options{
+		AllowedOrigins:   origins,
+		AllowedMethods:   []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+		AllowCredentials: false,
+		MaxAge:           300,
+	})
 }

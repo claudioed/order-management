@@ -1,0 +1,175 @@
+# Default values for order-management.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/claudioed/order-management
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: order-management.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+
+config:
+  httpAddr: ":8080"
+  eventPublisher: "log"   # "log" or "kafka" — gates the outbound domain-event publisher only
+
+database:
+  url: ""
+  existingSecret: ""
+  existingSecretKey: "DATABASE_URL"
+
+# KAFKA_BROKERS is only rendered when config.eventPublisher is "kafka".
+# Unlike fulfillment-execution, order-management has no inbound Kafka
+# consumer — this is purely the outbound domain-event publisher toggle
+# (cmd/order/main.go: buildRepoAdapters, EVENT_PUBLISHER env var).
+kafka:
+  brokers: "kafka:9092"
+
+# inventory-storage is this service's outbound HTTP dependency for per-line
+# stock allocation (POST/DELETE /reservations). Defaults to "permissive"
+# (no-op — AllocateOrder/CancelOrder refuse rather than fabricate a fake
+# success), matching the binary's own safe default. Set mode to "http" and
+# point baseUrl at a real inventory-storage deployment for allocation to
+# actually work (cmd/order/main.go: buildInventoryClient).
+inventoryStorage:
+  mode: "permissive"
+  baseUrl: ""
+
+# NOTE: order-management does not yet wire OpenTelemetry — cmd/order/main.go
+# has no OTEL_EXPORTER_OTLP_ENDPOINT support as of this chart version. No
+# otel block is defined here rather than inventing env vars the binary
+# doesn't read; add one once the binary actually supports OTLP export.
+
+extraEnv: []
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 5
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Deployment environment, exported as the deployment.environment.name OTel
+# resource attribute where consumed. Only the analytics projector/reports
+# containers below reference this today (see the otel block note).
+environment: "local"
+
+# OpenTelemetry. NOTE: unlike wes-work-planning, order-management's own
+# cmd/order, cmd/order-projector, and cmd/order-reports binaries do not
+# currently read OTEL_EXPORTER_OTLP_ENDPOINT (verified against the Go
+# source; see CLAUDE.md's analytics section). This block exists solely so
+# the analytics projector/reports templates below (copied verbatim from
+# wes-work-planning, which DOES support OTLP) have a value to guard on. It
+# stays disabled by default and renders no OTEL env vars unless flipped on;
+# flipping it on today would set env vars the binaries simply ignore.
+otel:
+  enabled: false
+  endpoint: "http://otel-collector.observability.svc.cluster.local:4317"
+  serviceName: "order-management"
+
+# --- analytics data product (ADR-0006) ---
+# The per-service "Order Funnel & Allocation Health" report: a separate
+# analytics topic, a writer (projector) and a read-only reader (reports),
+# backed by a separate analytical database. Disabled by default so existing
+# releases are unaffected; set analytics.enabled=true to deploy the two extra
+# processes.
+analytics:
+  enabled: false
+  # Directory (inside the image) of the analytical *.up.sql migrations the
+  # projector applies on start.
+  migrationsPath: "migrations/analytics"
+  database:
+    # The projector's read-write analytical DSN.
+    projectorUrl: ""
+    # The reader's DSN — a read-only role where possible; falls back to the
+    # projector DSN when empty (local/dev).
+    reportsUrl: ""
+    # Name of an existing Secret with ANALYTICS_DATABASE_URL and
+    # ANALYTICS_READER_DATABASE_URL keys. Takes precedence over the URLs above.
+    existingSecret: ""
+  projector:
+    replicaCount: 1
+    adminAddr: ":8091"
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+  reports:
+    replicaCount: 1
+    httpAddr: ":8092"
+    service:
+      type: ClusterIP
+      port: 80
+      targetPort: 8092
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
