@@ -11,6 +11,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
+	"github.com/riandyrn/otelchi"
+	otelchimetric "github.com/riandyrn/otelchi/metric"
 
 	"github.com/claudioed/order-management/internal/application/usecases"
 	"github.com/claudioed/order-management/internal/domain/order"
@@ -30,14 +32,30 @@ type Server struct {
 }
 
 // NewRouter builds the chi router for every endpoint in CLAUDE.md's REST
-// API. A nil logger defaults to slog.Default().
-func NewRouter(s *Server, logger *slog.Logger) http.Handler {
+// API. A nil logger defaults to slog.Default(); an empty serviceName
+// defaults to DefaultServiceName.
+//
+// Middleware order matters here: otelchi runs before RequestLogger so the
+// request context already carries a span by the time a line is logged,
+// and otelchimetric's duration histogram is wired right after it, mirroring
+// inventory-storage's NewRouter and the fleet-standard-metrics ADR's Tier 1
+// HTTP RED requirement exactly. WithChiRoutes resolves the route pattern up
+// front, so spans/metrics are labeled "/orders/{id}" rather than one
+// distinct series per order id.
+func NewRouter(s *Server, logger *slog.Logger, serviceName string) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if serviceName == "" {
+		serviceName = DefaultServiceName
 	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	r.Use(otelchi.Middleware(serviceName, otelchi.WithChiRoutes(r)))
+	// Emits http.server.request.duration (seconds) per OTel HTTP semantic
+	// conventions; no hand-rolled histogram needed.
+	r.Use(otelchimetric.NewServerRequestDuration(otelchimetric.NewBaseConfig(serviceName)))
 	r.Use(RequestLogger(logger))
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware())

@@ -22,6 +22,7 @@ import (
 	kafkaadapter "github.com/claudioed/order-management/internal/adapters/outbound/kafka"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
 	"github.com/claudioed/order-management/internal/adapters/outbound/postgres"
+	"github.com/claudioed/order-management/internal/adapters/outbound/telemetry"
 	"github.com/claudioed/order-management/internal/application/ports"
 	"github.com/claudioed/order-management/internal/application/usecases"
 	"github.com/claudioed/order-management/internal/domain/order"
@@ -38,6 +39,38 @@ func main() {
 func run() error {
 	logger := newLogger(getenv("LOG_LEVEL", "info"))
 	slog.SetDefault(logger)
+
+	ctx := context.Background()
+
+	serviceName := getenv("OTEL_SERVICE_NAME", inboundhttp.DefaultServiceName)
+	otlpEndpoint := getenv("OTEL_EXPORTER_OTLP_ENDPOINT", telemetry.DefaultEndpoint)
+
+	// Telemetry comes up before any adapter, so every subsequent adapter is
+	// built against the real providers rather than the no-op globals.
+	// Export is non-blocking: an unreachable Collector costs telemetry,
+	// never availability.
+	shutdownTelemetry, err := telemetry.Setup(ctx, serviceName, getenv("SERVICE_VERSION", telemetry.DefaultServiceVersion), otlpEndpoint)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTelemetry(shutdownCtx); err != nil {
+			logger.Warn("telemetry shutdown did not flush cleanly", "error", err)
+		}
+	}()
+	logger.Info("telemetry configured",
+		"service_name", serviceName,
+		"service_version", getenv("SERVICE_VERSION", telemetry.DefaultServiceVersion),
+		"environment", getenv("ENVIRONMENT", telemetry.DefaultEnvironment),
+		"otlp_endpoint", otlpEndpoint,
+	)
+
+	orderMetrics, err := telemetry.NewOrderMetrics()
+	if err != nil {
+		return err
+	}
 
 	httpAddr := getenv("HTTP_ADDR", ":8080")
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -58,7 +91,7 @@ func run() error {
 
 	clock := memory.SystemClock{}
 	server := &inboundhttp.Server{
-		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise},
+		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise, Metrics: orderMetrics},
 		RetryAllocation: &usecases.RetryAllocation{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
 		CancelOrder:     &usecases.CancelOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock},
 		GetOrder:        &usecases.GetOrder{Orders: orders},
@@ -66,7 +99,7 @@ func run() error {
 
 	httpServer := &http.Server{
 		Addr:              httpAddr,
-		Handler:           inboundhttp.NewRouter(server, logger),
+		Handler:           inboundhttp.NewRouter(server, logger, serviceName),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
