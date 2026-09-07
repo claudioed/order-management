@@ -96,9 +96,17 @@ func NewPublisher(writer Writer) *Publisher {
 // NewWriter builds a *kafkago.Writer addressed at Topic on the given broker
 // addresses.
 func NewWriter(brokers ...string) *kafkago.Writer {
+	return NewWriterForTopic(Topic, brokers...)
+}
+
+// NewWriterForTopic builds a Kafka writer for topic on the given brokers.
+// Production code should use NewWriter, which pins the published integration
+// topic. This variant lets integration tests exercise the identical writer
+// configuration against an isolated, per-test topic.
+func NewWriterForTopic(topic string, brokers ...string) *kafkago.Writer {
 	return &kafkago.Writer{
 		Addr:                   kafkago.TCP(brokers...),
-		Topic:                  Topic,
+		Topic:                  topic,
 		Balancer:               &kafkago.LeastBytes{},
 		AllowAutoTopicCreation: true,
 	}

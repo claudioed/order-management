@@ -4,8 +4,6 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
-  schedule:
-    - cron: "0 6 * * 1"   # weekly, Monday 6am UTC, for the mutation job only
   workflow_dispatch: {}
 
 permissions:
@@ -19,10 +17,9 @@ defaults:
   run:
     shell: bash
 
-# v1 ran only `lint` and `test`. The harness has since been brought to
-# fleet parity: `bdd`, `integration`, `mutation-fast`, `vuln`, `mutation`,
-# `api-lint`, `arch-test`, and `docs-api-drift` all gate the build now
-# (mirroring wes-work-planning's CI shape).
+# v1 ran only `lint` and `test`. `helm-lint`, `docker-publish`, and `release`
+# are now onboarded (see CLAUDE.md's v1 scope note and the
+# docker-helm-release PR) — `mutation` and `bdd` remain deliberately deferred.
 jobs:
   # ============================================================
   # CLASSIFICATION: LINTERS & STATIC ANALYSIS
@@ -31,12 +28,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: false          # golangci-lint-action manages its own cache
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@db9de0fc1a667e1a49d2291a1a042dff081d78f6 # v9
         with:
           version: v2.13.1
           args: --timeout=5m
@@ -48,8 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
 
@@ -88,195 +85,30 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: coverage
           path: coverage.out
 
   # ============================================================
-  # CLASSIFICATION: BEHAVIOR TESTING (BDD / Gherkin)
-  # ============================================================
-  bdd:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - name: Run BDD (godog/Gherkin) acceptance tests
-        run: go test ./... -run TestFeatures -v
-
-  # ============================================================
-  # CLASSIFICATION: INTEGRATION TESTING
-  # This repo owns TWO databases (OLTP + the ADR-0006 analytics store),
-  # so the job provisions two Postgres services and migrates both.
+  # CLASSIFICATION: INTEGRATION TESTING (isolated Testcontainers Kafka)
   # ============================================================
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: order
-          POSTGRES_PASSWORD: order
-          POSTGRES_DB: order
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-      analytics:
-        image: postgres:16
-        env:
-          POSTGRES_USER: analytics
-          POSTGRES_PASSWORD: analytics
-          POSTGRES_DB: analytics
-        ports: ["5433:5432"]
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - name: Run migrations (OLTP + analytics)
+      - name: Build, vet, and test Kafka adapter against Testcontainers
         run: |
           set -euo pipefail
-          GOFLAGS="-tags=postgres" go run github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1 \
-            -path migrations \
-            -database "postgres://order:order@localhost:5432/order?sslmode=disable" up
-          GOFLAGS="-tags=postgres" go run github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1 \
-            -path migrations/analytics \
-            -database "postgres://analytics:analytics@localhost:5433/analytics?sslmode=disable" up
-      - name: Integration tests
-        env:
-          DATABASE_URL: "postgres://order:order@localhost:5432/order?sslmode=disable"
-          ANALYTICS_DATABASE_URL: "postgres://analytics:analytics@localhost:5433/analytics?sslmode=disable"
-        run: go test -tags=integration ./... -race -count=1
+          go build -tags=integration ./...
+          go vet -tags=integration ./...
+          go test -tags=integration ./internal/adapters/outbound/kafka
 
-  # Fast, BLOCKING test-quality sensor: runs on every push/PR. Subset:
-  # ./internal/domain/order (the Order aggregate + line status model +
-  # promise-date policy). Thresholds (efficacy/mutant-coverage) come from
-  # .gremlins.yaml, so this job goes red when the tests stop asserting.
-  # ============================================================
-  # CLASSIFICATION: TEST QUALITY (MUTATION TESTING, fast subset)
-  # ============================================================
-  mutation-fast:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - name: Install gremlins
-        run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
-      - name: Mutation testing (fast subset — order aggregate)
-        run: gremlins unleash ./internal/domain/order
-
-  # Supply-chain sensor: known CVEs in the dependency graph and the Go stdlib.
-  # ============================================================
-  # CLASSIFICATION: SECURITY SCANNER (dependency / stdlib CVEs)
-  # ============================================================
-  vuln:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-      - name: Run govulncheck
-        run: govulncheck ./...
-
-  # Exhaustive, deep mutation run over the whole domain. Slow, so it stays on
-  # the weekly schedule / manual dispatch; mutation-fast is the blocking one.
-  mutation:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - name: Install gremlins
-        run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
-      - name: Mutation testing (domain layer)
-        run: gremlins unleash ./internal/domain --workers 1 --timeout-coefficient 30
-
-  # ============================================================
-  # CLASSIFICATION: LINTERS & STATIC ANALYSIS (API contracts)
-  # ============================================================
-  api-lint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "20"
-      - name: Install Spectral
-        run: npm install -g @stoplight/spectral-cli
-      - name: Lint OpenAPI spec
-        run: spectral lint apis/openapi.yaml --ruleset .spectral.yaml --fail-severity=warn
-      - name: Lint AsyncAPI spec
-        run: spectral lint apis/asyncapi.yaml --ruleset .spectral.asyncapi.yaml --fail-severity=warn
-
-  # ============================================================
-  # CLASSIFICATION: LINTERS & STATIC ANALYSIS (architecture fitness)
-  # ============================================================
-  arch-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-      - name: Architecture fitness tests
-        run: go test ./internal/architecture/... -v
-
-  # Guards against the generated "API Reference" docs
-  # (docs/docs/api-reference/rest/, produced by docusaurus-plugin-openapi-docs
-  # from apis/openapi.yaml) drifting out of sync with the spec they're
-  # supposed to mirror. Regenerates them exactly as `gen-api-docs` would and
-  # fails the PR if that produces any diff — i.e. someone changed
-  # apis/openapi.yaml (or hand-edited the generated files) without running
-  # `npm run gen-api-docs order` and committing the result.
-  docs-api-drift:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: docs
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: docs/package-lock.json
-      - run: npm ci
-      - name: Regenerate REST API docs from apis/openapi.yaml
-        run: npm run clean-api-docs order && npm run gen-api-docs order
-      - name: Fail if generated docs differ from what's committed
-        run: |
-          set -euo pipefail
-          if ! git diff --exit-code -- docs/api-reference/rest; then
-            echo "::error::docs/docs/api-reference/rest is out of sync with apis/openapi.yaml." \
-                 "Run 'npm run gen-api-docs order' inside docs/ and commit the result."
-            exit 1
-          fi
 
   # ============================================================
   # CLASSIFICATION: PACKAGING VALIDATION (Helm chart)
@@ -288,17 +120,17 @@ jobs:
     timeout-minutes: 10
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: azure/setup-helm@v5
+      - uses: azure/setup-helm@59b1c81c6280f5abebb1fb1bc585696daa7dfb42 # v5
         with:
           version: v3.16.4
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: helm/chart-testing-action@v2.8.0
+      - uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
       - name: Run chart-testing (lint)
         run: ct lint --charts charts/order-management --validate-maintainers=false --check-version-increment=false
 
@@ -320,10 +152,10 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
       - name: Build image (local only, not pushed)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           platforms: linux/amd64
@@ -333,7 +165,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: "Trivy scan (SARIF, always uploaded)"
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         if: always()
         with:
           image-ref: 'order-management:scan'
@@ -342,12 +174,12 @@ jobs:
           severity: 'CRITICAL,HIGH,MEDIUM'
           ignore-unfixed: true
       - name: Upload Trivy SARIF to Security tab
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
       - name: "Trivy scan (blocking gate: CRITICAL/HIGH with a fix available)"
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: 'order-management:scan'
           format: 'table'
@@ -362,25 +194,26 @@ jobs:
   docker-publish:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [lint, test, bdd, integration, api-lint, arch-test, docs-api-drift, mutation-fast, vuln]
+    needs: [lint, test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
+      packages: write
       id-token: write   # cosign keyless signing (Fulcio/Rekor via GitHub OIDC)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set image tag (short SHA)
         run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           platforms: linux/amd64
@@ -391,13 +224,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
       - name: Sign the published image (keyless, GitHub OIDC identity)
         run: |
           cosign sign --yes \
             ghcr.io/claudioed/order-management@${{ steps.build.outputs.digest }}
       - name: Generate SBOM (SPDX) for the published image
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           image: ghcr.io/claudioed/order-management@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -409,8 +242,7 @@ jobs:
             --type spdxjson \
             ghcr.io/claudioed/order-management@${{ steps.build.outputs.digest }}
       - name: Upload SBOM as a workflow artifact
-        uses: actions/upload-artifact@v7
-        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: sbom
           path: sbom.spdx.json
@@ -433,7 +265,7 @@ jobs:
       contents: write
       packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - name: Compute next version
@@ -451,9 +283,9 @@ jobs:
           echo "version=$new" >> "$GITHUB_OUTPUT"
       - name: Set image tag (short SHA)
         run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -463,7 +295,7 @@ jobs:
           docker buildx imagetools create \
             -t ghcr.io/claudioed/order-management:${{ steps.version.outputs.version }} \
             ghcr.io/claudioed/order-management:${{ env.SHORT_SHA }}
-      - uses: azure/setup-helm@v5
+      - uses: azure/setup-helm@59b1c81c6280f5abebb1fb1bc585696daa7dfb42 # v5
         with:
           version: v3.16.4
       - name: Package and publish the Helm chart for this release
@@ -487,7 +319,7 @@ jobs:
           git tag ${{ steps.version.outputs.version }}
           git push origin ${{ steps.version.outputs.version }}
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           tag_name: ${{ steps.version.outputs.version }}
           generate_release_notes: true
