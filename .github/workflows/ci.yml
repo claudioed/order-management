@@ -4,6 +4,8 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+  schedule:
+    - cron: "0 6 * * 1"   # weekly, Monday 6am UTC, for the mutation job only
   workflow_dispatch: {}
 
 permissions:
@@ -17,10 +19,10 @@ defaults:
   run:
     shell: bash
 
-# v1 ran only `lint` and `test`. `helm-lint`, `docker-publish`, and `release`
-# are now onboarded (see CLAUDE.md's v1 scope note and the
-# docker-helm-release PR) — `mutation`, `bdd`, `integration`, and `api-lint`
-# remain deliberately deferred.
+# v1 ran only `lint` and `test`. The harness has since been brought to
+# fleet parity: `bdd`, `integration`, `mutation-fast`, `vuln`, `mutation`,
+# `api-lint`, `arch-test`, and `docs-api-drift` all gate the build now
+# (mirroring wes-work-planning's CI shape).
 jobs:
   # ============================================================
   # CLASSIFICATION: LINTERS & STATIC ANALYSIS
@@ -91,6 +93,190 @@ jobs:
         with:
           name: coverage
           path: coverage.out
+
+  # ============================================================
+  # CLASSIFICATION: BEHAVIOR TESTING (BDD / Gherkin)
+  # ============================================================
+  bdd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Run BDD (godog/Gherkin) acceptance tests
+        run: go test ./... -run TestFeatures -v
+
+  # ============================================================
+  # CLASSIFICATION: INTEGRATION TESTING
+  # This repo owns TWO databases (OLTP + the ADR-0006 analytics store),
+  # so the job provisions two Postgres services and migrates both.
+  # ============================================================
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: order
+          POSTGRES_PASSWORD: order
+          POSTGRES_DB: order
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      analytics:
+        image: postgres:16
+        env:
+          POSTGRES_USER: analytics
+          POSTGRES_PASSWORD: analytics
+          POSTGRES_DB: analytics
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Run migrations (OLTP + analytics)
+        run: |
+          set -euo pipefail
+          GOFLAGS="-tags=postgres" go run github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1 \
+            -path migrations \
+            -database "postgres://order:order@localhost:5432/order?sslmode=disable" up
+          GOFLAGS="-tags=postgres" go run github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1 \
+            -path migrations/analytics \
+            -database "postgres://analytics:analytics@localhost:5433/analytics?sslmode=disable" up
+      - name: Integration tests
+        env:
+          DATABASE_URL: "postgres://order:order@localhost:5432/order?sslmode=disable"
+          ANALYTICS_DATABASE_URL: "postgres://analytics:analytics@localhost:5433/analytics?sslmode=disable"
+        run: go test -tags=integration ./... -race -count=1
+
+  # Fast, BLOCKING test-quality sensor: runs on every push/PR. Subset:
+  # ./internal/domain/order (the Order aggregate + line status model +
+  # promise-date policy). Thresholds (efficacy/mutant-coverage) come from
+  # .gremlins.yaml, so this job goes red when the tests stop asserting.
+  # ============================================================
+  # CLASSIFICATION: TEST QUALITY (MUTATION TESTING, fast subset)
+  # ============================================================
+  mutation-fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install gremlins
+        run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
+      - name: Mutation testing (fast subset — order aggregate)
+        run: gremlins unleash ./internal/domain/order
+
+  # Supply-chain sensor: known CVEs in the dependency graph and the Go stdlib.
+  # ============================================================
+  # CLASSIFICATION: SECURITY SCANNER (dependency / stdlib CVEs)
+  # ============================================================
+  vuln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  # Exhaustive, deep mutation run over the whole domain. Slow, so it stays on
+  # the weekly schedule / manual dispatch; mutation-fast is the blocking one.
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install gremlins
+        run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
+      - name: Mutation testing (domain layer)
+        run: gremlins unleash ./internal/domain --workers 1 --timeout-coefficient 30
+
+  # ============================================================
+  # CLASSIFICATION: LINTERS & STATIC ANALYSIS (API contracts)
+  # ============================================================
+  api-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+      - name: Install Spectral
+        run: npm install -g @stoplight/spectral-cli
+      - name: Lint OpenAPI spec
+        run: spectral lint apis/openapi.yaml --ruleset .spectral.yaml --fail-severity=warn
+      - name: Lint AsyncAPI spec
+        run: spectral lint apis/asyncapi.yaml --ruleset .spectral.asyncapi.yaml --fail-severity=warn
+
+  # ============================================================
+  # CLASSIFICATION: LINTERS & STATIC ANALYSIS (architecture fitness)
+  # ============================================================
+  arch-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Architecture fitness tests
+        run: go test ./internal/architecture/... -v
+
+  # Guards against the generated "API Reference" docs
+  # (docs/docs/api-reference/rest/, produced by docusaurus-plugin-openapi-docs
+  # from apis/openapi.yaml) drifting out of sync with the spec they're
+  # supposed to mirror. Regenerates them exactly as `gen-api-docs` would and
+  # fails the PR if that produces any diff — i.e. someone changed
+  # apis/openapi.yaml (or hand-edited the generated files) without running
+  # `npm run gen-api-docs order` and committing the result.
+  docs-api-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - run: npm ci
+      - name: Regenerate REST API docs from apis/openapi.yaml
+        run: npm run clean-api-docs order && npm run gen-api-docs order
+      - name: Fail if generated docs differ from what's committed
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- docs/api-reference/rest; then
+            echo "::error::docs/docs/api-reference/rest is out of sync with apis/openapi.yaml." \
+                 "Run 'npm run gen-api-docs order' inside docs/ and commit the result."
+            exit 1
+          fi
 
   # ============================================================
   # CLASSIFICATION: PACKAGING VALIDATION (Helm chart)
@@ -176,11 +362,10 @@ jobs:
   docker-publish:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [lint, test]
+    needs: [lint, test, bdd, integration, api-lint, arch-test, docs-api-drift, mutation-fast, vuln]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
-      packages: write
       id-token: write   # cosign keyless signing (Fulcio/Rekor via GitHub OIDC)
     steps:
       - uses: actions/checkout@v7
@@ -225,6 +410,7 @@ jobs:
             ghcr.io/claudioed/order-management@${{ steps.build.outputs.digest }}
       - name: Upload SBOM as a workflow artifact
         uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: sbom
           path: sbom.spdx.json
