@@ -60,9 +60,10 @@ apis/openapi.yaml
 
 Additive read side built from this service's OWN domain events. The OLTP
 domain/application layers are NOT modified and must NOT import the analytics
-store. `internal/analytics/report/` depends on nothing. (Note: this repo's
-`check-all` has no arch-test/bdd target as the others do — isolation is
-maintained structurally; consider adding those CI jobs for parity.)
+store. `internal/analytics/report/` depends on nothing. (Isolation is
+enforced by the `arch-test` CI job via `internal/architecture/` — the
+arch-go rule `analytics depends on nothing internal except itself` fails
+the build on any violation.)
 
 - Events are fanned to a SEPARATE topic `warehouse.order-management.analytics`
   by a new outbound adapter; the integration topic/publisher are untouched.
@@ -79,6 +80,8 @@ maintained structurally; consider adding those CI jobs for parity.)
   (received→allocated→released funnel; cancels/backorders/allocation-fails as
   leakage; order-level events enriched with their path via an OrderRepo lookup).
 - `GET /reports/.../freshness` reports projection lag.
+- The async contract for both Kafka topics is documented in
+  `apis/asyncapi.yaml` (Spectral-gated in CI by the `api-lint` job).
 
 ## Ubiquitous Language (use these exact names)
 
@@ -242,20 +245,25 @@ permissive mode, `AllocateOrder`/`ReleaseOrder` must return a clear
 - golangci-lint: copy `.golangci.yml` verbatim from
   `/Users/claudioed/warehouse-systems/inventory-storage/.golangci.yml`.
 
-## v1 scope — explicitly deferred (do NOT build these; document them, don't skip silently)
+## Explicitly deferred (document them, don't skip silently)
 
-- Helm chart / warehouse-infra kind-cluster wiring.
-- Gremlins mutation testing gate.
-- godog/BDD acceptance tests.
-- MCP inbound adapter.
-- Kafka integration events / async publishing (log publisher only).
+Originally the "v1 scope — explicitly deferred" list. Several entries have
+since SHIPPED and were removed from this list (Helm chart + CI packaging
+jobs, gremlins mutation gate, godog/BDD acceptance suite, MCP inbound
+adapter, Kafka integration + analytics fan-out, Postgres integration suite,
+arch-go fitness tests, Spectral api-lint, docs-api-drift) — CI and the
+README's "Deferred" section reflect the current truth. Still deferred:
+
 - Real carrier-rate promise-date calculation (a configurable static lead
   time is correct for v1).
+- Kafka release-confirmation reply events from wes-work-planning (see
+  ADR-0005's known-gaps section).
+- Clawing back released work on cancellation (ADR-0004's known gap).
 - Any change to inventory-storage or wes-work-planning — this build must
   be 100% additive from THEIR point of view; they are not touched at all.
 
-Write a short "Deferred (v1)" section in the README listing these
-explicitly, so a reader never mistakes an absence for an oversight.
+Keep the README's "Deferred" section listing these explicitly, so a reader
+never mistakes an absence for an oversight.
 
 ## Local quality gate (mirror the other five repos' Makefile/lefthook shape, minus DB/mutation-dependent targets)
 
@@ -271,11 +279,21 @@ Copy the structural shape from
 `/Users/claudioed/warehouse-systems/inventory-storage/lefthook.yml`, dropping
 anything mutation/integration-specific.
 
-GitHub Actions CI (`.github/workflows/ci.yml`): `lint` and `test` jobs only
-in v1 (mirror the job shape/style of the other repos' workflows for these
-two jobs specifically — same golangci-lint version pin `v2.13.1`, same Go
-setup action version). Do NOT add `mutation`, `bdd`, `helm-lint`,
-`docker-publish`, `release`, or `integration` jobs — those are deferred.
+GitHub Actions CI (`.github/workflows/ci.yml`) is at fleet parity with
+wes-work-planning's shape: `lint` and `test` (+ coverage gate) alongside
+`bdd` (godog, `go test ./... -run TestFeatures`), `integration` (two
+`postgres:16` service containers — one per database this repo owns —
+migrating both `migrations/` and `migrations/analytics/`, then
+`go test -tags=integration ./... -race -count=1`), `mutation-fast`
+(weekly `mutation` on schedule; gremlins v0.6.0, thresholds pinned in
+`.gremlins.yaml`), `vuln` (govulncheck), `api-lint` (Spectral on
+`apis/openapi.yaml` + `apis/asyncapi.yaml`), `arch-test`
+(`internal/architecture/`), `docs-api-drift` (Docusaurus API-reference
+regeneration diff gate), plus `helm-lint`, `trivy-scan`,
+`docker-publish`, and `release`. Same golangci-lint version pin
+`v2.13.1` and Go setup action version as the other repos. Note: the
+local Makefile/lefthook deliberately do NOT carry the new sensors —
+they are CI-only by decision; `make check` remains the fast local loop.
 
 ## Definition of done
 
