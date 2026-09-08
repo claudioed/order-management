@@ -55,6 +55,7 @@
   },
   "description": "Documentation site for the Order Management bounded context (warehouse-systems).",
   "overrides": {
+    "@faker-js/faker": ">=10.5.0",
     "openapi-to-postmanv2": {
       "js-yaml": "^4.3.1"
     },
