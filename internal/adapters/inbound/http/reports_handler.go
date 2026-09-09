@@ -8,7 +8,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"github.com/claudioed/order-management/internal/adapters/inbound/auth"
 	"github.com/claudioed/order-management/internal/analytics/report"
 )
 
@@ -146,17 +145,13 @@ func writeReportInternal(w http.ResponseWriter, r *http.Request, err error) {
 // NewReportsRouter builds the chi router for the order-reports reader service.
 // A nil logger falls back to slog.Default().
 //
-// authn is the same fleet-standard bearer middleware NewRouter mounts, but
-// with the required scope pinned to read: every route on this reader is a
-// GET over a read-only pool, so a read key is always sufficient and the
-// caller's own Required policy is deliberately overridden. /healthz stays
-// outside the middleware. A zero-value auth.Middleware means "off".
-func NewReportsRouter(h *ReportsHandlers, logger *slog.Logger, authn auth.Middleware) http.Handler {
+// Every route, including /reports/*, is reachable with no Authorization
+// header: the fleet-wide REST/MCP static-bearer auth layer has been
+// removed.
+func NewReportsRouter(h *ReportsHandlers, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	authn = withAuthDefaults(authn, logger)
-	authn.Required = func(*http.Request) auth.Scope { return auth.ScopeRead }
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -165,11 +160,8 @@ func NewReportsRouter(h *ReportsHandlers, logger *slog.Logger, authn auth.Middle
 
 	r.Get("/healthz", h.GetReportsHealthz)
 
-	r.Group(func(r chi.Router) {
-		r.Use(authn.Handler)
-		r.Get("/reports/funnel", h.GetFunnel)
-		r.Get("/reports/funnel/freshness", h.GetFreshness)
-	})
+	r.Get("/reports/funnel", h.GetFunnel)
+	r.Get("/reports/funnel/freshness", h.GetFreshness)
 
 	return r
 }

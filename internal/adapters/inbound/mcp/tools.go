@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel"
@@ -54,33 +53,25 @@ func (d Deps) getOrder(ctx context.Context, in getOrderInput) (orderDTO, error) 
 // --- registration -------------------------------------------------------------
 
 // registerTools adds every tool to the server, each wrapped so its handler
-// runs inside an OTel span named "mcp.tool <name>" and is gated by the
-// session's scope.
+// runs inside an OTel span named "mcp.tool <name>".
 //
 // order-management exposes no write use case over MCP (see Deps' own doc
-// comment): the one registered tool is a read tool and requires
-// ScopeRead. The scope-parameterised addTool wrapper is kept identical to
-// the other contexts anyway, so a legitimate future write tool needs no
-// auth rework.
-func (d Deps) registerTools(server *mcp.Server, scopeOf func(context.Context) Scope) {
+// comment): the one registered tool is a read tool.
+func (d Deps) registerTools(server *mcp.Server) {
 	readOnly := true
 
-	addTool(server, scopeOf, ScopeRead, &mcp.Tool{
+	addTool(server, &mcp.Tool{
 		Name:        "get_order",
 		Description: "Return one order's current state by id: status, allow-partial-shipment flag, promise date, and every line's SKU/quantity/process-path/gift-wrap/status/reservation-id. Use it to answer 'what is the state of this order' questions -- allocation, backorder, release, or cancellation progress.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: readOnly},
 	}, d.getOrder)
 }
 
-// addTool registers one scope-gated tool. It centralises the cross-cutting
-// concerns every tool shares: a span per call, scope enforcement against the
-// tool's required minimum scope, and mapping a handler error onto the span
-// before returning it. It is parameterised on the required scope so a future
-// write tool (ScopeReadWrite) reuses it unchanged.
+// addTool registers one tool. It centralises the cross-cutting concern
+// every tool shares: a span per call, and mapping a handler error onto the
+// span before returning it.
 func addTool[In, Out any](
 	server *mcp.Server,
-	scopeOf func(context.Context) Scope,
-	required Scope,
 	tool *mcp.Tool,
 	handle func(context.Context, In) (Out, error),
 ) {
@@ -89,16 +80,9 @@ func addTool[In, Out any](
 		ctx, span := otel.Tracer(tracerName).Start(ctx, "mcp.tool "+tool.Name,
 			trace.WithAttributes(
 				attribute.String("mcp.tool.name", tool.Name),
-				attribute.String("mcp.tool.required_scope", string(required)),
 			),
 		)
 		defer span.End()
-
-		if !scopeAllows(scopeOf(ctx), required) {
-			err := fmt.Errorf("tool %q requires %s scope", tool.Name, required)
-			span.SetStatus(codes.Error, "unauthorized")
-			return nil, zero, err
-		}
 
 		out, err := handle(ctx, in)
 		if err != nil {

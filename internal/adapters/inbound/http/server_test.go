@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/claudioed/order-management/internal/adapters/inbound/auth"
 	inboundhttp "github.com/claudioed/order-management/internal/adapters/inbound/http"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
 	"github.com/claudioed/order-management/internal/application/ports"
@@ -78,7 +77,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	return &testEnv{
-		handler:   inboundhttp.NewRouter(server, logger, "", auth.Middleware{}),
+		handler:   inboundhttp.NewRouter(server, logger, ""),
 		orders:    orders,
 		inventory: inventory,
 	}
