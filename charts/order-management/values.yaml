@@ -96,6 +96,26 @@ kafka:
 inventoryStorage:
   mode: "permissive"
   baseUrl: ""
+  # Bearer this Customer presents to inventory-storage's REST surface
+  # (fleet ADR 0005 / ADR-0011). Rendered into the auth Secret as
+  # INVENTORY_STORAGE_API_KEY only when non-empty; empty sends no header.
+  apiKey: ""
+
+# REST identity (ADR-0011, adopting warehouse-ops-agent ADR 0005): static
+# bearer keys with read / read-write scopes, no IdP. The OLTP and reports
+# deployments both read AUTH_MODE from the ConfigMap and the keys from the
+# auth Secret. mode is enforce|log|off; "log" lets every request through
+# but logs "auth: would-reject", which is the rollout gate. Keys are only
+# rendered into the Secret when non-empty; with no key configured the
+# binary itself falls back to "off" with a WARN regardless of mode.
+# existingSecret names a pre-created Secret carrying API_READ_KEY /
+# API_READWRITE_KEY (and optionally INVENTORY_STORAGE_API_KEY) instead of
+# the chart rendering one from readKey/readWriteKey.
+auth:
+  mode: "enforce"
+  readKey: ""
+  readWriteKey: ""
+  existingSecret: ""
 
 # NOTE: order-management does not yet wire OpenTelemetry — cmd/order/main.go
 # has no OTEL_EXPORTER_OTLP_ENDPOINT support as of this chart version. No

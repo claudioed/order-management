@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/claudioed/order-management/internal/adapters/inbound/auth"
 	inboundhttp "github.com/claudioed/order-management/internal/adapters/inbound/http"
 	"github.com/claudioed/order-management/internal/adapters/outbound/events"
 	"github.com/claudioed/order-management/internal/adapters/outbound/inventorystorage"
@@ -82,7 +83,7 @@ func run() error {
 	}
 	defer closeAdapters()
 
-	inventory := buildInventoryClient(getenv("INVENTORY_STORAGE_MODE", "permissive"), os.Getenv("INVENTORY_STORAGE_BASE_URL"), logger)
+	inventory := buildInventoryClient(getenv("INVENTORY_STORAGE_MODE", "permissive"), os.Getenv("INVENTORY_STORAGE_BASE_URL"), os.Getenv("INVENTORY_STORAGE_API_KEY"), logger)
 
 	promise := order.NewLeadTimePolicy(
 		durationEnv("PROMISE_DEFAULT_LEAD_TIME", order.DefaultLeadTime, logger),
@@ -99,7 +100,7 @@ func run() error {
 
 	httpServer := &http.Server{
 		Addr:              httpAddr,
-		Handler:           inboundhttp.NewRouter(server, logger, serviceName),
+		Handler:           inboundhttp.NewRouter(server, logger, serviceName, buildRESTAuth(os.Getenv, logger)),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -217,14 +218,39 @@ func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logge
 // INVENTORY_STORAGE_MODE (http|permissive), defaulting to "permissive" so
 // unit tests and CI never reach the network. Permissive does NOT mean
 // fail-open: it refuses to allocate rather than fabricating a reservation.
-func buildInventoryClient(mode, baseURL string, logger *slog.Logger) ports.InventoryReservationClient {
+//
+// apiKey (INVENTORY_STORAGE_API_KEY) is the bearer this Customer presents to
+// the Supplier's REST surface (fleet ADR 0005); empty means no header.
+func buildInventoryClient(mode, baseURL, apiKey string, logger *slog.Logger) ports.InventoryReservationClient {
 	if !strings.EqualFold(mode, "http") {
 		logger.Warn("inventory-storage client in permissive (no-op) mode; allocation will refuse to run",
 			"hint", "set INVENTORY_STORAGE_MODE=http and INVENTORY_STORAGE_BASE_URL for a real deployment")
 		return inventorystorage.NewPermissiveClient()
 	}
-	logger.Info("inventory-storage client configured", "mode", "http", "base_url", baseURL)
-	return inventorystorage.NewClient(baseURL, nil)
+	logger.Info("inventory-storage client configured", "mode", "http", "base_url", baseURL, "bearer", apiKey != "")
+	return inventorystorage.NewClient(baseURL, nil).WithBearerToken(apiKey)
+}
+
+// buildRESTAuth assembles the fleet-standard REST identity middleware
+// (ADR-0011, fleet ADR 0005) from the environment: API_READ_KEY /
+// API_READWRITE_KEY (falling back to MCP_READ_KEY / MCP_READWRITE_KEY) and
+// AUTH_MODE=enforce|log|off. The default mode is "enforce" when at least
+// one key is configured and "off" -- with a loud WARN -- when none is, so
+// local development and the unit tests keep working without keys. Key
+// material is never logged.
+func buildRESTAuth(getenv func(string) string, logger *slog.Logger) auth.Middleware {
+	keys := auth.KeysFromEnv(getenv)
+	authn := auth.NewStaticKeyAuth(keys)
+	defaultMode := auth.ModeOff
+	if authn.HasKeys() {
+		defaultMode = auth.ModeEnforce
+	}
+	mode := auth.ParseMode(getenv("AUTH_MODE"), defaultMode)
+	if mode == auth.ModeOff {
+		logger.Warn("REST auth is OFF: no API_READ_KEY/API_READWRITE_KEY configured or AUTH_MODE=off")
+	}
+	logger.Info("REST auth configured", "mode", string(mode), "keys", len(keys))
+	return auth.Middleware{Authn: authn, Mode: mode, Logger: logger}
 }
 
 // durationEnv reads a Go duration (e.g. "48h", "90m") from key, falling

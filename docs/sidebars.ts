@@ -69,6 +69,7 @@ const sidebars: SidebarsConfig = {
         'adr/0008-fulfillment-class-demand-shape-classifier',
         'adr/0009-standard-metrics-convention',
         'adr/0010-mcp-inbound-adapter',
+        'adr/0011-adopt-fleet-rest-identity',
       ],
     },
   ],

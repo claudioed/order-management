@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/claudioed/order-management/internal/adapters/inbound/auth"
 	inboundhttp "github.com/claudioed/order-management/internal/adapters/inbound/http"
 	"github.com/claudioed/order-management/internal/analytics/report"
 )
@@ -38,7 +39,7 @@ func TestReports_GetFunnel_OK(t *testing.T) {
 		OrdersReceived: 5, OrdersAllocated: 4, OrdersReleased: 3,
 		OrdersCancelled: 1, LinesBackordered: 2,
 	}}}}
-	srv := inboundhttp.NewReportsRouter(&inboundhttp.ReportsHandlers{Store: store}, nil)
+	srv := inboundhttp.NewReportsRouter(&inboundhttp.ReportsHandlers{Store: store}, nil, auth.Middleware{})
 
 	req := httptest.NewRequest(http.MethodGet, "/reports/funnel?from=2026-06-01T00:00:00Z&to=2026-06-02T00:00:00Z&pathId=pick", nil)
 	rec := httptest.NewRecorder()
@@ -73,7 +74,7 @@ func TestReports_GetFunnel_OK(t *testing.T) {
 }
 
 func TestReports_GetFunnel_MissingParams(t *testing.T) {
-	srv := inboundhttp.NewReportsRouter(&inboundhttp.ReportsHandlers{Store: &stubStore{}}, nil)
+	srv := inboundhttp.NewReportsRouter(&inboundhttp.ReportsHandlers{Store: &stubStore{}}, nil, auth.Middleware{})
 
 	tests := []struct {
 		name string
@@ -101,7 +102,7 @@ func TestReports_GetFunnel_MissingParams(t *testing.T) {
 
 func TestReports_GetFreshness_OK(t *testing.T) {
 	store := &stubStore{lag: 90 * time.Second}
-	srv := inboundhttp.NewReportsRouter(&inboundhttp.ReportsHandlers{Store: store}, nil)
+	srv := inboundhttp.NewReportsRouter(&inboundhttp.ReportsHandlers{Store: store}, nil, auth.Middleware{})
 
 	req := httptest.NewRequest(http.MethodGet, "/reports/funnel/freshness", nil)
 	rec := httptest.NewRecorder()
@@ -122,7 +123,7 @@ func TestReports_GetFreshness_OK(t *testing.T) {
 }
 
 func TestReports_Healthz(t *testing.T) {
-	srv := inboundhttp.NewReportsRouter(&inboundhttp.ReportsHandlers{Store: &stubStore{}}, nil)
+	srv := inboundhttp.NewReportsRouter(&inboundhttp.ReportsHandlers{Store: &stubStore{}}, nil, auth.Middleware{})
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)

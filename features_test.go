@@ -20,6 +20,7 @@ import (
 
 	"github.com/cucumber/godog"
 
+	"github.com/claudioed/order-management/internal/adapters/inbound/auth"
 	inboundhttp "github.com/claudioed/order-management/internal/adapters/inbound/http"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
 	"github.com/claudioed/order-management/internal/application/ports"
@@ -150,7 +151,7 @@ func (w *world) reset() {
 	// exercised) without flooding the pretty-format scenario output.
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	w.server = httptest.NewServer(inboundhttp.NewRouter(server, logger, ""))
+	w.server = httptest.NewServer(inboundhttp.NewRouter(server, logger, "", auth.Middleware{}))
 	w.lastOrderID = ""
 	w.resBySKU = map[string]string{}
 	w.lastStatus = 0
