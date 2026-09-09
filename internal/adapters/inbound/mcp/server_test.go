@@ -15,26 +15,11 @@ import (
 	"github.com/claudioed/order-management/internal/domain/shared"
 )
 
-const readKey = "test-read-key"
-
-// bearerTransport adds a fixed Authorization header to every request, so the
-// in-process MCP client authenticates like a real one.
-type bearerTransport struct {
-	token string
-	base  http.RoundTripper
-}
-
-func (b bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if b.token != "" {
-		r.Header.Set("Authorization", "Bearer "+b.token)
-	}
-	return b.base.RoundTrip(r)
-}
-
 // newServer builds a real MCP HTTP server over an in-memory repo seeded
 // with one order (directly via order.Rehydrate, mirroring the domain's
-// own test suite), and returns its httptest URL. Only a read key is
-// configured -- this context has no write tool.
+// own test suite), and returns its httptest URL. The server is mounted
+// unauthenticated -- the fleet REST/MCP static-bearer auth layer was
+// removed.
 func newServer(t *testing.T) string {
 	t.Helper()
 	orders := memory.NewOrderRepo()
@@ -56,18 +41,17 @@ func newServer(t *testing.T) string {
 		GetOrder: &usecases.GetOrder{Orders: orders},
 	}
 	server := inboundmcp.NewServer(deps)
-	auth := inboundmcp.NewStaticKeyAuth(map[string]inboundmcp.Scope{readKey: inboundmcp.ScopeRead})
-	httpSrv := httptest.NewServer(inboundmcp.Handler(server, auth))
+	httpSrv := httptest.NewServer(inboundmcp.Handler(server))
 	t.Cleanup(httpSrv.Close)
 	return httpSrv.URL
 }
 
-func connect(t *testing.T, url, token string) *sdk.ClientSession {
+func connect(t *testing.T, url string) *sdk.ClientSession {
 	t.Helper()
 	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "0.0.1"}, nil)
 	transport := &sdk.StreamableClientTransport{
 		Endpoint:   url,
-		HTTPClient: &http.Client{Transport: bearerTransport{token: token, base: http.DefaultTransport}},
+		HTTPClient: &http.Client{},
 	}
 	session, err := client.Connect(context.Background(), transport, nil)
 	if err != nil {
@@ -77,24 +61,9 @@ func connect(t *testing.T, url, token string) *sdk.ClientSession {
 	return session
 }
 
-func TestServer_UnauthenticatedIsRejected(t *testing.T) {
-	url := newServer(t)
-	resp, err := http.Post(url, "application/json", nil)
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
-	}
-	if got := resp.Header.Get("WWW-Authenticate"); got == "" {
-		t.Fatal("missing WWW-Authenticate challenge on 401")
-	}
-}
-
 func TestServer_ToolsListAndCall(t *testing.T) {
 	url := newServer(t)
-	session := connect(t, url, readKey)
+	session := connect(t, url)
 	ctx := context.Background()
 
 	tools, err := session.ListTools(ctx, nil)
@@ -141,7 +110,7 @@ func TestServer_ToolsListAndCall(t *testing.T) {
 
 func TestServer_CallToolRejectsUnknownOrder(t *testing.T) {
 	url := newServer(t)
-	session := connect(t, url, readKey)
+	session := connect(t, url)
 	res, err := session.CallTool(context.Background(), &sdk.CallToolParams{
 		Name:      "get_order",
 		Arguments: map[string]any{"orderId": "GHOST"},

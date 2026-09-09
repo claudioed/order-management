@@ -43,9 +43,8 @@ type HTTPDoer interface {
 // response shapes below are local mirrors of that service's published
 // wire contract (see ADR 0002).
 type Client struct {
-	baseURL     string
-	doer        HTTPDoer
-	bearerToken string
+	baseURL string
+	doer    HTTPDoer
 }
 
 // NewClient builds a Client against baseURL (from INVENTORY_STORAGE_BASE_URL).
@@ -55,25 +54,6 @@ func NewClient(baseURL string, doer HTTPDoer) *Client {
 		doer = &http.Client{Timeout: DefaultTimeout}
 	}
 	return &Client{baseURL: strings.TrimRight(baseURL, "/"), doer: doer}
-}
-
-// WithBearerToken returns a copy of the client that sends
-// "Authorization: Bearer <token>" on every request (fleet ADR 0005: the
-// Supplier's REST surface is behind static bearer keys). An empty token
-// leaves the client unauthenticated -- no header is sent at all -- which is
-// what a peer running AUTH_MODE=off or log expects. The token comes from
-// INVENTORY_STORAGE_API_KEY via the composition root and is never logged.
-func (c *Client) WithBearerToken(token string) *Client {
-	cp := *c
-	cp.bearerToken = strings.TrimSpace(token)
-	return &cp
-}
-
-// authorize sets the bearer header when a token is configured.
-func (c *Client) authorize(req *http.Request) {
-	if c.bearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
-	}
 }
 
 // reserveRequest mirrors inventory-storage's ReserveStockRequest.
@@ -112,7 +92,6 @@ func (c *Client) Reserve(ctx context.Context, req ports.ReservationRequest) (por
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
-	c.authorize(httpReq)
 
 	resp, err := c.doer.Do(httpReq)
 	if err != nil {
@@ -151,7 +130,6 @@ func (c *Client) RevokeReservation(ctx context.Context, reservationID string) er
 		return err
 	}
 	httpReq.Header.Set("Accept", "application/json")
-	c.authorize(httpReq)
 
 	resp, err := c.doer.Do(httpReq)
 	if err != nil {

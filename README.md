@@ -154,10 +154,6 @@ Release no longer calls any Supplier synchronously — see
 | `PROMISE_DEFAULT_LEAD_TIME` | `48h` | Promise-date lead time for any unlisted path. |
 | `PROMISE_PATH_LEAD_TIMES` | *(unset)* | Per-path overrides, e.g. `pick=24h,singles=6h`. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
-| `AUTH_MODE` | `enforce` if a key is set, else `off` | REST identity mode ([ADR 0011](docs/docs/adr/0011-adopt-fleet-rest-identity.md)): `enforce` rejects with 401/403, `log` lets everything through but logs `auth: would-reject`, `off` disables the middleware. Read by `cmd/order` and `cmd/order-reports`; `/healthz` is always open. |
-| `API_READ_KEY` | *(unset)* | Static bearer key granting the `read` scope (`GET`/`HEAD`/`OPTIONS`, and every `/reports/*` route). Falls back to `MCP_READ_KEY`. Never logged. |
-| `API_READWRITE_KEY` | *(unset)* | Static bearer key granting `read-write` (every mutating method). Falls back to `MCP_READWRITE_KEY`. Never logged. |
-| `INVENTORY_STORAGE_API_KEY` | *(unset)* | Bearer this service presents to inventory-storage on `POST`/`DELETE /reservations`. Unset ⇒ no `Authorization` header. |
 
 ## Kafka integration
 
@@ -274,19 +270,6 @@ intake and again on retry.
 
 Every error response is `application/problem+json` (RFC 7807), the same shape
 the other five services emit.
-
-### Authentication
-
-Every route except `/healthz` requires a static bearer key
-(`Authorization: Bearer <key>`) once `AUTH_MODE=enforce` — the default as
-soon as `API_READ_KEY` or `API_READWRITE_KEY` is set. `GET` needs the
-`read` scope, `POST`/`DELETE` need `read-write`. A missing or unknown key
-is a `401` problem with a `WWW-Authenticate: Bearer` challenge; a read key on
-a mutating route is a `403 insufficient-scope` problem. With no key
-configured the binary starts in `off` mode with a WARN, so the walkthrough
-below works unauthenticated locally. See
-[ADR 0011](docs/docs/adr/0011-adopt-fleet-rest-identity.md) and the fleet
-decision it adopts.
 
 ### Curl walkthrough
 
@@ -473,7 +456,8 @@ GitHub Pages on every push to `main` that touches `docs/**`, publishing to
 8. [0008 — Fulfillment-class demand-shape classifier](docs/docs/adr/0008-fulfillment-class-demand-shape-classifier.md)
 9. [0009 — Standard metrics convention](docs/docs/adr/0009-standard-metrics-convention.md)
 10. [0010 — MCP inbound adapter](docs/docs/adr/0010-mcp-inbound-adapter.md)
-11. [0011 — Adopt the fleet REST identity (static bearer keys, read/read-write scopes)](docs/docs/adr/0011-adopt-fleet-rest-identity.md)
+11. [0011 — Adopt the fleet REST identity (static bearer keys, read/read-write scopes)](docs/docs/adr/0011-adopt-fleet-rest-identity.md) (superseded by 0012)
+12. [0012 — Remove the REST/MCP bearer auth layer](docs/docs/adr/0012-remove-rest-mcp-bearer-auth.md)
 
 ## License
 

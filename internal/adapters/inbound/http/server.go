@@ -14,7 +14,6 @@ import (
 	"github.com/riandyrn/otelchi"
 	otelchimetric "github.com/riandyrn/otelchi/metric"
 
-	"github.com/claudioed/order-management/internal/adapters/inbound/auth"
 	"github.com/claudioed/order-management/internal/application/usecases"
 	"github.com/claudioed/order-management/internal/domain/order"
 	"github.com/claudioed/order-management/internal/domain/shared"
@@ -36,15 +35,9 @@ type Server struct {
 // API. A nil logger defaults to slog.Default(); an empty serviceName
 // defaults to DefaultServiceName.
 //
-// authn is the fleet-standard REST identity middleware (ADR-0011, fleet
-// ADR 0005): static bearer keys with read / read-write scopes. It is
-// mounted on every route EXCEPT /healthz, which stays open for the
-// kubelet's probes. GET/HEAD/OPTIONS need read; everything else needs
-// read-write. A zero-value auth.Middleware (no authenticator, no mode)
-// is treated as AUTH_MODE=off, so callers that construct a router
-// without keys -- local dev, the httptest suite -- are unaffected. The
-// middleware's logger and RFC 7807 problem-type base default to this
-// router's logger and this service's problemBaseURI when unset.
+// Every route, including every mutating one, is reachable with no
+// Authorization header: the fleet-wide REST/MCP static-bearer auth layer
+// has been removed (see the ADR recorded alongside this change).
 //
 // Middleware order matters here: otelchi runs before RequestLogger so the
 // request context already carries a span by the time a line is logged,
@@ -53,14 +46,13 @@ type Server struct {
 // HTTP RED requirement exactly. WithChiRoutes resolves the route pattern up
 // front, so spans/metrics are labeled "/orders/{id}" rather than one
 // distinct series per order id.
-func NewRouter(s *Server, logger *slog.Logger, serviceName string, authn auth.Middleware) http.Handler {
+func NewRouter(s *Server, logger *slog.Logger, serviceName string) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if serviceName == "" {
 		serviceName = DefaultServiceName
 	}
-	authn = withAuthDefaults(authn, logger)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -74,34 +66,12 @@ func NewRouter(s *Server, logger *slog.Logger, serviceName string, authn auth.Mi
 
 	r.Get("/healthz", s.handleHealthz)
 
-	// Everything but the liveness probe sits behind the auth middleware.
-	r.Group(func(r chi.Router) {
-		r.Use(authn.Handler)
-		r.Post("/orders", s.handleReceiveOrder)
-		r.Get("/orders/{id}", s.handleGetOrder)
-		r.Post("/orders/{id}/retry-allocation", s.handleRetryAllocation)
-		r.Delete("/orders/{id}", s.handleCancelOrder)
-	})
+	r.Post("/orders", s.handleReceiveOrder)
+	r.Get("/orders/{id}", s.handleGetOrder)
+	r.Post("/orders/{id}/retry-allocation", s.handleRetryAllocation)
+	r.Delete("/orders/{id}", s.handleCancelOrder)
 
 	return r
-}
-
-// withAuthDefaults normalises an auth.Middleware for this service: a
-// missing authenticator or mode means "off" (a no-op handler), and the
-// logger / problem-type base fall back to the router's logger and this
-// service's RFC 7807 namespace so the 401/403 bodies match every other
-// problem this API emits.
-func withAuthDefaults(m auth.Middleware, logger *slog.Logger) auth.Middleware {
-	if m.Authn == nil || m.Mode == "" {
-		m.Mode = auth.ModeOff
-	}
-	if m.Logger == nil {
-		m.Logger = logger
-	}
-	if m.ProblemBase == "" {
-		m.ProblemBase = problemBaseURI
-	}
-	return m
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {

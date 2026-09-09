@@ -99,7 +99,7 @@ without breaking the wire contract.
 
 ## Authentication
 
-None. `security: []` in the spec is deliberate and explicit: this is an
-internal, cluster-local service reached through the platform's gateway,
-which owns authentication and authorisation. Declaring `security: []`
-states "no auth at this layer" rather than leaving it ambiguous.
+None. The spec declares no `security` scheme at all: this service's
+REST and MCP surfaces are reachable with no `Authorization` header (see
+[ADR 0012](../adr/0012-remove-rest-mcp-bearer-auth.md), which removed the
+static-bearer layer ADR 0011 had adopted).

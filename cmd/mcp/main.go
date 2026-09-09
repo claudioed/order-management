@@ -11,9 +11,8 @@
 // behalf. This server therefore wires only the read side (GetOrder) and
 // exposes only a read tool.
 //
-// Auth is a static bearer key (no IdP): set MCP_READ_KEY (and, for the
-// future write seam, MCP_READWRITE_KEY) from a Kubernetes Secret. A
-// request must present a valid key; the scope it grants gates the tools.
+// The server is mounted unauthenticated: the fleet-wide REST/MCP
+// static-bearer auth layer has been removed.
 package main
 
 import (
@@ -25,7 +24,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/claudioed/order-management/internal/adapters/inbound/auth"
 	inboundmcp "github.com/claudioed/order-management/internal/adapters/inbound/mcp"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
 	"github.com/claudioed/order-management/internal/adapters/outbound/postgres"
@@ -83,9 +81,7 @@ func run() error {
 		GetOrder: &usecases.GetOrder{Orders: orders},
 	}
 	server := inboundmcp.NewServer(deps)
-
-	authn := inboundmcp.NewStaticKeyAuth(authKeys(logger))
-	handler := inboundmcp.Handler(server, authn)
+	handler := inboundmcp.Handler(server)
 
 	srv := &http.Server{Addr: httpAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 
@@ -128,22 +124,6 @@ func buildAdapters(ctx context.Context, databaseURL, migrationsPath string, logg
 	}
 
 	return postgres.NewOrderRepo(pool), pool.Close, nil
-}
-
-// authKeys reads the bearer keys from the environment through the shared
-// auth package's fleet convention (ADR-0011): API_READ_KEY /
-// API_READWRITE_KEY, falling back to MCP_READ_KEY / MCP_READWRITE_KEY, so
-// one Secret can serve both the REST and MCP surfaces. Read grants read
-// scope; read-write is kept for the future write seam even though no
-// write tool is registered yet. If neither is set the server still starts
-// but rejects every request (fail closed) -- a missing key must never mean
-// "open to everyone". The keys themselves are never logged.
-func authKeys(logger *slog.Logger) map[string]inboundmcp.Scope {
-	keys := auth.KeysFromEnv(os.Getenv)
-	if len(keys) == 0 {
-		logger.Warn("no API_READ_KEY/API_READWRITE_KEY (or MCP_READ_KEY/MCP_READWRITE_KEY) set; server will reject all requests")
-	}
-	return keys
 }
 
 // logLevel mirrors cmd/order/main.go's newLogger level parsing, kept local
