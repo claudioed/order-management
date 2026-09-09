@@ -73,3 +73,36 @@ Name of the Secret holding the analytics DSNs, when the chart creates its own.
 {{- include "order-management.fullname" . }}-analytics
 {{- end }}
 {{- end }}
+
+{{/*
+Name of the Secret holding the REST identity keys (ADR-0011): API_READ_KEY,
+API_READWRITE_KEY and the outbound INVENTORY_STORAGE_API_KEY.
+*/}}
+{{- define "order-management.authSecretName" -}}
+{{- if .Values.auth.existingSecret }}
+{{- .Values.auth.existingSecret }}
+{{- else }}
+{{- include "order-management.fullname" . }}-auth
+{{- end }}
+{{- end }}
+
+{{/*
+Non-empty when at least one REST identity key value is set, i.e. when the
+chart should render its own auth Secret and the deployments should reference
+it. Empty string otherwise (falsy in an `if`).
+*/}}
+{{- define "order-management.authSecretHasKeys" -}}
+{{- if or .Values.auth.readKey .Values.auth.readWriteKey .Values.inventoryStorage.apiKey -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Non-empty when the deployments should mount the auth Secret: either an
+existing Secret is named, or the chart renders one because a key is set.
+*/}}
+{{- define "order-management.authSecretEnabled" -}}
+{{- if or .Values.auth.existingSecret (include "order-management.authSecretHasKeys" .) -}}
+true
+{{- end -}}
+{{- end }}
