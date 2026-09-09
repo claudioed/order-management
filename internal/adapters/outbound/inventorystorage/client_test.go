@@ -20,6 +20,7 @@ type captured struct {
 	method string
 	path   string
 	body   map[string]any
+	auth   string
 }
 
 func newServer(t *testing.T, status int, responseBody string, got *captured) *httptest.Server {
@@ -27,6 +28,7 @@ func newServer(t *testing.T, status int, responseBody string, got *captured) *ht
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got.method = r.Method
 		got.path = r.URL.Path
+		got.auth = r.Header.Get("Authorization")
 		if raw, err := io.ReadAll(r.Body); err == nil && len(raw) > 0 {
 			_ = json.Unmarshal(raw, &got.body)
 		}
@@ -61,6 +63,62 @@ func TestReserveSendsInventoryStoragesPublishedRequestShape(t *testing.T) {
 	if got.body["sku"] != "SKU-1" || got.body["quantity"] != float64(3) || got.body["demandRef"] != "ord-7" {
 		t.Fatalf("request body = %v, want {sku, quantity, demandRef}", got.body)
 	}
+	if got.auth != "" {
+		t.Fatalf("no bearer configured, but Authorization = %q", got.auth)
+	}
+}
+
+// TestBearerTokenIsSentOnlyWhenConfigured pins fleet ADR 0005's client
+// side: the Authorization header is present iff INVENTORY_STORAGE_API_KEY
+// is configured, on both the reserve and the revoke call.
+func TestBearerTokenIsSentOnlyWhenConfigured(t *testing.T) {
+	t.Run("configured token is sent on reserve and revoke", func(t *testing.T) {
+		var got captured
+		srv := newServer(t, http.StatusCreated, `{"id":"res-1"}`, &got)
+		client := inventorystorage.NewClient(srv.URL, nil).WithBearerToken("  secret-key ")
+
+		if _, err := client.Reserve(context.Background(), ports.ReservationRequest{SKU: "SKU-1", Quantity: 1, DemandRef: "ord-1"}); err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+		if got.auth != "Bearer secret-key" {
+			t.Fatalf("Reserve Authorization = %q, want Bearer secret-key", got.auth)
+		}
+
+		var gotRevoke captured
+		revokeSrv := newServer(t, http.StatusNoContent, "", &gotRevoke)
+		revoker := inventorystorage.NewClient(revokeSrv.URL, nil).WithBearerToken("secret-key")
+		if err := revoker.RevokeReservation(context.Background(), "res-1"); err != nil {
+			t.Fatalf("RevokeReservation: %v", err)
+		}
+		if gotRevoke.auth != "Bearer secret-key" {
+			t.Fatalf("Revoke Authorization = %q, want Bearer secret-key", gotRevoke.auth)
+		}
+	})
+
+	t.Run("empty token sends no header", func(t *testing.T) {
+		var got captured
+		srv := newServer(t, http.StatusNoContent, "", &got)
+		client := inventorystorage.NewClient(srv.URL, nil).WithBearerToken("")
+		if err := client.RevokeReservation(context.Background(), "res-1"); err != nil {
+			t.Fatalf("RevokeReservation: %v", err)
+		}
+		if got.auth != "" {
+			t.Fatalf("Authorization = %q, want none", got.auth)
+		}
+	})
+
+	t.Run("WithBearerToken does not mutate the receiver", func(t *testing.T) {
+		var got captured
+		srv := newServer(t, http.StatusNoContent, "", &got)
+		base := inventorystorage.NewClient(srv.URL, nil)
+		_ = base.WithBearerToken("k")
+		if err := base.RevokeReservation(context.Background(), "res-1"); err != nil {
+			t.Fatalf("RevokeReservation: %v", err)
+		}
+		if got.auth != "" {
+			t.Fatalf("base client must stay unauthenticated, got %q", got.auth)
+		}
+	})
 }
 
 // The single most important behaviour in this adapter: only a 409 is the

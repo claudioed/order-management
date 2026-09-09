@@ -46,7 +46,11 @@ info:
 servers:
   - url: http://localhost:8080
     description: Local development
-security: []
+# Fleet REST identity (ADR-0011, adopting warehouse-ops-agent ADR 0005):
+# every operation except /healthz requires a static bearer key.
+# GET/HEAD/OPTIONS need the read scope; every other method needs read-write.
+security:
+  - bearerAuth: []
 tags:
   - name: Orders
     description: >
@@ -76,6 +80,7 @@ paths:
         not check downstream dependencies (Postgres, inventory-storage,
         wes-work-planning) — it is a liveness check, not a readiness check.
       tags: [Health]
+      security: []
       responses:
         "200":
           description: Service is alive.
@@ -188,6 +193,10 @@ paths:
                 status: 422
                 detail: quantity must be greater than zero
                 instance: /orders
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/InsufficientScope"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -228,6 +237,10 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/OrderNotFound"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/InsufficientScope"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -275,6 +288,10 @@ paths:
                 instance: /orders/ord-a1b2c3d4-0000-0000-0000-000000000001
         "503":
           $ref: "#/components/responses/DownstreamUnavailable"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/InsufficientScope"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -352,10 +369,25 @@ paths:
                 instance: /orders/ord-a1b2c3d4-0000-0000-0000-000000000001/retry-allocation
         "503":
           $ref: "#/components/responses/DownstreamUnavailable"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/InsufficientScope"
         "500":
           $ref: "#/components/responses/InternalError"
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Static API key with a `read` or `read-write` scope (ADR-0011,
+        fleet ADR 0005). Keys are issued out of band from a Kubernetes
+        Secret (`API_READ_KEY` / `API_READWRITE_KEY`); there is no IdP.
+        `GET`/`HEAD`/`OPTIONS` require `read`; every other method requires
+        `read-write`. `/healthz` is open.
+
   parameters:
     OrderId:
       name: id
@@ -422,6 +454,44 @@ components:
             title: An unexpected internal error occurred
             status: 500
             detail: unexpected adapter failure
+            instance: /orders
+
+    Unauthenticated:
+      description: >
+        No bearer credential, or an unknown one. Carries a
+        `WWW-Authenticate: Bearer` challenge. Only emitted when the service
+        runs with `AUTH_MODE=enforce` (ADR-0011).
+      headers:
+        WWW-Authenticate:
+          description: The bearer challenge.
+          schema:
+            type: string
+            example: Bearer realm="warehouse-systems"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://errors.order-management.warehouse-systems.dev/unauthenticated
+            title: Unauthorized
+            status: 401
+            detail: Missing or invalid bearer credential.
+            instance: /orders
+
+    InsufficientScope:
+      description: >
+        The credential is valid but grants only the `read` scope, and this
+        operation requires `read-write`. Only emitted under
+        `AUTH_MODE=enforce` (ADR-0011).
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://errors.order-management.warehouse-systems.dev/insufficient-scope
+            title: Forbidden
+            status: 403
+            detail: This credential does not grant the read-write scope.
             instance: /orders
 
   schemas:

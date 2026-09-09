@@ -11,6 +11,8 @@ data:
   KAFKA_BROKERS: {{ .Values.kafka.brokers | quote }}
   {{- end }}
   INVENTORY_STORAGE_MODE: {{ .Values.inventoryStorage.mode | quote }}
+  # REST identity mode (ADR-0011): enforce | log | off.
+  AUTH_MODE: {{ .Values.auth.mode | quote }}
   {{- if .Values.inventoryStorage.baseUrl }}
   INVENTORY_STORAGE_BASE_URL: {{ .Values.inventoryStorage.baseUrl | quote }}
   {{- end }}

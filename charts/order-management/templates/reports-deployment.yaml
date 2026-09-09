@@ -46,6 +46,23 @@ spec:
                 secretKeyRef:
                   name: {{ include "order-management.analyticsSecretName" . }}
                   key: ANALYTICS_READER_DATABASE_URL
+            # REST identity (ADR-0011 / fleet ADR 0005).
+            - name: AUTH_MODE
+              value: {{ .Values.auth.mode | quote }}
+            {{- if include "order-management.authSecretEnabled" . }}
+            - name: API_READ_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "order-management.authSecretName" . }}
+                  key: API_READ_KEY
+                  optional: true
+            - name: API_READWRITE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "order-management.authSecretName" . }}
+                  key: API_READWRITE_KEY
+                  optional: true
+            {{- end }}
             {{- if .Values.otel.enabled }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.otel.endpoint | quote }}

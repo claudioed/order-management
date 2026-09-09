@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/claudioed/order-management/internal/adapters/inbound/auth"
 	inboundhttp "github.com/claudioed/order-management/internal/adapters/inbound/http"
 	"github.com/claudioed/order-management/internal/adapters/outbound/analyticsstore"
 )
@@ -52,7 +53,7 @@ func run() error {
 	defer pool.Close()
 
 	handlers := &inboundhttp.ReportsHandlers{Store: analyticsstore.NewPostgresReport(pool)}
-	router := inboundhttp.NewReportsRouter(handlers, logger)
+	router := inboundhttp.NewReportsRouter(handlers, logger, buildRESTAuth(os.Getenv, logger))
 
 	srv := &http.Server{Addr: httpAddr, Handler: router, ReadHeaderTimeout: 5 * time.Second}
 
@@ -70,6 +71,27 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return srv.Shutdown(ctx)
+}
+
+// buildRESTAuth mirrors cmd/order/main.go's helper (kept local so each
+// composition root stays free-standing): API_READ_KEY / API_READWRITE_KEY
+// (falling back to MCP_READ_KEY / MCP_READWRITE_KEY) plus
+// AUTH_MODE=enforce|log|off, defaulting to enforce when a key is configured
+// and to off -- with a loud WARN -- when none is. The reports router pins
+// the required scope to read itself. Key material is never logged.
+func buildRESTAuth(getenv func(string) string, logger *slog.Logger) auth.Middleware {
+	keys := auth.KeysFromEnv(getenv)
+	authn := auth.NewStaticKeyAuth(keys)
+	defaultMode := auth.ModeOff
+	if authn.HasKeys() {
+		defaultMode = auth.ModeEnforce
+	}
+	mode := auth.ParseMode(getenv("AUTH_MODE"), defaultMode)
+	if mode == auth.ModeOff {
+		logger.Warn("REST auth is OFF: no API_READ_KEY/API_READWRITE_KEY configured or AUTH_MODE=off")
+	}
+	logger.Info("REST auth configured", "mode", string(mode), "keys", len(keys))
+	return auth.Middleware{Authn: authn, Mode: mode, Logger: logger}
 }
 
 // newLogger builds the process-wide structured logger. LOG_LEVEL maps
