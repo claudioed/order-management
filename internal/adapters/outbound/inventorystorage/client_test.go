@@ -20,6 +20,7 @@ type captured struct {
 	method string
 	path   string
 	body   map[string]any
+	auth   string
 }
 
 func newServer(t *testing.T, status int, responseBody string, got *captured) *httptest.Server {
@@ -27,6 +28,7 @@ func newServer(t *testing.T, status int, responseBody string, got *captured) *ht
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got.method = r.Method
 		got.path = r.URL.Path
+		got.auth = r.Header.Get("Authorization")
 		if raw, err := io.ReadAll(r.Body); err == nil && len(raw) > 0 {
 			_ = json.Unmarshal(raw, &got.body)
 		}
@@ -60,6 +62,11 @@ func TestReserveSendsInventoryStoragesPublishedRequestShape(t *testing.T) {
 	}
 	if got.body["sku"] != "SKU-1" || got.body["quantity"] != float64(3) || got.body["demandRef"] != "ord-7" {
 		t.Fatalf("request body = %v, want {sku, quantity, demandRef}", got.body)
+	}
+	// This client sends no Authorization header at all -- the fleet
+	// REST/MCP static-bearer auth layer has been removed.
+	if got.auth != "" {
+		t.Fatalf("Authorization = %q, want none (auth layer removed)", got.auth)
 	}
 }
 

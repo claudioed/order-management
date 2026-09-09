@@ -144,6 +144,10 @@ func writeReportInternal(w http.ResponseWriter, r *http.Request, err error) {
 
 // NewReportsRouter builds the chi router for the order-reports reader service.
 // A nil logger falls back to slog.Default().
+//
+// Every route, including /reports/*, is reachable with no Authorization
+// header: the fleet-wide REST/MCP static-bearer auth layer has been
+// removed.
 func NewReportsRouter(h *ReportsHandlers, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
@@ -155,6 +159,7 @@ func NewReportsRouter(h *ReportsHandlers, logger *slog.Logger) http.Handler {
 	r.Use(middleware.Recoverer)
 
 	r.Get("/healthz", h.GetReportsHealthz)
+
 	r.Get("/reports/funnel", h.GetFunnel)
 	r.Get("/reports/funnel/freshness", h.GetFreshness)
 

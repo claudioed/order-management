@@ -61,6 +61,19 @@ type Clock interface {
 	Now() time.Time
 }
 
+// OrderMetrics records order-intake outcomes so the business signal (how
+// much demand is arriving, and how much of it is immediately accepted vs.
+// rejected as invalid at intake) is observable independently of HTTP
+// traffic. Use cases treat a nil value as "not instrumented", so wiring it
+// is optional. Mirrors inventory-storage's ports.ReservationMetrics shape
+// exactly: two named methods over a single counter distinguished by an
+// `outcome` attribute, per the fleet-standard-metrics ADR's Tier-2
+// convention.
+type OrderMetrics interface {
+	OrderAccepted(ctx context.Context)
+	OrderRejected(ctx context.Context)
+}
+
 // ReservationRequest is this context's request shape for
 // inventory-storage's POST /reservations. DemandRef carries the OrderId —
 // which is precisely the identity this bounded context was created to own.

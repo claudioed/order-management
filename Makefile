@@ -21,7 +21,7 @@ COVERAGE_THRESHOLD := 90
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build vet fmt fmt-check lint test coverage check check-all
+.PHONY: help build vet fmt fmt-check lint test integration coverage check check-all
 
 help:
 	@echo "order-management — local quality gate (targets mirror .github/workflows/ci.yml)"
@@ -33,6 +33,7 @@ help:
 	@echo "  fmt-check   Fail if gofmt -l . is non-empty (the CI-style check)"
 	@echo "  lint        golangci-lint run ./... (pinned $(GOLANGCI_VERSION) in CI)"
 	@echo "  test        go test ./... -race — unit + httptest, no DB needed"
+	@echo "  integration Run Kafka integration tests in an isolated Testcontainers broker"
 	@echo "  coverage    CI coverage command + the $(COVERAGE_THRESHOLD)% gate"
 	@echo ""
 	@echo "  check       FAST bundle: fmt-check vet build lint test"
@@ -68,6 +69,11 @@ lint:
 
 test:
 	$(GO) test ./... -race
+
+integration:
+	$(GO) build -tags=integration ./...
+	$(GO) vet -tags=integration ./...
+	$(GO) test -tags=integration ./internal/adapters/outbound/kafka
 
 coverage:
 	$(GO) test ./... -race -coverprofile=$(COVERAGE_OUT) -coverpkg=$(COVERAGE_PKGS)

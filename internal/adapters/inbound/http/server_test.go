@@ -77,7 +77,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	return &testEnv{
-		handler:   inboundhttp.NewRouter(server, logger),
+		handler:   inboundhttp.NewRouter(server, logger, ""),
 		orders:    orders,
 		inventory: inventory,
 	}

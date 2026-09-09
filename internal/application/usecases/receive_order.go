@@ -77,6 +77,10 @@ type ReceiveOrder struct {
 	Clock     ports.Clock
 	Inventory ports.InventoryReservationClient
 	Promise   order.LeadTimePolicy
+	// Metrics records the business-fact outcome of order intake (accepted
+	// vs. rejected). Optional — a nil Metrics means "not instrumented",
+	// same convention as every other optional port on this use case.
+	Metrics ports.OrderMetrics
 }
 
 func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowPartialShipment bool) (*order.Order, error) {
@@ -84,6 +88,7 @@ func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowParti
 	for i, l := range lines {
 		line, err := order.NewOrderLine(i+1, l.SKU, l.Quantity, l.PathID, l.GiftWrap)
 		if err != nil {
+			uc.recordRejected(ctx)
 			return nil, err
 		}
 		domainLines = append(domainLines, line)
@@ -96,6 +101,7 @@ func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowParti
 
 	o, err := order.New(id, domainLines, allowPartialShipment)
 	if err != nil {
+		uc.recordRejected(ctx)
 		return nil, err
 	}
 
@@ -105,6 +111,10 @@ func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowParti
 	if err := uc.Events.Publish(ctx, shared.NewOrderReceived(uc.Clock.Now(), o.ID(), len(domainLines))); err != nil {
 		return nil, err
 	}
+	// The order is genuinely persisted and OrderReceived has already fired
+	// at this point — intake itself succeeded, independent of whatever the
+	// best-effort allocation attempt below does next (see the type doc).
+	uc.recordAccepted(ctx)
 
 	// Best-effort implicit allocation-then-release — see the type doc for
 	// the full reasoning. A hard failure here is intentionally NOT
@@ -139,4 +149,16 @@ func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowParti
 		return stored, nil
 	}
 	return o, nil
+}
+
+func (uc *ReceiveOrder) recordAccepted(ctx context.Context) {
+	if uc.Metrics != nil {
+		uc.Metrics.OrderAccepted(ctx)
+	}
+}
+
+func (uc *ReceiveOrder) recordRejected(ctx context.Context) {
+	if uc.Metrics != nil {
+		uc.Metrics.OrderRejected(ctx)
+	}
 }

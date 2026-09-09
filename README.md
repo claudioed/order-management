@@ -191,7 +191,7 @@ subscriber) consumes independently:
   `docker-compose.kafka.yml` uses (this repo has its own copy rather than
   a cross-repo reference).
 - **Fire-and-forget, deliberately.** There is no release-confirmation
-  reply event from `wes-work-planning` in v1 — see "Deferred (v1)" below.
+  reply event from `wes-work-planning` in v1 — see "Deferred" below.
 
 ## Analytics data product
 
@@ -378,49 +378,48 @@ brew install lefthook   # or: go install github.com/evilmartians/lefthook@latest
 lefthook install
 ```
 
-CI runs exactly two jobs in v1: **`lint`** and **`test`**.
+CI mirrors the local gate and the fleet's sensor set (same shape as
+wes-work-planning's CI): **`lint`**, **`test`** (+ coverage gate), **`bdd`**
+(godog/Gherkin acceptance suite under `features/`), **`integration`**
+(`-tags=integration` suite against two `postgres:16` service containers —
+one per database this repo owns), **`mutation-fast`** (gremlins on
+`./internal/domain/order`, thresholds pinned in `.gremlins.yaml`) with the
+exhaustive weekly **`mutation`** run on schedule, **`vuln`**
+(govulncheck), **`api-lint`** (Spectral on `apis/openapi.yaml` and
+`apis/asyncapi.yaml`), **`arch-test`** (arch-go fitness tests in
+`internal/architecture/`), and **`docs-api-drift`** (regenerates the
+Docusaurus API reference from the spec and fails on diff) — plus the
+packaging/security/publish jobs (`helm-lint`, `trivy-scan`,
+`docker-publish`, `release`).
 
-## Deferred (v1)
+## Deferred
 
 The following are **deliberately out of scope for this first pass**. They are
 listed so an absence is never mistaken for an oversight — each is a decision,
-not a gap someone forgot about.
+not a gap someone forgot about. (Originally the "Deferred (v1)" list; items
+since shipped — Helm chart, MCP adapter, Docker publishing/releases,
+Kafka integration, analytics data product, and the full CI sensor set
+above — have been removed from it.)
 
-- **Helm chart / `warehouse-infra` kind-cluster wiring.** No `charts/`
-  directory and no `helm-lint` CI job. Deployment for now is
-  `go run ./cmd/order` or a hand-built container.
-- **Gremlins mutation-testing gate.** The sibling services gate on mutation
-  score; there is no `.gremlins.yaml` and no `mutation` job here yet. The 90%
-  coverage gate is the only test-quality sensor in v1.
-- **godog / BDD acceptance tests.** No `features/` directory and no `bdd` job.
-  The behavioural rules are covered by table-driven unit tests and the
-  `httptest` suite instead.
-- **MCP inbound adapter.** HTTP is the only inbound adapter.
 - **Kafka release-confirmation reply events from wes-work-planning.**
   This service publishes `OrderAllocated`/`OrderPartiallyAllocated` to
   Kafka fire-and-forget — it never learns whether wes-work-planning's
   consumer actually processed the event or successfully enqueued its own
-  work. This is a deliberate v1 choice (mirroring inventory-storage's own
+  work. This is a deliberate choice (mirroring inventory-storage's own
   ADR 0004 stance on transactional guarantees), not an oversight: a
   confirmation-loop pattern (e.g. this service subscribing to a
   `WorkEnqueued` reply event) is real, scoped-down future work. See
   [ADR 0005](docs/docs/adr/0005-choreographed-release-via-kafka.md).
-- **Postgres integration tests.** The `postgres` adapter has no
-  `-tags=integration` suite and there is no `integration` CI job; that needs a
-  live database in CI, which is a separate round of work.
-- **arch-go architecture fitness tests.** The dependency rule in ADR 0001 is
-  upheld by review here, not yet by an executable test.
-- **Spectral / OpenAPI linting in CI.** `apis/openapi.yaml` is
-  spectral-clean against `.spectral.yaml` locally, but there is no `api-lint`
-  job in v1.
-- **Docker image publishing and releases.** No `docker-publish` or `release`
-  job, no `Dockerfile`.
 - **Real carrier-rate promise dates.** `LeadTimePolicy` computes the promise
   date from a configurable per-path lead time. That is real, tested domain
   logic — not a hardcoded field — but it is not a live carrier integration,
   and no such service exists in this fleet to call.
 - **Clawing back released work on cancellation.** Documented in detail in
   [ADR 0004](docs/docs/adr/0004-cancellation-boundary-at-release.md).
+- **Killing the surviving promise.go boundary mutants.** The mutation gate
+  is pinned at the measured baseline (efficacy 90 / mutant-coverage 81 —
+  see `.gremlins.yaml`); hardening the lead-time fallback tests to ratchet
+  those thresholds toward the fleet's 99/99 is tracked follow-up work.
 - **Any change to `inventory-storage` or `wes-work-planning`.** This build is
   100% additive from their point of view; neither repository is touched.
 
@@ -452,6 +451,13 @@ GitHub Pages on every push to `main` that touches `docs/**`, publishing to
 3. [0003 — Ship-complete by default and fail-closed allocation](docs/docs/adr/0003-ship-complete-default-and-fail-closed-allocation.md)
 4. [0004 — The cancellation boundary is release](docs/docs/adr/0004-cancellation-boundary-at-release.md)
 5. [0005 — Choreographed release via Kafka, folded allocate-then-release, and pathId goes internal-only](docs/docs/adr/0005-choreographed-release-via-kafka.md)
+6. [0006 — Analytical data product](docs/docs/adr/0006-analytical-data-product.md)
+7. [0007 — Adopt the fleet micro-frontend console](docs/docs/adr/0007-adopt-fleet-micro-frontend-console.md)
+8. [0008 — Fulfillment-class demand-shape classifier](docs/docs/adr/0008-fulfillment-class-demand-shape-classifier.md)
+9. [0009 — Standard metrics convention](docs/docs/adr/0009-standard-metrics-convention.md)
+10. [0010 — MCP inbound adapter](docs/docs/adr/0010-mcp-inbound-adapter.md)
+11. [0011 — Adopt the fleet REST identity (static bearer keys, read/read-write scopes)](docs/docs/adr/0011-adopt-fleet-rest-identity.md) (superseded by 0012)
+12. [0012 — Remove the REST/MCP bearer auth layer](docs/docs/adr/0012-remove-rest-mcp-bearer-auth.md)
 
 ## License
 

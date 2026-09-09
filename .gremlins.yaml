@@ -1,0 +1,38 @@
+# gremlins (github.com/go-gremlins/gremlins) configuration — pinned so mutation
+# runs are reproducible between a developer's machine and CI, and so the
+# test-quality sensor can FAIL the build when it regresses.
+#
+# Discovered automatically: gremlins looks for `.gremlins.yaml` at the Go module
+# root. Both CI mutation jobs pick it up:
+#   - `mutation-fast` (every push/PR) -> gremlins unleash ./internal/domain/order
+#   - `mutation`      (schedule/dispatch) -> gremlins unleash ./internal/domain
+#
+# Measured on 2026-09-07 with gremlins v0.6.0 (workers 1, timeout-coefficient 30):
+#   ./internal/domain/order -> 53 mutants, killed 39 / lived 4 / not covered 10,
+#   efficacy 90.70%, mutant-coverage 81.13%, ~46s
+# The 4 lived and 10 uncovered mutants are boundary conditionals in
+# promise.go's lead-time fallbacks — killing them is tracked as follow-up
+# domain-test hardening; the gate below locks in TODAY's score so neither
+# number can silently regress in the meantime.
+#
+# NOTE on the comparison: gremlins fails when the MEASURED value is <= the
+# threshold (a run measuring 100.00% against a threshold of 100 exits with
+# "ERROR: below efficacy-threshold"), so the threshold must sit strictly
+# below what we can meet today. 90/81 is therefore the tightest useful
+# value pair: it locks in the measured 90.70/81.13 and goes red the moment
+# a previously-killed mutant survives, the same "gate just under what we
+# already achieve" approach as the 90% coverage gate in ci.yml. Ratchet
+# the thresholds upward alongside any test-quality improvement work.
+
+silent: false
+
+unleash:
+  # Matches the flags the CI mutation job uses for the weekly deep run.
+  workers: 1
+  timeout-coefficient: 30
+
+  threshold:
+    # efficacy = KILLED / (KILLED + LIVED)
+    efficacy: 90
+    # mutant-coverage = (KILLED + LIVED) / TOTAL mutants
+    mutant-coverage: 81
