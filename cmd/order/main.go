@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/claudioed/order-management/internal/adapters/outbound/events"
 	"github.com/claudioed/order-management/internal/adapters/outbound/inventorystorage"
 	kafkaadapter "github.com/claudioed/order-management/internal/adapters/outbound/kafka"
+	"github.com/claudioed/order-management/internal/adapters/outbound/kafkacatalog"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
 	"github.com/claudioed/order-management/internal/adapters/outbound/postgres"
 	"github.com/claudioed/order-management/internal/adapters/outbound/telemetry"
@@ -84,6 +86,58 @@ func run() error {
 
 	inventory := buildInventoryClient(getenv("INVENTORY_STORAGE_MODE", "permissive"), os.Getenv("INVENTORY_STORAGE_BASE_URL"), logger)
 
+	// The process-path catalogue's SOURCE is selectable, defaulting to
+	// "none" (validation skipped -- a nil ports.ProcessPathCatalogue is
+	// this fleet's established "not yet wired" convention, see
+	// ReceiveOrder's doc comment). Set PATH_CATALOGUE_SOURCE=kafka for a
+	// real deployment, mirroring wes-work-planning/fulfillment-execution/
+	// workforce-management's identical PATH_CATALOGUE_SOURCE convention.
+	// Unlike those three services, order-management never had a
+	// file-based catalogue to begin with (see ADR-0013's scope decision),
+	// so there is no "file" mode here -- only "none" (skip) and "kafka"
+	// (real validation).
+	catalogueSource := getenv("PATH_CATALOGUE_SOURCE", "none")
+	var catalogue ports.ProcessPathCatalogue
+	// catalogueConsumerCtx/cancelCatalogueConsumer are declared here
+	// (rather than inline in the switch below) because the Kafka
+	// catalogue source needs its own Run goroutine started BEFORE
+	// WaitReady is called -- otherwise nothing would ever be consuming
+	// messages while this process waits, guaranteeing a deadlock until
+	// WaitReadyTimeout.
+	catalogueConsumerCtx, cancelCatalogueConsumer := context.WithCancel(context.Background())
+	defer cancelCatalogueConsumer()
+
+	switch catalogueSource {
+	case "kafka":
+		kafkaBrokers := os.Getenv("KAFKA_BROKERS")
+		if kafkaBrokers == "" {
+			return fmt.Errorf("PATH_CATALOGUE_SOURCE=kafka requires KAFKA_BROKERS to be set")
+		}
+		kafkaCatalogue, err := kafkacatalog.NewConsumer(context.Background(), strings.Split(kafkaBrokers, ","), logger)
+		if err != nil {
+			return fmt.Errorf("failed to start the Kafka-sourced process-path catalogue: %w", err)
+		}
+		catalogue = kafkaCatalogue
+		logger.Info("process-path catalogue source configured", "source", "kafka", "topic", kafkacatalog.Topic)
+		go func() {
+			logger.Info("process-path catalogue consumer running", "topic", kafkacatalog.Topic)
+			if err := kafkaCatalogue.Run(catalogueConsumerCtx); err != nil {
+				logger.Error("process-path catalogue consumer stopped", "error", err)
+			}
+		}()
+
+		logger.Info("waiting for the process-path catalogue to replay its initial history before accepting traffic")
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), kafkacatalog.WaitReadyTimeout)
+		err = kafkaCatalogue.WaitReady(waitCtx)
+		waitCancel()
+		if err != nil {
+			return fmt.Errorf("process-path catalogue did not become ready within %s: %w", kafkacatalog.WaitReadyTimeout, err)
+		}
+	default:
+		logger.Warn("process-path catalogue source not configured; ReceiveOrder will skip path validation",
+			"hint", "set PATH_CATALOGUE_SOURCE=kafka for a real deployment")
+	}
+
 	promise := order.NewLeadTimePolicy(
 		durationEnv("PROMISE_DEFAULT_LEAD_TIME", order.DefaultLeadTime, logger),
 		perPathLeadTimes(os.Getenv("PROMISE_PATH_LEAD_TIMES"), logger),
@@ -91,7 +145,7 @@ func run() error {
 
 	clock := memory.SystemClock{}
 	server := &inboundhttp.Server{
-		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise, Metrics: orderMetrics},
+		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise, Catalogue: catalogue, Metrics: orderMetrics},
 		RetryAllocation: &usecases.RetryAllocation{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
 		CancelOrder:     &usecases.CancelOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock},
 		GetOrder:        &usecases.GetOrder{Orders: orders},
