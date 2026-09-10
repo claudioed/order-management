@@ -1,338 +1,158 @@
-# Project: Order Management (Generic/Supporting Bounded Context — order intake, allocation, release)
+# Order Management
 
-The missing upstream Open Host Service for the warehouse-systems fleet. Owns
-**Order** and **OrderLine** as first-class aggregates: intake, per-line stock
-allocation (via inventory-storage), promise-date calculation, release of
-allocated work (via wes-work-planning), and cancellation up to the release
-boundary. Before this context existed, "an order" was just an unowned,
-unvalidated string (`OrderRef`/`DemandRef`/`Reference`) independently
-reinvented by three different services.
+Generic/Supporting bounded context: order intake, per-line stock allocation,
+promise-date calculation, and choreographed release — the missing upstream
+Open Host Service for the `warehouse-systems` fleet. Owns **Order** and
+**OrderLine** as first-class aggregates. Before this context existed, "an
+order" was just an unowned string (`OrderRef`/`DemandRef`/`Reference`)
+independently reinvented by three other services.
 
-Source of truth for the design: `/Users/claudioed/warehouse-systems/.hermes/plans/2026-08-25_023800-order-management.md`
-and the fleet's shared reference docs at `/Users/claudioed/docs/amazon-fulfillment-ddd.md`
+Design source of truth: `/Users/claudioed/warehouse-systems/.hermes/plans/2026-08-25_023800-order-management.md`
+and the fleet's shared DDD reference docs at `/Users/claudioed/docs/amazon-fulfillment-ddd.md`
 and `/Users/claudioed/warehouse-systems-ddd.md`. Honor their ubiquitous
-language and DDD strategic classifications.
+language and strategic classifications.
 
-## Bounded-context boundary (NON-NEGOTIABLE — read this before writing any code)
+Study project — not a production system, not affiliated with Amazon or any
+company (see README.md banner).
 
-This service is a **pure HTTP consumer** of `inventory-storage`'s and
-`wes-work-planning`'s already-published, already-stable REST APIs. It is a
-**separate Go module in a separate repository** — it MUST NOT import any Go
-package from those repos, and it gets no write access to their internal
-aggregates (`Reservation`, `WorkPool`, `WorkUnit`, etc.), only to their
-published HTTP contracts below. Order Management is the **Customer**;
-inventory-storage and wes-work-planning are the **Suppliers / Open Host
-Services** — the same directional Customer/Supplier relationship the fleet's
-DDD reference docs already use for WMS → WES. Do not weaken this boundary
-for convenience (e.g. no shared Go module, no direct DB access to either
-service's schema).
+## Project Overview
 
-## Architecture (NON-NEGOTIABLE — identical shape to the other five services)
+- **Module:** `github.com/claudioed/order-management`, Go 1.26.
+- **Four binaries, one module:** `cmd/order` (HTTP + Kafka-choreography
+  OLTP service), `cmd/mcp` (MCP read server, ADR-0010), `cmd/order-projector`
+  (analytics writer, ADR-0006), `cmd/order-reports` (analytics read-only API).
+- **Public intent, one command.** Since ADR-0005, a caller expresses "place
+  an order" via `POST /orders` alone — allocation and release happen inside
+  that same call as a folded, best-effort saga. There is no public
+  `/allocate` or `/release` verb anymore.
+- **Suppliers:** `inventory-storage` (synchronous HTTP, `POST /reservations`)
+  and `wes-work-planning` (asynchronous, via Kafka choreography — no HTTP
+  call). This context is the **Customer**; both are **Suppliers / Open Host
+  Services**. See `.claude/rules/bounded-context-boundary.md`.
 
-Hexagonal / Ports & Adapters. Strict dependency rule: **domain depends on
-nothing; application depends on domain; adapters depend on
-application/domain.** No framework, HTTP, or SQL types in the domain layer.
+## Architecture (NON-NEGOTIABLE — identical shape to the other fleet services)
+
+Hexagonal / Ports & Adapters, enforced by an `arch-go` fitness test
+(`internal/architecture/architecture_test.go`, CI job `arch-test`). Strict
+dependency rule: **domain depends on nothing; application depends on
+domain; adapters depend on application/domain.** No framework, HTTP, or SQL
+type ever appears in the domain layer.
 
 ```
-cmd/order/                    main.go — composition root
+cmd/
+  order/                       main.go — HTTP + Kafka-choreography OLTP service
+  mcp/                         MCP server composition root (ADR-0010)
+  order-projector/             analytics writer (ADR-0006), FirstOffset consumer
+  order-reports/                analytics read-only REST API
 internal/
   domain/
-    order/                    Order aggregate, OrderLine, Status, invariants
-    shared/                   value objects: OrderId, SKU, PathId, events, errors
+    order/                     Order aggregate, OrderLine, Status, invariants, LeadTimePolicy
+    shared/                    OrderId, SKU, PathId, domain events, errors
   application/
-    ports/                    OUT: OrderRepo, EventPublisher, Clock,
-                               InventoryReservationClient, WorkReleaseClient
-    usecases/                 ReceiveOrder, AllocateOrder, RetryAllocation,
-                               ReleaseOrder, CancelOrder, GetOrder
+    ports/                     OrderRepo, EventPublisher, Clock, OrderMetrics,
+                                InventoryReservationClient (NO WorkReleaseClient — deleted, ADR-0005)
+    usecases/                  ReceiveOrder, RetryAllocation, CancelOrder, GetOrder
+                                (AllocateOrder/ReleaseOrder deleted as public types, ADR-0005;
+                                shared allocate-then-release logic lives in allocation.go)
   adapters/
-    inbound/http/             chi handlers, DTOs, RFC7807 error mapping
-    outbound/inventorystorage/  HTTP client: POST /reservations,
-                                 DELETE /reservations/{id}
-    outbound/weswork/           HTTP client: POST /paths/{pathId}/work-units
-    outbound/postgres/        pgxpool repo + migrations
-    outbound/memory/          in-memory repo for tests
-    outbound/events/          log publisher (Kafka-ready interface, unused in v1)
-migrations/                   golang-migrate SQL files
-apis/openapi.yaml
+    inbound/http/               chi handlers, DTOs, RFC 7807 error mapping, CORS
+    inbound/mcp/                MCP read-only tool (get_order), ADR-0010
+    outbound/inventorystorage/  HTTP client: POST /reservations, DELETE /reservations/{id}
+    outbound/kafka/             integration-events publisher (EVENT_PUBLISHER=kafka)
+    outbound/events/            log publisher (default, EVENT_PUBLISHER=log)
+    outbound/postgres/          pgxpool repo + golang-migrate runner
+    outbound/memory/            in-memory repo for tests
+    outbound/analyticsstore/    analytics read/write store (ADR-0006)
+    outbound/telemetry/         OTel MeterProvider/TracerProvider, otelchi RED (ADR-0009)
+  analytics/report/             analytical read model — depends on nothing internal (enforced)
+migrations/                    golang-migrate SQL (OLTP)
+migrations/analytics/          golang-migrate SQL (analytics store)
+apis/openapi.yaml              REST contract (5 endpoints)
+apis/asyncapi.yaml             Kafka contract (2 channels, 11 messages)
+web/                           order-mgmt-mfe — Vite/React MFE remote (ADR-0007), NOT part of the Go module
+docs/docs/adr/                 12 ADRs — see .claude/rules/adrs.md
 ```
 
-## Analytics data product (ADR-0006)
+**Note on `web/`:** owns its own `package.json`/build/dev-server (`:5181`),
+talks only to this service's own REST API, and never participates in
+`make check`/`check-all`. See `.claude/rules/frontend-mfe.md`.
 
-Additive read side built from this service's OWN domain events. The OLTP
-domain/application layers are NOT modified and must NOT import the analytics
-store. `internal/analytics/report/` depends on nothing. (Isolation is
-enforced by the `arch-test` CI job via `internal/architecture/` — the
-arch-go rule `analytics depends on nothing internal except itself` fails
-the build on any violation.)
+## Key Commands
 
-- Events are fanned to a SEPARATE topic `warehouse.order-management.analytics`
-  by a new outbound adapter; the integration topic/publisher are untouched.
-  Selected by `EVENT_PUBLISHER=kafka` (fan-out alongside the integration
-  publisher). NOTE: the "Domain events" section below still says "log publisher
-  only in v1, no Kafka" — that predates the Kafka integration + analytics work
-  and is now stale; a Kafka publisher and analytics fan-out both exist.
-- Separate analytical Postgres (`ANALYTICS_DATABASE_URL`), own migrations
-  (`migrations/analytics/`), read-only reader role.
-- Three processes: `cmd/order` (OLTP), `cmd/order-projector` (the ONLY writer;
-  consumes from FirstOffset, idempotent on event_id), `cmd/order-reports`
-  (read-only reader, `GET /reports/...`).
-- Report: **Order Funnel & Allocation Health**, keyed per path × hour
-  (received→allocated→released funnel; cancels/backorders/allocation-fails as
-  leakage; order-level events enriched with their path via an OrderRepo lookup).
-- `GET /reports/.../freshness` reports projection lag.
-- The async contract for both Kafka topics is documented in
-  `apis/asyncapi.yaml` (Spectral-gated in CI by the `api-lint` job).
+```bash
+# Local quality gate (mirrors .github/workflows/ci.yml)
+make check          # fmt-check + vet + build + lint + test — run after every change
+make check-all       # check + coverage (90% gate on domain+application)
+make integration     # Kafka adapter against a Testcontainers broker
+make coverage         # go test -race -coverprofile + the 90% gate
 
-## Ubiquitous Language (use these exact names)
+# Run locally
+go run ./cmd/order                    # in-memory adapters if DATABASE_URL unset
+docker compose up -d postgres         # Postgres 16 on :5434
+docker compose -f docker-compose.kafka.yml up -d   # local Kafka (KRaft, :9092)
 
-- **Order** — the aggregate root. `OrderId`, `OrderLine[]`,
-  `AllowPartialShipment bool`, `Status`, `PromiseDate *time.Time`.
-- **OrderLine** — `SKU`, `Quantity`, `PathId` (defaults to `"pick"` if not
-  supplied — a documented v1 simplification, same spirit as
-  fulfillment-execution's `path_id`-prefix convention), `GiftWrap bool`,
-  `LineStatus` (`Pending`/`Allocated`/`Backordered`/`Released`/`Cancelled`),
-  `ReservationId *string` (set once allocated; needed to cancel).
-- **Status** (order-level, ALWAYS derived from line statuses — never a
-  redundant field that can drift out of sync): `Received` →
-  `Allocated` | `PartiallyAllocated` | `Backordered` → `Released` |
-  `PartiallyReleased` → `Cancelled` (only reachable from a pre-release
-  state).
-- **Allocation** — reserving stock for one line via inventory-storage's
-  `POST /reservations`. This service does NOT model a local Reservation
-  aggregate — it only stores the `ReservationId` reference.
-  inventory-storage remains the sole owner/source-of-truth for reservation
-  state.
-- **Release** — enqueuing an allocated line as work via wes-work-planning's
-  `POST /paths/{pathId}/work-units`.
-- **Promise date** — computed at allocation time by a domain policy
-  function using a configurable per-path lead time (no live carrier
-  integration exists — intentionally simple, but real code with real
-  tests, never a stub/hardcoded field).
-- **Backordered** — a line-level state set when inventory-storage's
-  `POST /reservations` returns 409 (insufficient usable stock). This is a
-  BUSINESS FACT, distinct from a transport/5xx error, which is NOT a
-  business fact and must fail the call outright rather than silently
-  marking a line backordered (fail-closed on ambiguity).
+# Docs site (Docusaurus — regenerate after ANY apis/openapi.yaml change)
+cd docs && npm ci
+npm run gen-api-docs   # docusaurus gen-api-docs order -> docs/docs/api-reference/rest/
+npm run build          # onBrokenLinks / onBrokenAnchors are both 'throw'
 
-## Aggregates & invariants (enforce in domain, unit-tested — each needs a failing-path test)
+# golangci-lint (CI-pinned version)
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.1
+```
 
-- **Order**: cannot allocate the same line twice; cannot release a line
-  that isn't `Allocated`; cannot cancel once ANY line is `Released`
-  (`ErrOrderAlreadyReleased`); order-level `Status` is always computed from
-  line statuses, never stored redundantly.
-- **OrderLine**: `Quantity` must be > 0; `SKU` must be non-empty; a
-  `Backordered` line may transition back to `Allocated` ONLY via
-  `RetryAllocation` — no other path.
-- **BR3 (ship-complete default)**: `AllowPartialShipment=false` (the
-  default): if ANY line ends up `Backordered` during `AllocateOrder`, the
-  WHOLE order's status is `Backordered` (no line proceeds to release) until
-  a human/caller issues `RetryAllocation`. `AllowPartialShipment=true`:
-  allocated lines are independently eligible for release; order status
-  becomes `PartiallyAllocated`.
-- **BR6 (cancellation boundary)**: `CancelOrder` is legal ONLY while no
-  line has reached `Released`. Legal cancellation revokes every allocated
-  line's reservation via `DELETE /reservations/{id}` on inventory-storage.
-  Once ANY line is `Released`, v1 does NOT claw back released work — this
-  is a documented, deliberate known gap (same honesty pattern as
-  inventory-storage's ADR-0003 "no expiry sweeper" section), not an
-  oversight to silently paper over.
+Full CI job list, coverage/mutation gates, and the docs-drift check live in
+`.claude/rules/ci-quality-gates.md` — read it before touching `.github/workflows/`
+or `apis/*.yaml`.
 
-## Domain events (past tense — local log publisher only in v1, no Kafka)
+## Code Standards / Testing
 
-OrderReceived, OrderLineAllocated, OrderLineBackordered, OrderAllocated,
-OrderPartiallyAllocated, OrderLineReleased, OrderReleased, OrderCancelled.
-
-## Use cases (application layer)
-
-1. ReceiveOrder(lines[], allowPartialShipment) -> Order in Received status
-2. AllocateOrder(orderId) -> calls inventory-storage POST /reservations per
-   line; 409 -> that line Backordered (business fact); any other
-   non-2xx/transport error -> the whole call fails, nothing is silently
-   marked backordered
-3. RetryAllocation(orderId) -> re-attempts allocation for every Backordered
-   line only
-4. ReleaseOrder(orderId) -> calls wes-work-planning POST
-   /paths/{pathId}/work-units per Allocated line (cpt=PromiseDate,
-   reference=orderId, sku, giftWrap); rejects a line that isn't Allocated
-5. CancelOrder(orderId) -> revokes every allocated line's reservation via
-   DELETE /reservations/{id}; rejects with ErrOrderAlreadyReleased if any
-   line is already Released
-6. GetOrder(orderId) -> current Order state (read)
-
-## REST API (inbound adapter)
-
-- POST   /orders                          -> ReceiveOrder
-- GET    /orders/{id}                     -> GetOrder
-- POST   /orders/{id}/allocate            -> AllocateOrder
-- POST   /orders/{id}/retry-allocation    -> RetryAllocation
-- POST   /orders/{id}/release             -> ReleaseOrder
-- DELETE /orders/{id}                     -> CancelOrder
-- GET    /healthz
-
-JSON DTOs live in the http adapter; never leak domain structs.
-
-CORS middleware (`go-chi/cors`) is enabled on every route, allowing
-`CORS_ALLOWED_ORIGINS` (env, default `http://localhost:5173,http://localhost:5181`
-— the `warehouse-console` shell and this service's own `order-mgmt-mfe`
-remote) — added for the fleet's browser console (see "Frontend
-micro-frontend remote" below); no other behavior change.
-
-## Frontend micro-frontend remote (`web/`)
-
-This repo also owns `web/`: `order-mgmt-mfe`, a Vite + React Module
-Federation **remote** consumed by the separate `warehouse-console` shell
-repo. It is a plain browser client of this service's own REST API above
-— nothing in `web/` talks to any other bounded context, and nothing in
-`internal/` knows `web/` exists. Screens here (order search/lookup) are
-this repo's own responsibility to design and maintain, same as the REST
-API itself. See ADR-0002 in `warehouse-ops-agent`'s docs (the fleet-wide
-canonical record) and this repo's own adoption-record ADR under
-`docs/docs/adr/` for the full rationale. `web/` has its own `package.json`,
-build, and dev server (`:5181`); it does not participate in this repo's
-Go quality gate (`make check`/`check-all`) and is not part of the Go
-module.
-
-## Outbound HTTP contracts this service consumes (EXACT — verified against the live repos, do not guess a different shape)
-
-**inventory-storage** (base URL via env `INVENTORY_STORAGE_BASE_URL`):
-- `POST /reservations` — request `{"sku":"...","quantity":N,"demandRef":"..."}`
-  (use this Order's `OrderId` as `demandRef`) — 201 response:
-  `{"id":"...","sku":"...","quantity":N,"demandRef":"...","status":"...","allocations":[{"stockUnitId":"...","quantity":N}],"expiresAt":"..."}`.
-  A 409 response (RFC 7807 problem+json) means insufficient usable stock —
-  map to `Backordered` for that line. Any other non-2xx status or a
-  transport error must propagate as a hard failure of `AllocateOrder` —
-  never silently treated as backordered.
-- `DELETE /reservations/{id}` — 204 on success. Used by `CancelOrder`.
-
-**wes-work-planning** (base URL via env `WES_WORK_PLANNING_BASE_URL`):
-- `POST /paths/{pathId}/work-units` — request
-  `{"workUnitId":"...","cpt":"RFC3339","reference":"...","sku":"...","giftWrap":bool}`
-  — 201 response:
-  `{"id":"...","pathId":"...","cpt":"RFC3339","reference":"...","state":"...","giftWrap":bool}`.
-  `sku` and `giftWrap` are both optional fields already present on this
-  endpoint today — no changes to wes-work-planning are needed or permitted.
-
-Both outbound adapters follow the SAME permissive-by-default env-selected
-pattern already used three times elsewhere in this fleet
-(inventory-storage→facilitylayout, wes-work-planning→inventory-storage,
-fulfillment-execution→inventory-storage): `MODE=http|permissive` per
-adapter, defaulting to `permissive` so unit tests never hit the network.
-UNLIKE those other adapters (which fail-open because classification lookups
-are soft/optional), calling `AllocateOrder`/`ReleaseOrder` while wired to a
-permissive (no-op) client is NOT a soft concern — allocating real stock or
-releasing real work must never silently "succeed" against a no-op. In
-permissive mode, `AllocateOrder`/`ReleaseOrder` must return a clear
-`ErrDownstreamNotConfigured` rather than fabricating a fake success. Only
-`http` mode is suitable for any real integration test or deployment.
-
-## Tech & standards
-
-- Go 1.26, modules. Module path: `github.com/claudioed/order-management`.
-- chi (github.com/go-chi/chi/v5), pgx/v5 + pgxpool, golang-migrate SQL migrations.
-- Config via env (DATABASE_URL, HTTP_ADDR, INVENTORY_STORAGE_BASE_URL,
-  WES_WORK_PLANNING_BASE_URL, INVENTORY_STORAGE_MODE=http|permissive,
-  WES_WORK_PLANNING_MODE=http|permissive — both default to `permissive`).
-  docker-compose.yml for Postgres 16.
-- Typed domain errors mapped to HTTP status in the adapter, RFC 7807
-  problem+json for every error response (identical shape to the other five
-  services — copy their `problemDetails` struct and error-mapping pattern
-  exactly).
-- Table-driven tests: domain + application (in-memory adapter + fake HTTP
-  clients for the two outbound ports — never hit a real network in unit
-  tests); one httptest per REST endpoint covering at least one success and
-  one error path each.
 - gofmt/go vet clean; every package has a doc comment.
-- golangci-lint: copy `.golangci.yml` verbatim from
-  `/Users/claudioed/warehouse-systems/inventory-storage/.golangci.yml`.
-
-## Explicitly deferred (document them, don't skip silently)
-
-Originally the "v1 scope — explicitly deferred" list. Several entries have
-since SHIPPED and were removed from this list (Helm chart + CI packaging
-jobs, gremlins mutation gate, godog/BDD acceptance suite, MCP inbound
-adapter, Kafka integration + analytics fan-out, Postgres integration suite,
-arch-go fitness tests, Spectral api-lint, docs-api-drift) — CI and the
-README's "Deferred" section reflect the current truth. Still deferred:
-
-- Real carrier-rate promise-date calculation (a configurable static lead
-  time is correct for v1).
-- Kafka release-confirmation reply events from wes-work-planning (see
-  ADR-0005's known-gaps section).
-- Clawing back released work on cancellation (ADR-0004's known gap).
-- Any change to inventory-storage or wes-work-planning — this build must
-  be 100% additive from THEIR point of view; they are not touched at all.
-
-Keep the README's "Deferred" section listing these explicitly, so a reader
-never mistakes an absence for an oversight.
-
-## Local quality gate (mirror the other five repos' Makefile/lefthook shape, minus DB/mutation-dependent targets)
-
-Targets: `build` (go build ./...), `vet`, `fmt-check` (gofmt -l . empty),
-`lint` (golangci-lint run ./...), `test` (go test ./... -race), `coverage`
-(gate: 90% on `./internal/domain/...,./internal/application/...`), `check`
-(fmt-check + vet + build + lint + test), `check-all` (check + coverage).
-NO `integration`/`mutation`/`mutation-full`/`bdd` targets in v1 — those
-require Postgres/gremlins/godog setup that is out of scope this round.
-
-lefthook.yml: pre-commit runs fmt-check/vet/lint; pre-push runs `check`.
-Copy the structural shape from
-`/Users/claudioed/warehouse-systems/inventory-storage/lefthook.yml`, dropping
-anything mutation/integration-specific.
-
-GitHub Actions CI (`.github/workflows/ci.yml`) is at fleet parity with
-wes-work-planning's shape: `lint` and `test` (+ coverage gate) alongside
-`bdd` (godog, `go test ./... -run TestFeatures`), `integration` (two
-`postgres:16` service containers — one per database this repo owns —
-migrating both `migrations/` and `migrations/analytics/`, then
-`go test -tags=integration ./... -race -count=1`), `mutation-fast`
-(weekly `mutation` on schedule; gremlins v0.6.0, thresholds pinned in
-`.gremlins.yaml`), `vuln` (govulncheck), `api-lint` (Spectral on
-`apis/openapi.yaml` + `apis/asyncapi.yaml`), `arch-test`
-(`internal/architecture/`), `docs-api-drift` (Docusaurus API-reference
-regeneration diff gate), plus `helm-lint`, `trivy-scan`,
-`docker-publish`, and `release`. Same golangci-lint version pin
-`v2.13.1` and Go setup action version as the other repos. Note: the
-local Makefile/lefthook deliberately do NOT carry the new sensors —
-they are CI-only by decision; `make check` remains the fast local loop.
-
-## Definition of done
-
-- `go build ./...`, `go vet ./...`, `go test ./... -race` all green.
-- `golangci-lint run ./...` reports 0 issues.
-- Coverage on `internal/domain/...,internal/application/...` >= 90%
-  (verify with `go test -race -coverprofile=coverage.out -coverpkg=./internal/domain/...,./internal/application/... ./...`
-  then `go tool cover -func=coverage.out`).
-- Every named invariant in "Aggregates & invariants" above has a dedicated
+- `.golangci.yml` copied verbatim from `inventory-storage`'s own config.
+- Table-driven tests: domain + application layers use the in-memory adapter
+  and fake HTTP clients — **never hit a real network in a unit test.**
+  Kafka-touching `-tags=integration` tests use **testcontainers**, never a
+  skip-gated `KAFKA_BROKERS` env check (CI's `integration` job provisions no
+  external broker; testcontainers is the only variant that actually runs).
+- One httptest per REST endpoint: at least one success and one error path.
+- Every named invariant in `.claude/rules/domain-model.md` needs a dedicated
   failing-path test.
-- Every REST endpoint has at least one httptest success case and one error
-  case.
-- README.md: run steps (compose up, migrate, go run), curl example per
-  endpoint, hexagonal-layering note, and the "Deferred (v1)" section.
-- `apis/openapi.yaml` covers all 6 endpoints plus the RFC 7807 error schema
-  (spectral-lint clean if spectral is available locally; if not installed,
-  note that in your summary rather than skipping validation silently).
-- Four ADRs under `docs/docs/adr/` (Docusaurus-style frontmatter matching
-  the other repos' ADR files exactly — check
-  `/Users/claudioed/warehouse-systems/inventory-storage/docs/docs/adr/0001-hexagonal-ports-and-adapters.md`
-  for the exact frontmatter shape to copy):
-  1. `0001-hexagonal-ports-and-adapters.md`
-  2. `0002-http-consumer-of-inventory-and-wes-not-shared-code.md` — the
-     bounded-context-boundary decision above, in ADR form.
-  3. `0003-ship-complete-default-and-fail-closed-allocation.md` — BR2/BR3
-     in ADR form.
-  4. `0004-cancellation-boundary-at-release.md` — BR6 in ADR form,
-     including the documented known-gap section.
-- Do NOT attempt a full Docusaurus site build in v1 unless time permits
-  trivially — the ADR markdown files existing with correct content matters
-  more than a working `npm run build` for this first pass. Note the
-  Docusaurus site's status honestly in your final summary either way.
+- Coverage gate: **90%** on `./internal/domain/...,./internal/application/...`.
+- Mutation gate (gremlins, weekly `mutation` CI job): baseline locked at
+  efficacy 90.70% / mutant-coverage 81.13% on `internal/domain/order` — see
+  `.gremlins.yaml`. Do not let a change silently regress below the pinned
+  threshold.
+- godog/BDD acceptance suite: `features/*.feature`, run via
+  `go test ./... -run TestFeatures` (CI job `bdd`).
+
+## Where the rest of the detail lives
+
+This file is the index. Full DDD/tactical detail, API contracts, ADR
+summaries, and CI mechanics are split into `.claude/rules/` so this file
+stays short and current:
+
+- **`.claude/rules/bounded-context-boundary.md`** — the Customer/Supplier
+  rule, what this repo MUST NOT do (import Go packages, touch another
+  service's DB).
+- **`.claude/rules/domain-model.md`** — ubiquitous language, aggregate
+  invariants (BR2/BR3/BR6), the 9 domain events, and the folded
+  allocate-then-release use-case flow (ADR-0005).
+- **`.claude/rules/api-contracts.md`** — the 5 REST endpoints, the exact
+  outbound HTTP contract to inventory-storage, the Kafka integration/
+  analytics channels (asyncapi.yaml), and the MCP `get_order` tool.
+- **`.claude/rules/adrs.md`** — one-line summary + link for all 12 ADRs,
+  including which ones supersede an earlier one.
+- **`.claude/rules/ci-quality-gates.md`** — every CI job (`lint`, `test`,
+  `integration`, `helm-lint`, `trivy-scan`, `docker-publish`, `release`,
+  `codeql`, `scorecard`, `docs`), branch triggers, and the OpenAPI/AsyncAPI
+  drift-regeneration procedure.
+- **`.claude/rules/deferred-and-known-gaps.md`** — what is deliberately NOT
+  built yet, and why each gap is a decision, not an oversight.
+- **`.claude/rules/frontend-mfe.md`** — the `web/` micro-frontend remote,
+  its isolation from the Go module, CORS config.
 
 ## Git workflow
 
-- Work on a branch named `feature/order-management-v1` off `develop`.
-- `develop` branch must exist (create it from `main`/initial commit if this
-  is the first commit to the repo).
-- Commit frequently with clear messages.
-- Push and open a PR into `develop` via `gh pr create --base develop`.
-- Do NOT merge the PR yourself — leave it open for independent review.
-- Do NOT force-push over history once pushed.
+GitFlow: `feature/*` branches off `develop`, PR into `develop`
+(`gh pr create --base develop`); `develop` promotes to `main` for release.
+Do not merge your own PR — leave it open for independent review. Do not
+force-push over history once pushed.
