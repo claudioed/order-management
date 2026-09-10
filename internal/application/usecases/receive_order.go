@@ -77,6 +77,22 @@ type ReceiveOrder struct {
 	Clock     ports.Clock
 	Inventory ports.InventoryReservationClient
 	Promise   order.LeadTimePolicy
+	// PathPolicy resolves a line's process path when the caller (or an
+	// internal test) doesn't already supply one. Zero value is usable —
+	// PathSelectionPolicy has no state — so leaving this field unset in
+	// existing wiring changes nothing.
+	PathPolicy order.PathSelectionPolicy
+	// Catalogue validates a resolved path against
+	// process-path-management's live set of active paths before the
+	// order is ever persisted. A nil Catalogue means "not configured":
+	// validation is skipped, matching this fleet's convention of an
+	// optional outbound port defaulting to permissive rather than
+	// panicking on a missing wire-up (see ports.InventoryReservationClient's
+	// permissive-mode sibling, though that one fails loud on write —
+	// Catalogue's nil case is a read-only membership check with no
+	// mutation to protect, so failing OPEN here just means "not yet
+	// wired", not "silently fabricating a result"). See ADR-0013.
+	Catalogue ports.ProcessPathCatalogue
 	// Metrics records the business-fact outcome of order intake (accepted
 	// vs. rejected). Optional — a nil Metrics means "not instrumented",
 	// same convention as every other optional port on this use case.
@@ -86,10 +102,26 @@ type ReceiveOrder struct {
 func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowPartialShipment bool) (*order.Order, error) {
 	domainLines := make([]*order.OrderLine, 0, len(lines))
 	for i, l := range lines {
-		line, err := order.NewOrderLine(i+1, l.SKU, l.Quantity, l.PathID, l.GiftWrap)
+		pathID := l.PathID
+		if pathID == "" {
+			pathID = uc.PathPolicy.Select(l.SKU, l.Quantity, l.GiftWrap)
+		}
+		line, err := order.NewOrderLine(i+1, l.SKU, l.Quantity, pathID, l.GiftWrap)
 		if err != nil {
 			uc.recordRejected(ctx)
 			return nil, err
+		}
+		// The catalogue check runs only once the line itself is
+		// well-formed (SKU/quantity errors above take priority — an
+		// invalid line is rejected for being invalid, not for having
+		// an unreachable path). A resolved path that isn't currently
+		// active in process-path-management's real catalogue is a
+		// caller-facing input error, not a downstream infra failure:
+		// reject it here, before Save/OrderReceived, rather than
+		// letting wes-work-planning discover it one saga step later.
+		if uc.Catalogue != nil && !uc.Catalogue.IsActive(line.PathID()) {
+			uc.recordRejected(ctx)
+			return nil, shared.ErrUnknownProcessPath
 		}
 		domainLines = append(domainLines, line)
 	}
