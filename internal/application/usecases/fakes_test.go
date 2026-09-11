@@ -161,6 +161,18 @@ func (r *findFails) NextID(ctx context.Context) (shared.OrderId, error) {
 	return r.inner.NextID(ctx)
 }
 
+// fakeCatalogue is a scripted ports.ProcessPathCatalogue. By default every
+// path is active — tests that want a rejection populate inactive with the
+// specific PathId to reject, mirroring fakeInventory's per-key scripting
+// style.
+type fakeCatalogue struct {
+	inactive map[shared.PathId]bool
+}
+
+func (c *fakeCatalogue) IsActive(pathID shared.PathId) bool {
+	return !c.inactive[pathID]
+}
+
 // fixture bundles everything a use-case test needs, wired to in-memory and
 // fake adapters. No test in this package touches a real network or DB.
 type fixture struct {
@@ -169,6 +181,7 @@ type fixture struct {
 	events    *recordingPublisher
 	clock     *memory.FixedClock
 	promise   order.LeadTimePolicy
+	catalogue *fakeCatalogue
 }
 
 func now() time.Time {
@@ -184,11 +197,12 @@ func newFixture() *fixture {
 		promise: order.NewLeadTimePolicy(24*time.Hour, map[shared.PathId]time.Duration{
 			"singles": 6 * time.Hour,
 		}),
+		catalogue: &fakeCatalogue{inactive: map[shared.PathId]bool{}},
 	}
 }
 
 func (f *fixture) receiveOrder() *usecases.ReceiveOrder {
-	return &usecases.ReceiveOrder{Orders: f.orders, Events: f.events, Clock: f.clock, Inventory: f.inventory, Promise: f.promise}
+	return &usecases.ReceiveOrder{Orders: f.orders, Events: f.events, Clock: f.clock, Inventory: f.inventory, Promise: f.promise, Catalogue: f.catalogue}
 }
 
 func (f *fixture) retryAllocation() *usecases.RetryAllocation {

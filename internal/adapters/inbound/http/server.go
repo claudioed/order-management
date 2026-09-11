@@ -96,16 +96,13 @@ func (s *Server) handleReceiveOrder(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// PathId is never caller-supplied on this public intake DTO — see
-		// receiveOrderLineRequest's doc comment. Every line unconditionally
-		// gets the internal default; NewPathIdOrDefault("") always resolves
-		// to shared.DefaultPathId.
-		pathID, err := shared.NewPathIdOrDefault("")
-		if err != nil {
-			writeError(w, r, err)
-			return
-		}
+		// receiveOrderLineRequest's doc comment. Leave it empty here so
+		// ReceiveOrder's PathPolicy resolves it as a real domain policy
+		// decision (and validates the result against the live
+		// process-path catalogue) instead of this adapter pre-baking a
+		// default before the use case ever sees the line.
 		lines = append(lines, usecases.NewLine{
-			SKU: sku, Quantity: l.Quantity, PathID: pathID, GiftWrap: l.GiftWrap,
+			SKU: sku, Quantity: l.Quantity, GiftWrap: l.GiftWrap,
 		})
 	}
 

@@ -101,3 +101,23 @@ type InventoryReservationClient interface {
 	Reserve(ctx context.Context, req ReservationRequest) (ReservationResult, error)
 	RevokeReservation(ctx context.Context, reservationID string) error
 }
+
+// ProcessPathCatalogue is the read-only outbound port for
+// process-path-management's live catalogue of currently active process
+// paths. It intentionally exposes ONLY the membership question this
+// context needs at intake — "is this path active right now" — not the
+// catalogue's fuller shape (MatchPrefix, RequiredCapabilities): those
+// belong to process-path-management and to the consumers (WES, FE, WFM)
+// that actually route work onto a path, not to this context, which only
+// validates that a resolved path is real before committing an order to
+// it. See ADR-0013 and internal/adapters/outbound/kafkacatalog's package
+// doc comment for the adapter that implements this against a live Kafka
+// feed, mirroring the same port already proven in wes-work-planning /
+// fulfillment-execution / workforce-management.
+type ProcessPathCatalogue interface {
+	// IsActive reports whether pathId currently names an active,
+	// declared process path. Matching semantics (exact id, or a
+	// declared MatchPrefix + "-" family) are the adapter's concern, not
+	// the port's — ReceiveOrder only needs the yes/no answer.
+	IsActive(pathId shared.PathId) bool
+}

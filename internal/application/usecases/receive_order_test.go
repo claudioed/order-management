@@ -268,6 +268,70 @@ func TestReceiveOrder(t *testing.T) {
 		}
 	})
 
+	// PathSelectionPolicy + ports.ProcessPathCatalogue: order-management
+	// ADR-0013. A caller never supplies pathId on public intake, so these
+	// tests exercise NewLine.PathID left empty (the HTTP adapter's real
+	// behavior) to prove the use case's PathPolicy actually resolves it,
+	// and that an inactive/unknown resolved path is rejected BEFORE the
+	// order is ever persisted — the whole point of this ADR.
+	t.Run("an empty PathID is resolved by PathPolicy, not left blank", func(t *testing.T) {
+		f := newFixture()
+
+		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if o.Lines()[0].PathID() != shared.DefaultPathId {
+			t.Fatalf("line PathID = %q, want %q (PathPolicy's v1 default)", o.Lines()[0].PathID(), shared.DefaultPathId)
+		}
+	})
+
+	t.Run("a resolved path that is not active in the catalogue is rejected before persisting", func(t *testing.T) {
+		f := newFixture()
+		f.catalogue.inactive[shared.DefaultPathId] = true
+
+		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if !errors.Is(err, shared.ErrUnknownProcessPath) {
+			t.Fatalf("err = %v, want %v", err, shared.ErrUnknownProcessPath)
+		}
+		assertEventNames(t, f.events) // OrderReceived must NOT have fired
+		if len(f.inventory.reserveCalls) != 0 {
+			t.Fatalf("an order rejected for an unknown path must never reach inventory-storage, calls = %d", len(f.inventory.reserveCalls))
+		}
+	})
+
+	t.Run("a nil Catalogue skips validation entirely (not-yet-wired default)", func(t *testing.T) {
+		f := newFixture()
+		uc := f.receiveOrder()
+		uc.Catalogue = nil
+
+		o, err := uc.Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if o.Lines()[0].PathID() != shared.DefaultPathId {
+			t.Fatalf("line PathID = %q, want %q", o.Lines()[0].PathID(), shared.DefaultPathId)
+		}
+	})
+
+	t.Run("an explicitly supplied PathID still goes through catalogue validation", func(t *testing.T) {
+		f := newFixture()
+		f.catalogue.inactive["singles"] = true
+
+		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			line("SKU-1", 1, "singles"),
+		}, false)
+		if !errors.Is(err, shared.ErrUnknownProcessPath) {
+			t.Fatalf("err = %v, want %v", err, shared.ErrUnknownProcessPath)
+		}
+	})
+
 	// A publisher failure LATER in the implicit allocation-then-release
 	// pass (e.g. on the final OrderAllocated event, after OrderReceived
 	// and OrderLineAllocated already succeeded) is a hard failure of

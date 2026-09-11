@@ -19,6 +19,7 @@ func statusFor(err error) int {
 	case errors.Is(err, shared.ErrEmptyOrderID),
 		errors.Is(err, shared.ErrEmptySKU),
 		errors.Is(err, shared.ErrEmptyPathID),
+		errors.Is(err, shared.ErrUnknownProcessPath),
 		errors.Is(err, order.ErrNoLines),
 		errors.Is(err, order.ErrLineNotFound):
 		return http.StatusBadRequest
@@ -77,6 +78,8 @@ func problemFor(err error) problemInfo {
 		return problemInfo{"empty-sku", "SKU must not be empty"}
 	case errors.Is(err, shared.ErrEmptyPathID):
 		return problemInfo{"empty-path-id", "Path id must not be empty"}
+	case errors.Is(err, shared.ErrUnknownProcessPath):
+		return problemInfo{"unknown-process-path", "Resolved process path is not active in the process-path catalogue"}
 	case errors.Is(err, order.ErrNoLines):
 		return problemInfo{"order-without-lines", "An order must have at least one line"}
 	case errors.Is(err, order.ErrLineNotFound):
