@@ -184,3 +184,25 @@ analytics:
       requests:
         cpu: 100m
         memory: 128Mi
+
+# --- MCP server (ADR-0010) ---
+# The Model Context Protocol server (cmd/mcp): a second deployable running
+# the same GetOrder read use case over the same OLTP database as the HTTP
+# service, served over Streamable HTTP. Disabled by default so existing
+# releases are unaffected; set mcp.enabled=true to deploy it.
+mcp:
+  enabled: false
+  replicaCount: 1
+  httpAddr: ":8090"
+  service:
+    type: ClusterIP
+    port: 8090
+    targetPort: 8090
+  extraEnv: []
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi

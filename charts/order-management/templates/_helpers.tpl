@@ -73,3 +73,10 @@ Name of the Secret holding the analytics DSNs, when the chart creates its own.
 {{- include "order-management.fullname" . }}-analytics
 {{- end }}
 {{- end }}
+
+{{/*
+Fully qualified name of the MCP server deployment/service (ADR-0010).
+*/}}
+{{- define "order-management.mcpFullname" -}}
+{{- include "order-management.fullname" . }}-mcp
+{{- end }}
