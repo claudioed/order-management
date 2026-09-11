@@ -70,6 +70,9 @@ Typos, broken links and formatting are of course fair game.
 | [0008](./0008-fulfillment-class-demand-shape-classifier.md) | FulfillmentClass — a demand-shape classifier, not a process-path name | Accepted |
 | [0009](./0009-standard-metrics-convention.md) | Standard metrics convention across the fleet (telemetry.Setup, otelchi, Tier-2 business-metric naming) | Accepted |
 | [0010](./0010-mcp-inbound-adapter.md) | Model Context Protocol as an inbound adapter, not a new service | Accepted |
+| [0011](./0011-adopt-fleet-rest-identity.md) | Adopt the fleet REST identity (static bearer keys, read/read-write scopes) | Superseded by ADR 0012 |
+| [0012](./0012-remove-rest-mcp-bearer-auth.md) | Remove the REST/MCP bearer auth layer | Accepted |
+| [0013](./0013-process-path-selection-as-a-domain-policy.md) | Process-path selection as a real domain policy, validated against a live catalogue | Accepted |
 
 Each of these reconstructs a decision that is actually visible in this
 repository's `CLAUDE.md` and code — none is a generic placeholder.
