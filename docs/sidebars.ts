@@ -71,6 +71,7 @@ const sidebars: SidebarsConfig = {
         'adr/0010-mcp-inbound-adapter',
         'adr/0011-adopt-fleet-rest-identity',
         'adr/0012-remove-rest-mcp-bearer-auth',
+        'adr/0013-process-path-selection-as-a-domain-policy',
       ],
     },
   ],
