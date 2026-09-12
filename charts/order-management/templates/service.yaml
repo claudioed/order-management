@@ -4,6 +4,7 @@ metadata:
   name: {{ include "order-management.fullname" . }}
   labels:
     {{- include "order-management.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
 spec:
   type: {{ .Values.service.type }}
   ports:
@@ -13,3 +14,4 @@ spec:
       name: http
   selector:
     {{- include "order-management.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api
