@@ -1,7 +1,31 @@
-/** Local-dev base URL for order-management's own REST API. Mirrors
- *  e2e-tests/env.sh's port-offset convention (each service's own :8080
- *  default, offset by index -- FACILITY=8081, INVENTORY=8082, WES=8083,
- *  FULFILLMENT=8084, WORKFORCE=8085, ORDER=8086, PROCESS_PATH=8087,
- *  LABOR=8088). Verified directly against e2e-tests/env.sh's
- *  ORDER_HTTP_PORT=8086. */
-export const ORDER_API_BASE = "http://localhost:8086";
+export interface WarehouseRuntimeConfig {
+  apiOrigin?: string;
+}
+
+declare global {
+  interface Window {
+    __WAREHOUSE_CONFIG__?: WarehouseRuntimeConfig;
+  }
+}
+
+const ORDER_API_PATH = "/api/order-management";
+const DEV_ORDER_API_BASE = "http://localhost:8086";
+
+export function resolveOrderApiBase(
+  runtimeConfig: WarehouseRuntimeConfig,
+  isProduction: boolean,
+): string {
+  const apiOrigin = runtimeConfig.apiOrigin?.replace(/\/+$/, "");
+  if (!apiOrigin) {
+    if (isProduction) {
+      throw new Error("window.__WAREHOUSE_CONFIG__.apiOrigin is required in production");
+    }
+    return DEV_ORDER_API_BASE;
+  }
+  return `${apiOrigin}${ORDER_API_PATH}`;
+}
+
+export const ORDER_API_BASE = resolveOrderApiBase(
+  window.__WAREHOUSE_CONFIG__ ?? {},
+  import.meta.env.PROD,
+);

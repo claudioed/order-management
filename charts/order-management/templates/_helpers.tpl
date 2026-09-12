@@ -80,3 +80,15 @@ Fully qualified name of the MCP server deployment/service (ADR-0010).
 {{- define "order-management.mcpFullname" -}}
 {{- include "order-management.fullname" . }}-mcp
 {{- end }}
+
+{{/*
+Fully qualified name of the frontend (order_mgmt_mfe) deployment/service.
+
+The remote is served by its own nginx pod and reached through warehouse-infra's
+Nginx web gateway at /mfes/order-management/. It is deliberately a separate
+workload from the API: Kong never routes to it, and the OLTP Service must never
+select it.
+*/}}
+{{- define "order-management.frontendFullname" -}}
+{{- include "order-management.fullname" . }}-frontend
+{{- end }}
