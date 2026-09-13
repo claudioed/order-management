@@ -1,4 +1,4 @@
-# Architecture Decision Records (12 total, `docs/docs/adr/`)
+# Architecture Decision Records (14 total, `docs/docs/adr/`)
 
 1. **0001 — Hexagonal (ports & adapters) architecture.** The dependency
    rule this whole repo enforces (`internal/architecture/` fitness test).
@@ -45,6 +45,20 @@
     route reachable with no `Authorization` header. Re-adopting auth later
     means adopting the fleet's NEXT iteration of that decision, not
     resurrecting this deleted package verbatim.
+13. **0013 — Process-path selection as a real domain policy, validated
+    against a live catalogue.** `order.PathSelectionPolicy` (v1: one rule,
+    `PICK`) plus `ports.ProcessPathCatalogue.IsActive` backed by a Kafka-fed
+    `kafkacatalog` cache (`PATH_CATALOGUE_SOURCE=none|kafka`); unknown path
+    -> synchronous 400 before anything persists.
+14. **0014 — PROPOSED: the promise is a CPT window derived from fulfillment
+    capability.** Replaces `now + PROMISE_PATH_LEAD_TIMES` with a
+    `PromisePolicy` over process-path-management's capability contract
+    (their ADR 0010: `cycleTimeP95`, `eligibility`, site `CPTSchedule`)
+    and wes-work-planning capacity; `LeadTimePolicy` stays as the tagged
+    fallback (`basis=LeadTime`); per-shipment-group promising when
+    `AllowPartialShipment`; `OrderRepromised` closes the loop. Not
+    implemented yet — read it before touching `promise.go` or
+    `path_selection.go`.
 
 Other ADR-adjacent facts worth knowing without opening every file:
 
