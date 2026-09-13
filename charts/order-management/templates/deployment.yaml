@@ -59,6 +59,16 @@ spec:
             - name: INVENTORY_STORAGE_BASE_URL
               value: {{ .Values.inventoryStorage.baseUrl | quote }}
             {{- end }}
+            - name: SERVICE_VERSION
+              value: {{ .Values.image.tag | default .Chart.AppVersion | quote }}
+            - name: ENVIRONMENT
+              value: {{ .Values.environment | quote }}
+            {{- if .Values.otel.enabled }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.otel.endpoint | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: {{ .Values.otel.serviceName | quote }}
+            {{- end }}
             {{- if or .Values.database.url .Values.database.existingSecret }}
             - name: DATABASE_URL
               valueFrom:
