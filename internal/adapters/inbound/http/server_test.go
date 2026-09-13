@@ -63,7 +63,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	inventory := &stubInventory{}
 	publisher := nopPublisher{}
 	clock := memory.NewFixedClock(time.Date(2026, 8, 25, 9, 0, 0, 0, time.UTC))
-	promise := order.NewLeadTimePolicy(24*time.Hour, nil)
+	promise := order.PromisePolicy{Fallback: order.NewLeadTimePolicy(24*time.Hour, nil)}
 
 	server := &inboundhttp.Server{
 		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise},

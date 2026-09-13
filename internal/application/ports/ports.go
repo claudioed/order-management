@@ -104,14 +104,17 @@ type InventoryReservationClient interface {
 
 // ProcessPathCatalogue is the read-only outbound port for
 // process-path-management's live catalogue of currently active process
-// paths. It intentionally exposes ONLY the membership question this
-// context needs at intake — "is this path active right now" — not the
-// catalogue's fuller shape (MatchPrefix, RequiredCapabilities): those
-// belong to process-path-management and to the consumers (WES, FE, WFM)
-// that actually route work onto a path, not to this context, which only
-// validates that a resolved path is real before committing an order to
-// it. See ADR-0013 and internal/adapters/outbound/kafkacatalog's package
-// doc comment for the adapter that implements this against a live Kafka
+// paths. ADR-0013 originally kept this port to ONLY the membership
+// question ReceiveOrder needs at intake — "is this path active right
+// now" — deliberately deferring the catalogue's fuller shape (cycle
+// time, eligibility) until a real consumer needed it.
+//
+// ADR-0014 step A is that consumer: PromisePolicy needs a path's
+// CycleTimeP95 and Eligibility to decide whether an allocated line can
+// make a given CPT window. This is a NON-BREAKING additive widening
+// (two new methods), not a boundary violation — ADR-0014 explicitly asks
+// for it. See internal/adapters/outbound/kafkacatalog's package doc
+// comment for the adapter that implements this against a live Kafka
 // feed, mirroring the same port already proven in wes-work-planning /
 // fulfillment-execution / workforce-management.
 type ProcessPathCatalogue interface {
@@ -120,4 +123,60 @@ type ProcessPathCatalogue interface {
 	// declared MatchPrefix + "-" family) are the adapter's concern, not
 	// the port's — ReceiveOrder only needs the yes/no answer.
 	IsActive(pathId shared.PathId) bool
+
+	// CycleTimeP95 returns the path's 95th-percentile cycle time —
+	// how long it takes a unit to move through this path once picked
+	// up — and whether that value is currently known. known=false
+	// covers both "path is unknown/inactive" and "path is active but
+	// the wire event never carried a parseable cycle_time_p95" (see
+	// kafkacatalog's decoder): PromisePolicy treats both the same way,
+	// as "cannot compute a capability-basis promise for this line".
+	CycleTimeP95(pathId shared.PathId) (cycleTime time.Duration, known bool)
+
+	// Eligibility returns the path's declared eligibility rule and
+	// whether it is currently known (false for an unknown/inactive
+	// path). Nothing in step A consumes this for a routing decision —
+	// it is made available now so step B (eligibility-driven
+	// PathSelectionPolicy) does not need another catalogue widening.
+	Eligibility(pathId shared.PathId) (shared.Eligibility, bool)
+}
+
+// CPTScheduleCache is the read-only outbound port for
+// process-path-management's per-site CPT schedule (PPM ADR 0010's
+// CPTScheduleChanged event). It is backed by a Kafka-fed local cache
+// (internal/adapters/outbound/kafkacptschedule), mirroring
+// ProcessPathCatalogue's own Kafka-cache pattern exactly — including its
+// per-process-unique consumer group and readiness-gate design — but as
+// a SEPARATE consumer instance on the SAME topic, since CPTScheduleChanged
+// and ProcessPathCreated/Updated/Deactivated are independent event types
+// this service reacts to independently.
+//
+// NextCutoffs returns order.CPTWindow (a domain type) rather than a
+// ports-owned type: PromisePolicy is pure domain logic per ADR 0014 and
+// declares its own minimal order.ScheduleSource interface with this
+// exact signature, so this port's adapter (kafkacptschedule.Consumer)
+// satisfies both this port AND order.ScheduleSource without any
+// translation glue.
+type CPTScheduleCache interface {
+	// NextCutoffs returns up to n upcoming concrete cutoff instants for
+	// siteId, computed from the schedule's recurring (localTime,
+	// daysOfWeek, timezone) rule, from time `from` onward, each paired
+	// with the cptId and eligiblePathIds that applied. Returns
+	// known=false if no schedule exists yet for siteId (e.g. the Kafka
+	// cache has not yet observed a CPTScheduleChanged event for it).
+	NextCutoffs(siteId string, from time.Time, n int) (cutoffs []order.CPTWindow, known bool)
+}
+
+// PathCapacity is the read-only outbound port for remaining capacity per
+// (path, CPT) bucket. wes-work-planning does not publish this data yet
+// (see ADR-0014's rollout step 3) — the one implementation available in
+// this phase, UnknownPathCapacity, always reports known=false, which
+// PromisePolicy treats as "capacity is not a constraint" per the ADR's
+// explicit condition (c). This is the honest v1: a saturated path is
+// still promised optimistically until wes-work-planning ships
+// PathCapacityChanged and this port gets a Kafka-fed implementation.
+type PathCapacity interface {
+	// Remaining reports how many units remain available for pathId at
+	// cptId, and whether that figure is currently known.
+	Remaining(pathId shared.PathId, cptId string) (units int, known bool)
 }

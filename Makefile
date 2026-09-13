@@ -74,6 +74,8 @@ integration:
 	$(GO) build -tags=integration ./...
 	$(GO) vet -tags=integration ./...
 	$(GO) test -tags=integration ./internal/adapters/outbound/kafka
+	$(GO) test -tags=integration ./internal/adapters/outbound/kafkacatalog
+	$(GO) test -tags=integration ./internal/adapters/outbound/kafkacptschedule
 
 coverage:
 	$(GO) test ./... -race -coverprofile=$(COVERAGE_OUT) -coverpkg=$(COVERAGE_PKGS)

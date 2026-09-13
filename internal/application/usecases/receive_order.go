@@ -76,7 +76,13 @@ type ReceiveOrder struct {
 	Events    ports.EventPublisher
 	Clock     ports.Clock
 	Inventory ports.InventoryReservationClient
-	Promise   order.LeadTimePolicy
+	// Promise is order.PromisePolicy (ADR 0014): computes a
+	// capability-derived CPT-window promise when the underlying
+	// Schedule/Capability/Capacity inputs are wired, falling back to
+	// its own embedded LeadTimePolicy otherwise. A zero value always
+	// falls back to LeadTimePolicy's own zero-value behaviour, so
+	// existing wiring/tests need no changes to keep compiling.
+	Promise order.PromisePolicy
 	// PathPolicy resolves a line's process path when the caller (or an
 	// internal test) doesn't already supply one. Zero value is usable —
 	// PathSelectionPolicy has no state — so leaving this field unset in

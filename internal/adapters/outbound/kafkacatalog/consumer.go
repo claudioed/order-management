@@ -22,14 +22,15 @@
 //     fleet-wide (here too) by making every NewConsumer call use a
 //     unique, process-scoped group id -- never a shared name.
 //
-// One real difference from WES/FE's copy: order-management only ever
-// asks "is this path active" (see order-management ADR-0013's scope
-// decision) -- it has no use for MatchPrefix/RequiredCapabilities/Direct
-// beyond what's needed to answer that one question, so this consumer's
-// local cache and internal/domain/processpath.PathDefinition are
-// deliberately smaller than WES/FE's copies. Do not widen this shape
-// speculatively; extend it only when a real attribute-driven routing
-// phase needs the extra fields.
+// One real difference from WES/FE's copy: order-management, per ADR-0013,
+// originally only ever asked "is this path active" -- it had no use for
+// MatchPrefix/RequiredCapabilities/Direct beyond what's needed to answer
+// that one question. ADR-0014 step A widens this: PromisePolicy needs a
+// path's CycleTimeP95 and Eligibility to decide whether an allocated line
+// can make a CPT window, so this consumer's local cache now ALSO decodes
+// those two wire fields (cycle_time_p95, eligibility). Direct and
+// RequiredCapabilities remain undecoded here — nothing in this service
+// has needed them yet; extend further only when a real feature does.
 package kafkacatalog
 
 import (
@@ -74,13 +75,38 @@ type envelope struct {
 	Data      json.RawMessage `json:"data"`
 }
 
-// pathData is the payload shape for all three event types on Topic. Only
-// PathId and MatchPrefix are decoded — Direct and RequiredCapabilities
-// are read by WES/FE/WFM's copies of this consumer, not by
-// order-management's (see package doc comment).
+// pathData is the payload shape for all three event types on Topic.
+// PathId, MatchPrefix, CycleTimeP95 and Eligibility are decoded; Direct
+// and RequiredCapabilities are read by WES/FE/WFM's copies of this
+// consumer, not by order-management's (see package doc comment).
+//
+// CycleTimeP95 is the wire's time.Duration.String() form (e.g.
+// "45m0s"), parsed with time.ParseDuration. Eligibility is nil ONLY on a
+// ProcessPathDeactivated event; present (possibly all-empty) on
+// Created/Updated.
 type pathData struct {
-	PathId      string `json:"path_id"`
-	MatchPrefix string `json:"match_prefix"`
+	PathId       string           `json:"path_id"`
+	MatchPrefix  string           `json:"match_prefix"`
+	CycleTimeP95 string           `json:"cycle_time_p95"`
+	Eligibility  *eligibilityData `json:"eligibility"`
+}
+
+// eligibilityData is the wire shape of process-path-management's
+// EligibilityData, decoded into this context's own shared.Eligibility —
+// see shared.Eligibility's doc comment for why this is an independent
+// mirror rather than an imported type.
+type eligibilityData struct {
+	MaxUnitsPerLine           *int     `json:"max_units_per_line"`
+	RequiredProductAttributes []string `json:"required_product_attributes"`
+	ExcludedProductAttributes []string `json:"excluded_product_attributes"`
+	NonSortable               bool     `json:"non_sortable"`
+}
+
+func (e *eligibilityData) toShared() shared.Eligibility {
+	if e == nil {
+		return shared.Eligibility{}
+	}
+	return shared.NewEligibility(e.MaxUnitsPerLine, e.RequiredProductAttributes, e.ExcludedProductAttributes, e.NonSortable)
 }
 
 // Reader is the subset of *kafkago.Reader this Consumer needs, so tests
@@ -256,14 +282,45 @@ func (c *Consumer) markReady() {
 // processpath.Catalogue on every read rather than reimplementing the
 // match rule, so the two can never drift.
 func (c *Consumer) IsActive(pathID shared.PathId) bool {
+	_, err := c.lookup(pathID)
+	return err == nil
+}
+
+// CycleTimeP95 satisfies ports.ProcessPathCatalogue: it returns the
+// looked-up path's cycle time and whether it is known. An unknown path,
+// or a path whose wire event never carried a parseable cycle_time_p95,
+// both report known=false — PromisePolicy treats them identically.
+func (c *Consumer) CycleTimeP95(pathID shared.PathId) (time.Duration, bool) {
+	def, err := c.lookup(pathID)
+	if err != nil {
+		return 0, false
+	}
+	return def.CycleTimeP95, def.CycleTimeKnown
+}
+
+// Eligibility satisfies ports.ProcessPathCatalogue: it returns the
+// looked-up path's declared eligibility rule and whether it is known
+// (false for an unknown/inactive path).
+func (c *Consumer) Eligibility(pathID shared.PathId) (shared.Eligibility, bool) {
+	def, err := c.lookup(pathID)
+	if err != nil {
+		return shared.Eligibility{}, false
+	}
+	return def.Eligibility, true
+}
+
+// lookup resolves pathID against a fresh processpath.Catalogue built
+// from the current in-memory snapshot, so IsActive/CycleTimeP95/
+// Eligibility all share exactly the same matching semantics and can
+// never drift from one another.
+func (c *Consumer) lookup(pathID shared.PathId) (processpath.PathDefinition, error) {
 	c.mu.RLock()
 	defs := make([]processpath.PathDefinition, 0, len(c.paths))
 	for _, d := range c.paths {
 		defs = append(defs, d)
 	}
 	c.mu.RUnlock()
-	_, err := processpath.New(defs).Lookup(pathID.String())
-	return err == nil
+	return processpath.New(defs).Lookup(pathID.String())
 }
 
 // Run consumes Topic until ctx is cancelled or the reader returns a
@@ -338,10 +395,35 @@ func (c *Consumer) handle(msg kafkago.Message) error {
 func (c *Consumer) applyUpsert(data pathData) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	cycleTime, cycleTimeKnown := parseCycleTime(data.CycleTimeP95, data.PathId, c.Logger)
+
 	c.paths[strings.ToUpper(data.PathId)] = processpath.PathDefinition{
-		Id:          data.PathId,
-		MatchPrefix: data.MatchPrefix,
+		Id:             data.PathId,
+		MatchPrefix:    data.MatchPrefix,
+		CycleTimeP95:   cycleTime,
+		CycleTimeKnown: cycleTimeKnown,
+		Eligibility:    data.Eligibility.toShared(),
 	}
+}
+
+// parseCycleTime parses the wire's time.Duration.String() form. An empty
+// or unparseable value is logged and treated as "unknown" — the decoder
+// never crashes the consumer over a malformed cycle time; PromisePolicy
+// falls back to LeadTimePolicy whenever known is false.
+func parseCycleTime(raw, pathID string, logger *slog.Logger) (time.Duration, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("kafkacatalog: could not parse cycle_time_p95; treating as unknown",
+				"path_id", pathID, "cycle_time_p95", raw, "error", err)
+		}
+		return 0, false
+	}
+	return d, true
 }
 
 func (c *Consumer) applyDeactivated(id string) {

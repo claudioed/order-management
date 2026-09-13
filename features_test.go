@@ -137,7 +137,7 @@ func (w *world) reset() {
 	w.inventory = newFakeInventory()
 	w.publisher = &capturePublisher{}
 	clock := memory.NewFixedClock(fixedNow)
-	promise := order.NewLeadTimePolicy(24*time.Hour, nil)
+	promise := order.PromisePolicy{Fallback: order.NewLeadTimePolicy(24*time.Hour, nil)}
 
 	server := &inboundhttp.Server{
 		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: w.publisher, Clock: clock, Inventory: w.inventory, Promise: promise},

@@ -35,7 +35,7 @@ type RetryAllocation struct {
 	Inventory ports.InventoryReservationClient
 	Events    ports.EventPublisher
 	Clock     ports.Clock
-	Promise   order.LeadTimePolicy
+	Promise   order.PromisePolicy
 }
 
 func (uc *RetryAllocation) Execute(ctx context.Context, id shared.OrderId) (*order.Order, error) {

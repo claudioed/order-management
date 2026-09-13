@@ -500,6 +500,10 @@ components:
       description: >-
         Frozen wire shape shared verbatim with wes-work-planning's Kafka
         consumer (see CLAUDE.md's Kafka integration section).
+        promise_cpt_id/promise_basis are ADR 0014's additive fields (the
+        CPT identity a Capability-basis promise targets, and which
+        policy produced the promise) -- optional, since a LeadTime-basis
+        promise has no CPT identity and older consumers may ignore both.
       additionalProperties: false
       required: [order_id, promise_date, lines]
       properties:
@@ -510,7 +514,24 @@ components:
         promise_date:
           type: string
           format: date-time
-          description: Computed at allocation time by the per-path lead-time policy.
+          description: >-
+            The promise's cutoff instant. Computed by order.PromisePolicy
+            (ADR 0014): a real CPT window's cutoff when promise_basis is
+            "Capability", or the per-path lead-time policy's computed
+            instant when promise_basis is "LeadTime" (or absent, for
+            events predating ADR 0014).
+        promise_cpt_id:
+          type: string
+          description: >-
+            The CPT identity (e.g. "sp1-1800") this promise targets.
+            Present only when promise_basis is "Capability" -- a
+            LeadTime-basis promise has no departure identity.
+        promise_basis:
+          type: string
+          enum: [Capability, LeadTime]
+          description: >-
+            Which policy produced promise_date (ADR 0014). Absent on
+            events published before this ADR.
         lines:
           type: array
           description: Exactly the lines released in this pass (may be empty).

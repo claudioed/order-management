@@ -479,13 +479,21 @@ func TestRehydrateRestoresPersistedState(t *testing.T) {
 		order.RehydrateOrderLine(2, "SKU-2", 3, "singles", true, order.LineBackordered, nil),
 	}
 
-	o := order.Rehydrate("ord-9", lines, true, &promise)
+	cptId := "sp1-1800"
+	basis := order.BasisCapability
+	o := order.Rehydrate("ord-9", lines, true, &promise, &cptId, &basis)
 
 	if o.ID() != "ord-9" || !o.AllowPartialShipment() {
 		t.Fatalf("rehydrated order lost detail: %+v", o)
 	}
 	if got := o.PromiseDate(); got == nil || !got.Equal(promise) {
 		t.Fatalf("PromiseDate() = %v, want %v", got, promise)
+	}
+	if got := o.PromiseCptId(); got == nil || *got != cptId {
+		t.Fatalf("PromiseCptId() = %v, want %v", got, cptId)
+	}
+	if got := o.PromiseBasis(); got == nil || *got != basis {
+		t.Fatalf("PromiseBasis() = %v, want %v", got, basis)
 	}
 	if o.Status() != order.StatusPartiallyAllocated {
 		t.Fatalf("Status() = %q, want %q", o.Status(), order.StatusPartiallyAllocated)

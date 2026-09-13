@@ -102,12 +102,14 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - name: Build, vet, and test Kafka adapter against Testcontainers
+      - name: Build, vet, and test Kafka adapters against Testcontainers
         run: |
           set -euo pipefail
           go build -tags=integration ./...
           go vet -tags=integration ./...
           go test -tags=integration ./internal/adapters/outbound/kafka
+          go test -tags=integration ./internal/adapters/outbound/kafkacatalog
+          go test -tags=integration ./internal/adapters/outbound/kafkacptschedule
 
 
   # ============================================================
