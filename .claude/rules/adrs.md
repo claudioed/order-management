@@ -50,7 +50,7 @@
     `PICK`) plus `ports.ProcessPathCatalogue.IsActive` backed by a Kafka-fed
     `kafkacatalog` cache (`PATH_CATALOGUE_SOURCE=none|kafka`); unknown path
     -> synchronous 400 before anything persists.
-14. **0014 — PROPOSED: the promise is a CPT window derived from fulfillment
+14. **0014 — ACCEPTED: the promise is a CPT window derived from fulfillment
     capability.** Replaces `now + PROMISE_PATH_LEAD_TIMES` with a
     `PromisePolicy` over process-path-management's capability contract
     (their ADR 0010: `cycleTimeP95`, `eligibility`, site `CPTSchedule`)

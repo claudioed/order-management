@@ -10,11 +10,11 @@ description: "ADR 0014 — replace now+leadTime with a PromisePolicy that select
 
 ## Status
 
-Proposed. Companion to process-path-management ADR 0010 (fulfillment
-capability contract), which supplies the data this decision consumes.
-Depends on a future wes-work-planning ADR for remaining capacity per
-CPT; this ADR is written so it degrades correctly while that does not
-exist.
+Accepted. Companion to process-path-management ADR 0010 (fulfillment
+capability contract), accepted together, which supplies the data this
+decision consumes. Depends on a future wes-work-planning ADR for
+remaining capacity per CPT; this ADR is written so it degrades
+correctly while that does not exist.
 
 ## Context
 

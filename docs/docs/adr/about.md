@@ -73,7 +73,7 @@ Typos, broken links and formatting are of course fair game.
 | [0011](./0011-adopt-fleet-rest-identity.md) | Adopt the fleet REST identity (static bearer keys, read/read-write scopes) | Superseded by ADR 0012 |
 | [0012](./0012-remove-rest-mcp-bearer-auth.md) | Remove the REST/MCP bearer auth layer | Accepted |
 | [0013](./0013-process-path-selection-as-a-domain-policy.md) | Process-path selection as a real domain policy, validated against a live catalogue | Accepted |
-| [0014](./0014-promise-derived-from-fulfillment-capability.md) | The delivery promise is a CPT window derived from fulfillment capability, not a configured lead time | Proposed |
+| [0014](./0014-promise-derived-from-fulfillment-capability.md) | The delivery promise is a CPT window derived from fulfillment capability, not a configured lead time | Accepted |
 
 Each of these reconstructs a decision that is actually visible in this
 repository's `CLAUDE.md` and code — none is a generic placeholder.
