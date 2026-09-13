@@ -97,11 +97,6 @@ inventoryStorage:
   mode: "permissive"
   baseUrl: ""
 
-# NOTE: order-management does not yet wire OpenTelemetry — cmd/order/main.go
-# has no OTEL_EXPORTER_OTLP_ENDPOINT support as of this chart version. No
-# otel block is defined here rather than inventing env vars the binary
-# doesn't read; add one once the binary actually supports OTLP export.
-
 extraEnv: []
 
 livenessProbe:
@@ -123,20 +118,19 @@ tolerations: []
 affinity: {}
 
 # Deployment environment, exported as the deployment.environment.name OTel
-# resource attribute where consumed. Only the analytics projector/reports
-# containers below reference this today (see the otel block note).
+# resource attribute (see the otel block below; now consumed by every
+# deployed container in this chart, not just the analytics processes).
 environment: "local"
 
-# OpenTelemetry. NOTE: unlike wes-work-planning, order-management's own
-# cmd/order, cmd/order-projector, and cmd/order-reports binaries do not
-# currently read OTEL_EXPORTER_OTLP_ENDPOINT (verified against the Go
-# source; see CLAUDE.md's analytics section). This block exists solely so
-# the analytics projector/reports templates below (copied verbatim from
-# wes-work-planning, which DOES support OTLP) have a value to guard on. It
-# stays disabled by default and renders no OTEL env vars unless flipped on;
-# flipping it on today would set env vars the binaries simply ignore.
+# OpenTelemetry. ADR-0009 (standard-metrics-convention) added
+# telemetry.Setup + otelchi HTTP RED instrumentation to cmd/order, so the
+# OLTP deployment now reads these env vars exactly like the analytics
+# projector/reports/mcp deployments below already did. Enabled by default
+# like every other fleet chart (inventory-storage, wes-work-planning,
+# etc.) now that this service actually has OTel wiring, replacing the
+# previous order-management-only false default that predated it.
 otel:
-  enabled: false
+  enabled: true
   endpoint: "http://otel-collector.observability.svc.cluster.local:4317"
   serviceName: "order-management"
 
