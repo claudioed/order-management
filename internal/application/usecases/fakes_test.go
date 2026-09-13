@@ -164,13 +164,33 @@ func (r *findFails) NextID(ctx context.Context) (shared.OrderId, error) {
 // fakeCatalogue is a scripted ports.ProcessPathCatalogue. By default every
 // path is active — tests that want a rejection populate inactive with the
 // specific PathId to reject, mirroring fakeInventory's per-key scripting
-// style.
+// style. cycleTimes/eligibilities are optional per-path scripts for
+// PromisePolicy tests; an unscripted path reports known=false for both,
+// matching a real path the catalogue has never seen a cycle time for.
 type fakeCatalogue struct {
-	inactive map[shared.PathId]bool
+	inactive    map[shared.PathId]bool
+	cycleTimes  map[shared.PathId]time.Duration
+	eligibility map[shared.PathId]shared.Eligibility
 }
 
 func (c *fakeCatalogue) IsActive(pathID shared.PathId) bool {
 	return !c.inactive[pathID]
+}
+
+func (c *fakeCatalogue) CycleTimeP95(pathID shared.PathId) (time.Duration, bool) {
+	if c.inactive[pathID] {
+		return 0, false
+	}
+	d, ok := c.cycleTimes[pathID]
+	return d, ok
+}
+
+func (c *fakeCatalogue) Eligibility(pathID shared.PathId) (shared.Eligibility, bool) {
+	if c.inactive[pathID] {
+		return shared.Eligibility{}, false
+	}
+	e, ok := c.eligibility[pathID]
+	return e, ok
 }
 
 // fixture bundles everything a use-case test needs, wired to in-memory and
@@ -180,7 +200,7 @@ type fixture struct {
 	inventory *fakeInventory
 	events    *recordingPublisher
 	clock     *memory.FixedClock
-	promise   order.LeadTimePolicy
+	promise   order.PromisePolicy
 	catalogue *fakeCatalogue
 }
 
@@ -189,14 +209,20 @@ func now() time.Time {
 }
 
 func newFixture() *fixture {
+	leadTime := order.NewLeadTimePolicy(24*time.Hour, map[shared.PathId]time.Duration{
+		"singles": 6 * time.Hour,
+	})
 	return &fixture{
 		orders:    memory.NewOrderRepo(),
 		inventory: newFakeInventory(),
 		events:    &recordingPublisher{},
 		clock:     memory.NewFixedClock(now()),
-		promise: order.NewLeadTimePolicy(24*time.Hour, map[shared.PathId]time.Duration{
-			"singles": 6 * time.Hour,
-		}),
+		// No Schedule/Capability wired in this fixture: PromisePolicy
+		// always falls back to Fallback (LeadTimePolicy), matching
+		// every existing test's expectations unchanged. Tests that
+		// specifically exercise PromisePolicy's capability path live
+		// in internal/domain/order, not here.
+		promise:   order.PromisePolicy{Fallback: leadTime},
 		catalogue: &fakeCatalogue{inactive: map[shared.PathId]bool{}},
 	}
 }

@@ -22,7 +22,9 @@ import (
 	"github.com/claudioed/order-management/internal/adapters/outbound/inventorystorage"
 	kafkaadapter "github.com/claudioed/order-management/internal/adapters/outbound/kafka"
 	"github.com/claudioed/order-management/internal/adapters/outbound/kafkacatalog"
+	"github.com/claudioed/order-management/internal/adapters/outbound/kafkacptschedule"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
+	"github.com/claudioed/order-management/internal/adapters/outbound/pathcapacity"
 	"github.com/claudioed/order-management/internal/adapters/outbound/postgres"
 	"github.com/claudioed/order-management/internal/adapters/outbound/telemetry"
 	"github.com/claudioed/order-management/internal/application/ports"
@@ -30,6 +32,13 @@ import (
 	"github.com/claudioed/order-management/internal/domain/order"
 	"github.com/claudioed/order-management/internal/domain/shared"
 )
+
+// DefaultSiteId is used when DEFAULT_SITE_ID is unset. ADR 0014 step A
+// does not yet model which site an order ships from (a known
+// simplification for this phase — see order.PromisePolicy's doc
+// comment); every promise in this phase is computed against one
+// configured site.
+const DefaultSiteId = "site-1"
 
 func main() {
 	if err := run(); err != nil {
@@ -96,8 +105,14 @@ func run() error {
 	// file-based catalogue to begin with (see ADR-0013's scope decision),
 	// so there is no "file" mode here -- only "none" (skip) and "kafka"
 	// (real validation).
+	//
+	// ADR-0014 step A extends this SAME switch: the CPT schedule cache
+	// (kafkacptschedule) is a SEPARATE consumer instance on the SAME
+	// topic/broker as the catalogue, so it is gated identically -- it
+	// only runs when the catalogue does, since both need KAFKA_BROKERS.
 	catalogueSource := getenv("PATH_CATALOGUE_SOURCE", "none")
 	var catalogue ports.ProcessPathCatalogue
+	var cptSchedule ports.CPTScheduleCache
 	// catalogueConsumerCtx/cancelCatalogueConsumer are declared here
 	// (rather than inline in the switch below) because the Kafka
 	// catalogue source needs its own Run goroutine started BEFORE
@@ -113,7 +128,9 @@ func run() error {
 		if kafkaBrokers == "" {
 			return fmt.Errorf("PATH_CATALOGUE_SOURCE=kafka requires KAFKA_BROKERS to be set")
 		}
-		kafkaCatalogue, err := kafkacatalog.NewConsumer(context.Background(), strings.Split(kafkaBrokers, ","), logger)
+		brokerList := strings.Split(kafkaBrokers, ",")
+
+		kafkaCatalogue, err := kafkacatalog.NewConsumer(context.Background(), brokerList, logger)
 		if err != nil {
 			return fmt.Errorf("failed to start the Kafka-sourced process-path catalogue: %w", err)
 		}
@@ -126,6 +143,23 @@ func run() error {
 			}
 		}()
 
+		// A SEPARATE consumer instance, own per-process-unique consumer
+		// group, on the SAME topic -- see kafkacptschedule's package
+		// doc comment for why this is safe (independent event-type
+		// filters, independent groups).
+		cptScheduleConsumer, err := kafkacptschedule.NewConsumer(context.Background(), brokerList, logger)
+		if err != nil {
+			return fmt.Errorf("failed to start the Kafka-sourced CPT schedule cache: %w", err)
+		}
+		cptSchedule = cptScheduleConsumer
+		logger.Info("CPT schedule cache source configured", "source", "kafka", "topic", kafkacptschedule.Topic)
+		go func() {
+			logger.Info("CPT schedule consumer running", "topic", kafkacptschedule.Topic)
+			if err := cptScheduleConsumer.Run(catalogueConsumerCtx); err != nil {
+				logger.Error("CPT schedule consumer stopped", "error", err)
+			}
+		}()
+
 		logger.Info("waiting for the process-path catalogue to replay its initial history before accepting traffic")
 		waitCtx, waitCancel := context.WithTimeout(context.Background(), kafkacatalog.WaitReadyTimeout)
 		err = kafkaCatalogue.WaitReady(waitCtx)
@@ -133,15 +167,36 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("process-path catalogue did not become ready within %s: %w", kafkacatalog.WaitReadyTimeout, err)
 		}
+
+		logger.Info("waiting for the CPT schedule cache to replay its initial history before accepting traffic")
+		scheduleWaitCtx, scheduleWaitCancel := context.WithTimeout(context.Background(), kafkacptschedule.WaitReadyTimeout)
+		err = cptScheduleConsumer.WaitReady(scheduleWaitCtx)
+		scheduleWaitCancel()
+		if err != nil {
+			return fmt.Errorf("CPT schedule cache did not become ready within %s: %w", kafkacptschedule.WaitReadyTimeout, err)
+		}
 	default:
 		logger.Warn("process-path catalogue source not configured; ReceiveOrder will skip path validation",
 			"hint", "set PATH_CATALOGUE_SOURCE=kafka for a real deployment")
 	}
 
-	promise := order.NewLeadTimePolicy(
+	leadTime := order.NewLeadTimePolicy(
 		durationEnv("PROMISE_DEFAULT_LEAD_TIME", order.DefaultLeadTime, logger),
 		perPathLeadTimes(os.Getenv("PROMISE_PATH_LEAD_TIMES"), logger),
 	)
+
+	// PromisePolicy (ADR 0014) is the primary policy; leadTime is its
+	// fallback, unchanged in its own logic. Capability/Schedule are nil
+	// when the Kafka catalogue source is not configured, in which case
+	// PromisePolicy always falls back to leadTime -- exactly this
+	// service's pre-ADR-0014 behaviour.
+	promise := order.PromisePolicy{
+		Schedule:   cptSchedule,
+		Capability: catalogue,
+		Capacity:   pathcapacity.NewUnknown(),
+		Fallback:   leadTime,
+		SiteId:     getenv("DEFAULT_SITE_ID", DefaultSiteId),
+	}
 
 	clock := memory.SystemClock{}
 	server := &inboundhttp.Server{

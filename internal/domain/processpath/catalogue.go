@@ -12,28 +12,38 @@
 // wrong one saga step later in wes-work-planning.
 //
 // order-management deliberately keeps a SMALLER shape than WES/FE's
-// copy: it only ever asks "is this path active", never
-// RequiredCapabilities or Direct, so PathDefinition here carries only
-// what IsActive needs. If a future phase adds attribute-driven routing
-// (see the deferred Phase 2 in the process-path-selection plan), extend
-// this struct then -- don't carry unused fields today.
+// copy for the fields it does not need: RequiredCapabilities and Direct
+// are still not carried here. ADR-0014 step A DOES widen this struct
+// with CycleTimeP95 and Eligibility, since order.PromisePolicy is a real
+// consumer of both — see the kafkacatalog package doc comment for the
+// wire-decoding side of that widening.
 package processpath
 
 import (
 	"errors"
 	"strings"
+	"time"
+
+	"github.com/claudioed/order-management/internal/domain/shared"
 )
 
 // ErrUnknownPath is returned by Lookup when id does not match any
 // currently active path's prefix.
 var ErrUnknownPath = errors.New("processpath: unknown or inactive process path id")
 
-// PathDefinition is one currently active process path: its canonical id
-// and the lower-cased prefix family of real path_id values it
-// recognizes.
+// PathDefinition is one currently active process path: its canonical id,
+// the lower-cased prefix family of real path_id values it recognizes,
+// and (ADR-0014) its declared cycle time and eligibility.
+//
+// CycleTimeKnown is false when the wire event carried no parseable
+// cycle_time_p95 for this path — PromisePolicy treats "path known, cycle
+// time unknown" the same as "path unknown": fall back to LeadTimePolicy.
 type PathDefinition struct {
-	Id          string
-	MatchPrefix string
+	Id             string
+	MatchPrefix    string
+	CycleTimeP95   time.Duration
+	CycleTimeKnown bool
+	Eligibility    shared.Eligibility
 }
 
 // Catalogue is the validated, in-memory set of currently active process

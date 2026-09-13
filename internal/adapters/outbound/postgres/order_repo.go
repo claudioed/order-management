@@ -37,12 +37,21 @@ func (r *OrderRepo) Save(ctx context.Context, o *order.Order) error {
 	if d := o.PromiseDate(); d != nil {
 		promiseDate = d
 	}
+	promiseCptId := o.PromiseCptId()
+	var promiseBasis *string
+	if b := o.PromiseBasis(); b != nil {
+		s := b.String()
+		promiseBasis = &s
+	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO orders (id, allow_partial_shipment, promise_date)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (id) DO UPDATE SET promise_date = EXCLUDED.promise_date
-	`, o.ID().String(), o.AllowPartialShipment(), promiseDate); err != nil {
+		INSERT INTO orders (id, allow_partial_shipment, promise_date, promise_cpt_id, promise_basis)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (id) DO UPDATE SET
+			promise_date = EXCLUDED.promise_date,
+			promise_cpt_id = EXCLUDED.promise_cpt_id,
+			promise_basis = EXCLUDED.promise_basis
+	`, o.ID().String(), o.AllowPartialShipment(), promiseDate, promiseCptId, promiseBasis); err != nil {
 		return err
 	}
 
@@ -66,10 +75,12 @@ func (r *OrderRepo) Save(ctx context.Context, o *order.Order) error {
 func (r *OrderRepo) FindByID(ctx context.Context, id shared.OrderId) (*order.Order, error) {
 	var allowPartialShipment bool
 	var promiseDate *time.Time
+	var promiseCptId *string
+	var promiseBasisRaw *string
 
 	err := r.pool.QueryRow(ctx, `
-		SELECT allow_partial_shipment, promise_date FROM orders WHERE id = $1
-	`, id.String()).Scan(&allowPartialShipment, &promiseDate)
+		SELECT allow_partial_shipment, promise_date, promise_cpt_id, promise_basis FROM orders WHERE id = $1
+	`, id.String()).Scan(&allowPartialShipment, &promiseDate, &promiseCptId, &promiseBasisRaw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -109,7 +120,13 @@ func (r *OrderRepo) FindByID(ctx context.Context, id shared.OrderId) (*order.Ord
 		return nil, err
 	}
 
-	return order.Rehydrate(id, lines, allowPartialShipment, promiseDate), nil
+	var promiseBasis *order.PromiseBasis
+	if promiseBasisRaw != nil {
+		b := order.PromiseBasis(*promiseBasisRaw)
+		promiseBasis = &b
+	}
+
+	return order.Rehydrate(id, lines, allowPartialShipment, promiseDate, promiseCptId, promiseBasis), nil
 }
 
 // NextID mints an order id. The `ord-<uuid>` shape mirrors the

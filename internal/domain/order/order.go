@@ -54,6 +54,8 @@ type Order struct {
 	lines                []*OrderLine
 	allowPartialShipment bool
 	promiseDate          *time.Time
+	promiseCptId         *string
+	promiseBasis         *PromiseBasis
 }
 
 // New constructs an Order in Received status. lines must be non-empty;
@@ -75,8 +77,14 @@ func New(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool) (*Ord
 
 // Rehydrate rebuilds an Order from persisted state without re-running
 // construction invariants. Only outbound repository adapters call this.
-func Rehydrate(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool, promiseDate *time.Time) *Order {
-	return &Order{id: id, lines: lines, allowPartialShipment: allowPartialShipment, promiseDate: promiseDate}
+// promiseCptId/promiseBasis are nil for orders persisted before ADR 0014
+// or for a promise never given a CPT identity (a LeadTime-basis promise
+// leaves promiseCptId nil; promiseBasis is still recorded).
+func Rehydrate(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool, promiseDate *time.Time, promiseCptId *string, promiseBasis *PromiseBasis) *Order {
+	return &Order{
+		id: id, lines: lines, allowPartialShipment: allowPartialShipment,
+		promiseDate: promiseDate, promiseCptId: promiseCptId, promiseBasis: promiseBasis,
+	}
 }
 
 func (o *Order) ID() shared.OrderId         { return o.id }
@@ -91,9 +99,12 @@ func (o *Order) Lines() []*OrderLine {
 	return out
 }
 
-// PromiseDate is the date this order is promised for, computed at
-// allocation time by the LeadTimePolicy. Nil until at least one line is
-// allocated.
+// PromiseDate is the date this order is promised for — the CPT's
+// CutoffAt when the promise has a Capability basis, or the computed
+// instant from LeadTimePolicy otherwise. Nil until at least one line is
+// allocated. Kept as a bare time.Time on the wire and in the database for
+// backward compatibility (ADR 0014 §1); see PromiseCptId/PromiseBasis
+// for the rest of the Promise value.
 func (o *Order) PromiseDate() *time.Time {
 	if o.promiseDate == nil {
 		return nil
@@ -102,9 +113,50 @@ func (o *Order) PromiseDate() *time.Time {
 	return &d
 }
 
-// SetPromiseDate records the promise date computed by the domain's
-// LeadTimePolicy at allocation time.
+// PromiseCptId is the CPT identity (e.g. "sp1-1800") the promise
+// targets, when the promise has a Capability basis. Nil for a
+// LeadTime-basis promise, which has no departure identity, or before any
+// promise has been computed.
+func (o *Order) PromiseCptId() *string {
+	if o.promiseCptId == nil {
+		return nil
+	}
+	id := *o.promiseCptId
+	return &id
+}
+
+// PromiseBasis reports which policy produced the current promise
+// (Capability or LeadTime). Nil before any promise has been computed.
+func (o *Order) PromiseBasis() *PromiseBasis {
+	if o.promiseBasis == nil {
+		return nil
+	}
+	b := *o.promiseBasis
+	return &b
+}
+
+// SetPromiseDate records a bare promise date without a CPT identity or
+// basis. Kept for any caller that only has a computed instant (e.g.
+// tests exercising LeadTimePolicy directly) — production allocation code
+// should prefer SetPromise, which also records CptId/Basis.
 func (o *Order) SetPromiseDate(d time.Time) { o.promiseDate = &d }
+
+// SetPromise records the full Promise value ADR 0014 introduces: the
+// cutoff instant (kept on promiseDate for backward compatibility), the
+// CPT identity (nil for a LeadTime-basis promise), and which policy
+// produced it.
+func (o *Order) SetPromise(p Promise) {
+	d := p.CutoffAt
+	o.promiseDate = &d
+	basis := p.Basis
+	o.promiseBasis = &basis
+	if p.CptId == "" {
+		o.promiseCptId = nil
+		return
+	}
+	cptId := p.CptId
+	o.promiseCptId = &cptId
+}
 
 // Status derives the order-level status from the line statuses. There is
 // deliberately no stored Status field: a derived status cannot drift out

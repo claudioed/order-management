@@ -74,7 +74,7 @@ func TestOrderRepo_SaveAndFindByID_RoundTrip(t *testing.T) {
 	if err := o.Allocate(2, "res-int-2"); err != nil {
 		t.Fatalf("Allocate line 2: %v", err)
 	}
-	o.SetPromiseDate(occurredAt.Add(48 * time.Hour))
+	o.SetPromise(order.Promise{CptId: "sp1-1800", CutoffAt: occurredAt.Add(48 * time.Hour), Basis: order.BasisCapability})
 	if err := repo.Save(ctx, o); err != nil {
 		t.Fatalf("Save (allocated): %v", err)
 	}
@@ -85,6 +85,12 @@ func TestOrderRepo_SaveAndFindByID_RoundTrip(t *testing.T) {
 		}
 		if d := reloaded.PromiseDate(); d == nil || !d.Equal(occurredAt.Add(48*time.Hour)) {
 			t.Errorf("promiseDate = %v, want %v", d, occurredAt.Add(48*time.Hour))
+		}
+		if cptId := reloaded.PromiseCptId(); cptId == nil || *cptId != "sp1-1800" {
+			t.Errorf("promiseCptId = %v, want sp1-1800", cptId)
+		}
+		if basis := reloaded.PromiseBasis(); basis == nil || *basis != order.BasisCapability {
+			t.Errorf("promiseBasis = %v, want Capability", basis)
 		}
 		if r := reloaded.Lines()[0].ReservationID(); r == nil || *r != "res-int-1" {
 			t.Errorf("line 1 reservationId = %v, want res-int-1", r)

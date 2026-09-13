@@ -144,13 +144,21 @@ func publishOrderAllocationOutcome(
 	if d := o.PromiseDate(); d != nil {
 		promiseDate = *d
 	}
+	var promiseCptId string
+	if id := o.PromiseCptId(); id != nil {
+		promiseCptId = *id
+	}
+	var promiseBasis string
+	if b := o.PromiseBasis(); b != nil {
+		promiseBasis = b.String()
+	}
 
 	switch o.Status() {
 	case order.StatusAllocated, order.StatusReleased:
-		return events.Publish(ctx, shared.NewOrderAllocated(clock.Now(), o.ID(), promiseDate, released))
+		return events.Publish(ctx, shared.NewOrderAllocatedWithPromise(clock.Now(), o.ID(), promiseDate, promiseCptId, promiseBasis, released))
 	case order.StatusPartiallyAllocated, order.StatusPartiallyReleased:
-		return events.Publish(ctx, shared.NewOrderPartiallyAllocated(
-			clock.Now(), o.ID(), outcome.allocated, outcome.backordered, promiseDate, released,
+		return events.Publish(ctx, shared.NewOrderPartiallyAllocatedWithPromise(
+			clock.Now(), o.ID(), outcome.allocated, outcome.backordered, promiseDate, promiseCptId, promiseBasis, released,
 		))
 	default:
 		return nil
@@ -160,19 +168,27 @@ func publishOrderAllocationOutcome(
 // allocationDeps bundles the outbound dependencies allocateAndRelease
 // needs. ReceiveOrder and RetryAllocation each pass their own struct
 // fields through one value rather than a long positional parameter list.
+//
+// Promise is order.PromisePolicy (ADR 0014), which computes a
+// capability-derived CPT-window promise when the underlying inputs are
+// available, falling back to its own embedded LeadTimePolicy otherwise.
+// A zero-value PromisePolicy (Schedule/Capability both nil) always falls
+// back, so existing wiring/tests that only set Fallback keep working
+// unchanged.
 type allocationDeps struct {
 	Orders    ports.OrderRepo
 	Inventory ports.InventoryReservationClient
 	Events    ports.EventPublisher
 	Clock     ports.Clock
-	Promise   order.LeadTimePolicy
+	Promise   order.PromisePolicy
 }
 
-// setPromiseDate applies deps.Promise's lead-time policy to o, exactly as
-// AllocateOrder/RetryAllocation did pre-redesign.
+// setPromiseDate applies deps.Promise (PromisePolicy, ADR 0014) to o,
+// recording the full Promise value (CPT identity, cutoff instant, basis)
+// via Order.SetPromise.
 func (deps allocationDeps) setPromiseDate(o *order.Order) {
-	if d, ok := deps.Promise.PromiseDate(deps.Clock.Now(), o); ok {
-		o.SetPromiseDate(d)
+	if p, ok := deps.Promise.Promise(deps.Clock.Now(), o); ok {
+		o.SetPromise(p)
 	}
 }
 

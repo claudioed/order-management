@@ -49,7 +49,7 @@ func (h *harness) mustSaveOrder(id string, lines []*order.OrderLine, allowPartia
 	if err != nil {
 		h.t.Fatalf("order id %q: %v", id, err)
 	}
-	o := order.Rehydrate(orderID, lines, allowPartialShipment, nil)
+	o := order.Rehydrate(orderID, lines, allowPartialShipment, nil, nil, nil)
 	if err := h.orders.Save(h.ctx(), o); err != nil {
 		h.t.Fatalf("saving order %q: %v", id, err)
 	}

@@ -126,7 +126,7 @@ func TestPromiseDateUsesTheSlowestAllocatedLine(t *testing.T) {
 					i+1, "SKU-1", 1, tt.paths[i], false, tt.lineStatuses[i], nil,
 				))
 			}
-			o := order.Rehydrate("ord-1", lines, true, nil)
+			o := order.Rehydrate("ord-1", lines, true, nil, nil, nil)
 
 			got, ok := policy.PromiseDate(now, o)
 			if ok != tt.wantOK {

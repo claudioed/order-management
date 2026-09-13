@@ -74,12 +74,18 @@ type releasedLineData struct {
 }
 
 // allocationData is the `data` payload shape for both OrderAllocated and
-// OrderPartiallyAllocated, per CLAUDE.md. Frozen: field names and shape
-// must match wes-work-planning's consumer expectations exactly.
+// OrderPartiallyAllocated, per CLAUDE.md. promise_date is frozen: field
+// name and shape must match wes-work-planning's consumer expectations
+// exactly. promise_cpt_id/promise_basis are ADR 0014's additive fields —
+// omitempty so a LeadTime-basis promise's empty CptId does not add noise
+// to the wire, and so wes-work-planning's existing consumer (which does
+// not read these fields yet) is unaffected either way.
 type allocationData struct {
-	OrderID     string             `json:"order_id"`
-	PromiseDate string             `json:"promise_date"`
-	Lines       []releasedLineData `json:"lines"`
+	OrderID      string             `json:"order_id"`
+	PromiseDate  string             `json:"promise_date"`
+	PromiseCptId string             `json:"promise_cpt_id,omitempty"`
+	PromiseBasis string             `json:"promise_basis,omitempty"`
+	Lines        []releasedLineData `json:"lines"`
 }
 
 // Publisher publishes OrderAllocated and OrderPartiallyAllocated domain
@@ -129,15 +135,19 @@ func (p *Publisher) Publish(ctx context.Context, event shared.DomainEvent) error
 	switch e := event.(type) {
 	case shared.OrderAllocated:
 		data = allocationData{
-			OrderID:     e.OrderID.String(),
-			PromiseDate: e.PromiseDate.UTC().Format(time.RFC3339),
-			Lines:       toReleasedLineData(e.Lines),
+			OrderID:      e.OrderID.String(),
+			PromiseDate:  e.PromiseDate.UTC().Format(time.RFC3339),
+			PromiseCptId: e.PromiseCptId,
+			PromiseBasis: e.PromiseBasis,
+			Lines:        toReleasedLineData(e.Lines),
 		}
 	case shared.OrderPartiallyAllocated:
 		data = allocationData{
-			OrderID:     e.OrderID.String(),
-			PromiseDate: e.PromiseDate.UTC().Format(time.RFC3339),
-			Lines:       toReleasedLineData(e.Lines),
+			OrderID:      e.OrderID.String(),
+			PromiseDate:  e.PromiseDate.UTC().Format(time.RFC3339),
+			PromiseCptId: e.PromiseCptId,
+			PromiseBasis: e.PromiseBasis,
+			Lines:        toReleasedLineData(e.Lines),
 		}
 	default:
 		return nil

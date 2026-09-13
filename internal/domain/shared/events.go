@@ -95,15 +95,36 @@ type ReleasedLine struct {
 // the field is never nil-vs-empty-ambiguous either way). This event is
 // also forwarded to Kafka as an integration event — see the Kafka
 // integration section of CLAUDE.md.
+//
+// PromiseCptId and PromiseBasis are ADR 0014's additive fields: the CPT
+// identity the promise targets (empty for a LeadTime-basis promise, which
+// has no departure identity) and which policy produced PromiseDate
+// (Capability or LeadTime). PromiseDate itself is unchanged — it is the
+// promise's CutoffAt either way, kept on the wire for backward
+// compatibility.
 type OrderAllocated struct {
 	base
-	OrderID     OrderId
-	PromiseDate time.Time
-	Lines       []ReleasedLine
+	OrderID      OrderId
+	PromiseDate  time.Time
+	PromiseCptId string
+	PromiseBasis string
+	Lines        []ReleasedLine
 }
 
 func NewOrderAllocated(occurredAt time.Time, orderID OrderId, promiseDate time.Time, lines []ReleasedLine) OrderAllocated {
 	return OrderAllocated{base: newBase("OrderAllocated", occurredAt), OrderID: orderID, PromiseDate: promiseDate, Lines: lines}
+}
+
+// NewOrderAllocatedWithPromise is NewOrderAllocated plus ADR 0014's
+// promiseCptId/promiseBasis. Kept as a separate constructor rather than
+// widening NewOrderAllocated's signature so every existing call site
+// (and every existing test asserting on that signature) keeps compiling
+// unchanged; new call sites (allocateAndRelease) use this one.
+func NewOrderAllocatedWithPromise(occurredAt time.Time, orderID OrderId, promiseDate time.Time, promiseCptId, promiseBasis string, lines []ReleasedLine) OrderAllocated {
+	return OrderAllocated{
+		base: newBase("OrderAllocated", occurredAt), OrderID: orderID, PromiseDate: promiseDate,
+		PromiseCptId: promiseCptId, PromiseBasis: promiseBasis, Lines: lines,
+	}
 }
 
 // OrderPartiallyAllocated: some lines allocated, some backordered, on an
@@ -113,12 +134,17 @@ func NewOrderAllocated(occurredAt time.Time, orderID OrderId, promiseDate time.T
 // an earlier pass, and never the still-Backordered lines. This event is
 // also forwarded to Kafka as an integration event — see the Kafka
 // integration section of CLAUDE.md.
+//
+// PromiseCptId/PromiseBasis are ADR 0014's additive fields — see
+// OrderAllocated's doc comment.
 type OrderPartiallyAllocated struct {
 	base
 	OrderID          OrderId
 	AllocatedLines   int
 	BackorderedLines int
 	PromiseDate      time.Time
+	PromiseCptId     string
+	PromiseBasis     string
 	Lines            []ReleasedLine
 }
 
@@ -126,6 +152,18 @@ func NewOrderPartiallyAllocated(occurredAt time.Time, orderID OrderId, allocated
 	return OrderPartiallyAllocated{
 		base:    newBase("OrderPartiallyAllocated", occurredAt),
 		OrderID: orderID, AllocatedLines: allocated, BackorderedLines: backordered, PromiseDate: promiseDate, Lines: lines,
+	}
+}
+
+// NewOrderPartiallyAllocatedWithPromise is NewOrderPartiallyAllocated
+// plus ADR 0014's promiseCptId/promiseBasis — see
+// NewOrderAllocatedWithPromise's doc comment for why this is a separate
+// constructor rather than a widened signature.
+func NewOrderPartiallyAllocatedWithPromise(occurredAt time.Time, orderID OrderId, allocated, backordered int, promiseDate time.Time, promiseCptId, promiseBasis string, lines []ReleasedLine) OrderPartiallyAllocated {
+	return OrderPartiallyAllocated{
+		base:    newBase("OrderPartiallyAllocated", occurredAt),
+		OrderID: orderID, AllocatedLines: allocated, BackorderedLines: backordered, PromiseDate: promiseDate,
+		PromiseCptId: promiseCptId, PromiseBasis: promiseBasis, Lines: lines,
 	}
 }
 
