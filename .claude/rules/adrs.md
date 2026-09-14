@@ -1,4 +1,4 @@
-# Architecture Decision Records (16 total, `docs/docs/adr/`)
+# Architecture Decision Records (17 total, `docs/docs/adr/`)
 
 1. **0001 — Hexagonal (ports & adapters) architecture.** The dependency
    rule this whole repo enforces (`internal/architecture/` fitness test).
@@ -95,6 +95,26 @@
     so this policy can only evaluate `shared.DefaultPathId` itself, not
     choose among multiple real paths — read the ADR before extending
     `path_selection.go` to a real multi-path decision.
+17. **0017 — ACCEPTED: per-shipment-group promising (ADR 0014 step B,
+    the second half).** `order.PromisePolicy` gains `PromiseGroups(now,
+    o) ([]PromiseGroup, bool)`: for `AllowPartialShipment=false`, exactly
+    one group covering every allocated line, computed via the UNCHANGED
+    `Promise(now, o)` — byte-identical to pre-ADR-0017 behaviour. For
+    `AllowPartialShipment=true`, each allocated line is evaluated
+    independently and lines with an identical resulting `Promise`
+    (same `Basis`/`CptId`/`CutoffAt`) are grouped together.
+    `Order.SetPromiseGroups` stores the full `[]PromiseGroup` breakdown
+    AND re-derives the legacy single-valued `promiseDate`/`promiseCptId`/
+    `promiseBasis` as a "latest cutoff" projection (ADR 0014 §3's stated
+    rule, extended here to cover CptId/Basis too — documented in the
+    ADR). New additive Postgres table `order_promise_groups`
+    (delete-then-reinsert on every save; `orders`' existing columns
+    untouched); new additive `shared.ReleasedLine` pointer fields
+    (`PromiseCptId`/`PromiseBasis`/`PromiseCutoffAt`) carrying per-line
+    group attribution on the Kafka wire, `omitempty`. wes-work-planning
+    needs zero changes (verified against its real consumer decode
+    struct) — read the ADR before extending `promise_policy.go`,
+    `order.go`'s promise fields, or the Postgres/Kafka promise wiring.
 
 Other ADR-adjacent facts worth knowing without opening every file:
 

@@ -65,12 +65,22 @@ type envelope struct {
 // line released in one pass since it classifies the whole order, not the
 // individual line. Consumers that predate this field can safely ignore
 // it — see ADR-0008.
+//
+// promise_cpt_id/promise_basis/promise_cutoff_at are ADR-0017's additive
+// per-line promise fields (ADR 0014 §3's per-shipment-group promising):
+// which group THIS line belongs to. omitempty for an order whose promise
+// has no group breakdown to attribute a line to (the legacy SetPromise
+// path). wes-work-planning's current consumer does not read these
+// fields — see the top-level allocationData doc comment.
 type releasedLineData struct {
 	LineNo           int    `json:"line_no"`
 	SKU              string `json:"sku"`
 	PathID           string `json:"path_id"`
 	GiftWrap         bool   `json:"gift_wrap"`
 	FulfillmentClass string `json:"fulfillment_class"`
+	PromiseCptId     string `json:"promise_cpt_id,omitempty"`
+	PromiseBasis     string `json:"promise_basis,omitempty"`
+	PromiseCutoffAt  string `json:"promise_cutoff_at,omitempty"`
 }
 
 // allocationData is the `data` payload shape for both OrderAllocated and
@@ -121,10 +131,20 @@ func NewWriterForTopic(topic string, brokers ...string) *kafkago.Writer {
 func toReleasedLineData(lines []shared.ReleasedLine) []releasedLineData {
 	out := make([]releasedLineData, 0, len(lines))
 	for _, l := range lines {
-		out = append(out, releasedLineData{
+		rl := releasedLineData{
 			LineNo: l.LineNo, SKU: l.SKU.String(), PathID: l.PathID.String(), GiftWrap: l.GiftWrap,
 			FulfillmentClass: l.FulfillmentClass,
-		})
+		}
+		if l.PromiseCptId != nil {
+			rl.PromiseCptId = *l.PromiseCptId
+		}
+		if l.PromiseBasis != nil {
+			rl.PromiseBasis = *l.PromiseBasis
+		}
+		if l.PromiseCutoffAt != nil {
+			rl.PromiseCutoffAt = l.PromiseCutoffAt.UTC().Format(time.RFC3339)
+		}
+		out = append(out, rl)
 	}
 	return out
 }
