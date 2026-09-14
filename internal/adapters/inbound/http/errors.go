@@ -24,7 +24,8 @@ func statusFor(err error) int {
 		errors.Is(err, order.ErrLineNotFound):
 		return http.StatusBadRequest
 
-	case errors.Is(err, shared.ErrNonPositiveQuantity):
+	case errors.Is(err, shared.ErrNonPositiveQuantity),
+		errors.Is(err, shared.ErrLineIneligibleForResolvedPath):
 		return http.StatusUnprocessableEntity
 
 	case errors.Is(err, order.ErrOrderAlreadyReleased),
@@ -80,6 +81,8 @@ func problemFor(err error) problemInfo {
 		return problemInfo{"empty-path-id", "Path id must not be empty"}
 	case errors.Is(err, shared.ErrUnknownProcessPath):
 		return problemInfo{"unknown-process-path", "Resolved process path is not active in the process-path catalogue"}
+	case errors.Is(err, shared.ErrLineIneligibleForResolvedPath):
+		return problemInfo{"line-ineligible-for-resolved-path", "Line's attributes are not eligible for its resolved process path"}
 	case errors.Is(err, order.ErrNoLines):
 		return problemInfo{"order-without-lines", "An order must have at least one line"}
 	case errors.Is(err, order.ErrLineNotFound):
