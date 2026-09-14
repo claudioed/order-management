@@ -7,13 +7,17 @@
 #
 # See CLAUDE.md -> "Local quality gate".
 #
-# v1 deliberately has NO integration/mutation/bdd targets: those need Postgres,
-# gremlins and godog setup that is out of scope this round (see the README's
-# "Deferred (v1)" section).
+# Restored to fleet parity 2026-09-13: bdd/arch-test/mutation/mutation-fast/
+# vuln targets were shipped in PR #34 then silently dropped from this file
+# in PR #35's "harden security" pass, even though the backing files
+# (.gremlins.yaml, features/*.feature, internal/architecture/) were never
+# removed. check-all now matches the rest of the fleet's shape (check +
+# coverage + arch-test + bdd) instead of stopping at coverage alone.
 
 GO                 ?= go
 GOLANGCI_LINT      ?= golangci-lint
 GOLANGCI_VERSION   := v2.13.1
+GREMLINS_VERSION   := v0.6.0
 
 COVERAGE_OUT       := coverage.out
 COVERAGE_PKGS      := ./internal/domain/...,./internal/application/...
@@ -21,23 +25,28 @@ COVERAGE_THRESHOLD := 90
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build vet fmt fmt-check lint test integration coverage check check-all
+.PHONY: help build vet fmt fmt-check lint test integration coverage bdd arch-test mutation-fast mutation vuln check check-all
 
 help:
 	@echo "order-management — local quality gate (targets mirror .github/workflows/ci.yml)"
 	@echo ""
-	@echo "  help        Print this list of targets (default target)"
-	@echo "  build       go build ./..."
-	@echo "  vet         go vet ./..."
-	@echo "  fmt         gofmt -w . — format the tree in place"
-	@echo "  fmt-check   Fail if gofmt -l . is non-empty (the CI-style check)"
-	@echo "  lint        golangci-lint run ./... (pinned $(GOLANGCI_VERSION) in CI)"
-	@echo "  test        go test ./... -race — unit + httptest, no DB needed"
-	@echo "  integration Run Kafka integration tests in an isolated Testcontainers broker"
-	@echo "  coverage    CI coverage command + the $(COVERAGE_THRESHOLD)% gate"
+	@echo "  help          Print this list of targets (default target)"
+	@echo "  build         go build ./..."
+	@echo "  vet           go vet ./..."
+	@echo "  fmt           gofmt -w . — format the tree in place"
+	@echo "  fmt-check     Fail if gofmt -l . is non-empty (the CI-style check)"
+	@echo "  lint          golangci-lint run ./... (pinned $(GOLANGCI_VERSION) in CI)"
+	@echo "  test          go test ./... -race — unit + httptest, no DB needed"
+	@echo "  integration   Run Kafka integration tests in an isolated Testcontainers broker"
+	@echo "  coverage      CI coverage command + the $(COVERAGE_THRESHOLD)% gate"
+	@echo "  bdd           godog/Gherkin acceptance tests (features/*.feature)"
+	@echo "  arch-test     Architecture fitness tests (internal/architecture/)"
+	@echo "  mutation-fast Fast blocking mutation subset (thresholds in .gremlins.yaml)"
+	@echo "  mutation      Exhaustive mutation run over the whole domain layer (slow)"
+	@echo "  vuln          Known CVEs in the dependency graph and the Go stdlib"
 	@echo ""
 	@echo "  check       FAST bundle: fmt-check vet build lint test"
-	@echo "  check-all   check + coverage — run this before pushing"
+	@echo "  check-all   check + coverage + arch-test + bdd — run this before pushing"
 
 build:
 	$(GO) build ./...
@@ -87,8 +96,41 @@ coverage:
 		exit 1; \
 	fi
 
+bdd:
+	$(GO) test ./... -run TestFeatures -v
+
+arch-test:
+	$(GO) test ./internal/architecture/... -v
+
+mutation-fast:
+	@if ! command -v gremlins >/dev/null 2>&1; then \
+		echo "gremlins is not installed."; \
+		echo "install the version CI pins with:"; \
+		echo "  go install github.com/go-gremlins/gremlins/cmd/gremlins@$(GREMLINS_VERSION)"; \
+		exit 1; \
+	fi
+	gremlins unleash ./internal/domain/order
+
+mutation:
+	@if ! command -v gremlins >/dev/null 2>&1; then \
+		echo "gremlins is not installed."; \
+		echo "install the version CI pins with:"; \
+		echo "  go install github.com/go-gremlins/gremlins/cmd/gremlins@$(GREMLINS_VERSION)"; \
+		exit 1; \
+	fi
+	gremlins unleash ./internal/domain --workers 1 --timeout-coefficient 30
+
+vuln:
+	@if ! command -v govulncheck >/dev/null 2>&1; then \
+		echo "govulncheck is not installed."; \
+		echo "install it with:"; \
+		echo "  go install golang.org/x/vuln/cmd/govulncheck@latest"; \
+		exit 1; \
+	fi
+	govulncheck ./...
+
 # The fast self-correction loop: run this after every change, before committing.
 check: fmt-check vet build lint test
 
 # The fuller gate a human runs before pushing.
-check-all: check coverage
+check-all: check coverage arch-test bdd
