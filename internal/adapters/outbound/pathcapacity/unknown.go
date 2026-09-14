@@ -10,11 +10,18 @@
 // touching PromisePolicy at all.
 package pathcapacity
 
-import "github.com/claudioed/order-management/internal/domain/shared"
+import (
+	"time"
 
-// UnknownPathCapacity is the seam ADR-0014 describes as filled in a
-// later phase: it satisfies ports.PathCapacity but never claims to know
-// anything.
+	"github.com/claudioed/order-management/internal/domain/shared"
+)
+
+// UnknownPathCapacity is the seam ADR-0014 describes: it satisfies
+// ports.PathCapacity but never claims to know anything. ADR-0015 keeps
+// it as a legitimate no-op option (PATH_CATALOGUE_SOURCE=none / dev mode
+// / fallback), no longer the production default once a real Kafka feed
+// is configured — see internal/adapters/outbound/kafkapathcapacity for
+// that adapter.
 type UnknownPathCapacity struct{}
 
 // NewUnknown constructs an UnknownPathCapacity. It has no state.
@@ -22,6 +29,6 @@ func NewUnknown() UnknownPathCapacity { return UnknownPathCapacity{} }
 
 // Remaining always reports known=false: this adapter has no capacity
 // data source.
-func (UnknownPathCapacity) Remaining(_ shared.PathId, _ string) (int, bool) {
+func (UnknownPathCapacity) Remaining(_ shared.PathId, _ string, _ time.Time) (int, bool) {
 	return 0, false
 }
