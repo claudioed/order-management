@@ -76,6 +76,7 @@ Typos, broken links and formatting are of course fair game.
 | [0014](./0014-promise-derived-from-fulfillment-capability.md) | The delivery promise is a CPT window derived from fulfillment capability, not a configured lead time | Accepted |
 | [0015](./0015-wes-work-planning-path-capacity-changed-wired.md) | wes-work-planning's PathCapacityChanged is wired as the real PathCapacity adapter | Accepted |
 | [0016](./0016-eligibility-driven-process-path-selection.md) | Eligibility-driven process-path selection (ADR 0014 step B, routing only) | Accepted |
+| [0017](./0017-per-shipment-group-promising.md) | Per-shipment-group promising (ADR 0014 step B, the second half) | Accepted |
 
 Each of these reconstructs a decision that is actually visible in this
 repository's `CLAUDE.md` and code — none is a generic placeholder.
