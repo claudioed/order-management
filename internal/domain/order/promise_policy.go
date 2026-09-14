@@ -166,3 +166,140 @@ func allocatedLines(o *Order) []*OrderLine {
 	}
 	return out
 }
+
+// lineNos returns each line's 1-based LineNo, in the same order as lines.
+func lineNos(lines []*OrderLine) []int {
+	out := make([]int, len(lines))
+	for i, l := range lines {
+		out[i] = l.LineNo()
+	}
+	return out
+}
+
+// promiseForLines is Promise's search-and-fallback logic, parameterized
+// on an explicit line slice instead of deriving it from o via
+// allocatedLines internally. Promise(now, o) itself is unchanged and
+// still the one public entry point for "the whole order is one group" —
+// this unexported helper only exists so PromiseGroups can reuse the
+// EXACT SAME window search / capacity / eligibility logic per line
+// (ADR 0014 §3), rather than duplicating it. o is still needed because
+// p.fallback ultimately delegates to p.Fallback.PromiseDate(now, o),
+// which is LeadTimePolicy's own whole-order, slowest-line-governs
+// signature — untouched by this ADR, per the task's explicit direction
+// not to change LeadTimePolicy. Called with a single-line slice, that
+// whole-order fallback degenerates to exactly what a single-line order's
+// fallback would be, since only that one line is ever Allocated/Released
+// on the temporary rehydrated order fallbackOrder builds.
+func (p PromisePolicy) promiseForLines(now time.Time, o *Order, lines []*OrderLine) (Promise, bool) {
+	if len(lines) == 0 {
+		return Promise{}, false
+	}
+
+	if p.Schedule == nil || p.Capability == nil {
+		return p.fallbackForLines(now, o, lines)
+	}
+
+	windows, known := p.Schedule.NextCutoffs(p.SiteId, now, p.horizon())
+	if !known || len(windows) == 0 {
+		return p.fallbackForLines(now, o, lines)
+	}
+
+	for _, w := range windows {
+		if p.linesFitWindow(now, lines, w) {
+			return Promise{CptId: w.CptId, CutoffAt: w.CutoffAt, Basis: BasisCapability}, true
+		}
+	}
+	return p.fallbackForLines(now, o, lines)
+}
+
+// fallbackForLines delegates to p.Fallback.PromiseDate exactly as
+// p.fallback(now, o) does for the whole-order case, but against a
+// temporary aggregate rehydrated with ONLY lines Allocated — so
+// LeadTimePolicy's own "slowest allocated line governs" rule applies to
+// just this subset, never to the whole order's lines. LeadTimePolicy
+// itself is not modified: this is the minimum parameterization needed to
+// reuse it per group without changing its signature or behaviour.
+func (p PromisePolicy) fallbackForLines(now time.Time, o *Order, lines []*OrderLine) (Promise, bool) {
+	if len(lines) == len(allocatedLines(o)) {
+		// The common single-group case (every allocated line, i.e. a
+		// ship-complete order or a partial-shipment order where every
+		// line shares one fallback instant): reuse p.fallback(now, o)
+		// directly rather than building a throwaway aggregate, so the
+		// ship-complete path is provably byte-identical to Promise's
+		// own existing behaviour.
+		return p.fallback(now, o)
+	}
+	subset := make([]*OrderLine, len(lines))
+	for i, l := range lines {
+		subset[i] = RehydrateOrderLine(l.LineNo(), l.SKU(), l.Quantity(), l.PathID(), l.GiftWrap(), l.Status(), l.ReservationID())
+	}
+	tmp := Rehydrate(o.ID(), subset, o.AllowPartialShipment(), nil, nil, nil)
+	d, ok := p.Fallback.PromiseDate(now, tmp)
+	if !ok {
+		return Promise{}, false
+	}
+	return Promise{CutoffAt: d, Basis: BasisLeadTime}, true
+}
+
+// PromiseGroups computes ADR 0014 §3's per-shipment-group promise: when
+// o.AllowPartialShipment() is false, exactly one group covering every
+// allocated line, computed via the EXISTING unchanged Promise(now, o)
+// search — this is the "exactly as today" case the ADR requires to be
+// byte-identical to Promise's own result. When true, each allocated line
+// is evaluated INDEPENDENTLY (as if it were the sole line of a
+// single-line order), and lines whose independently-computed Promise is
+// identical (same Basis, same CptId, same CutoffAt) are grouped together
+// — directly implementing "lines are grouped by the cutoff they can
+// make". Returns ok=false in exactly the same case Promise does: no line
+// allocated yet.
+func (p PromisePolicy) PromiseGroups(now time.Time, o *Order) ([]PromiseGroup, bool) {
+	lines := allocatedLines(o)
+	if len(lines) == 0 {
+		return nil, false
+	}
+
+	if !o.AllowPartialShipment() {
+		promise, ok := p.promiseForLines(now, o, lines)
+		if !ok {
+			return nil, false
+		}
+		return []PromiseGroup{{LineNos: lineNos(lines), Promise: promise}}, true
+	}
+
+	// Partial shipment: compute each line's own promise, then partition
+	// by identical result. A stable, deterministic group order is kept
+	// by first-occurrence: the first line to produce a given Promise
+	// value opens its group, and every later line with the same Promise
+	// value is appended to it.
+	type keyed struct {
+		key     Promise
+		promise Promise
+		lineNo  int
+	}
+	perLine := make([]keyed, 0, len(lines))
+	for _, l := range lines {
+		promise, ok := p.promiseForLines(now, o, []*OrderLine{l})
+		if !ok {
+			// Promise's own contract only returns ok=false when NO
+			// line is allocated at all; a single already-allocated
+			// line always has a fallback answer (LeadTimePolicy never
+			// refuses to promise an allocated line — see promise.go).
+			// Unreachable in practice, but fail closed rather than
+			// silently drop the line from every group.
+			return nil, false
+		}
+		perLine = append(perLine, keyed{key: promise, promise: promise, lineNo: l.LineNo()})
+	}
+
+	var groups []PromiseGroup
+	index := make(map[Promise]int, len(perLine))
+	for _, k := range perLine {
+		if i, ok := index[k.key]; ok {
+			groups[i].LineNos = append(groups[i].LineNos, k.lineNo)
+			continue
+		}
+		index[k.key] = len(groups)
+		groups = append(groups, PromiseGroup{LineNos: []int{k.lineNo}, Promise: k.promise})
+	}
+	return groups, true
+}

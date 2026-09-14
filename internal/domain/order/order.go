@@ -49,6 +49,13 @@ var (
 // Order is the aggregate root: the unit of consistency for intake,
 // allocation, release and cancellation. Every line mutation goes through
 // an Order method, so the invariants below cannot be bypassed.
+//
+// promiseGroups (ADR 0014 §3 / ADR 0017) is the full-fidelity promise
+// breakdown: one PromiseGroup per set of lines sharing a cutoff. It lives
+// ALONGSIDE, not instead of, the legacy single-valued promiseDate/
+// promiseCptId/promiseBasis fields — those three remain a derived,
+// backward-compatible SUMMARY of promiseGroups (see SetPromiseGroups),
+// never a second source of truth that could drift from it.
 type Order struct {
 	id                   shared.OrderId
 	lines                []*OrderLine
@@ -56,6 +63,7 @@ type Order struct {
 	promiseDate          *time.Time
 	promiseCptId         *string
 	promiseBasis         *PromiseBasis
+	promiseGroups        []PromiseGroup
 }
 
 // New constructs an Order in Received status. lines must be non-empty;
@@ -80,10 +88,28 @@ func New(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool) (*Ord
 // promiseCptId/promiseBasis are nil for orders persisted before ADR 0014
 // or for a promise never given a CPT identity (a LeadTime-basis promise
 // leaves promiseCptId nil; promiseBasis is still recorded).
+//
+// Kept with its original 6-argument signature (no promiseGroups
+// parameter) so every existing call site and every existing test that
+// constructs an Order this way keeps compiling and behaving unchanged —
+// see RehydrateWithGroups for the ADR 0014 §3 / ADR 0017 widened
+// constructor a repository adapter that also persists the per-group
+// breakdown should call instead.
 func Rehydrate(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool, promiseDate *time.Time, promiseCptId *string, promiseBasis *PromiseBasis) *Order {
+	return RehydrateWithGroups(id, lines, allowPartialShipment, promiseDate, promiseCptId, promiseBasis, nil)
+}
+
+// RehydrateWithGroups is Rehydrate plus the full PromiseGroup breakdown
+// (ADR 0014 §3 / ADR 0017). promiseGroups may be nil (an order persisted
+// before this ADR, or one whose promiseDate/promiseCptId/promiseBasis
+// were set via the legacy SetPromise path) — PromiseGroups() then simply
+// returns an empty slice, and the legacy summary fields are exactly what
+// was passed in, untouched.
+func RehydrateWithGroups(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool, promiseDate *time.Time, promiseCptId *string, promiseBasis *PromiseBasis, promiseGroups []PromiseGroup) *Order {
 	return &Order{
 		id: id, lines: lines, allowPartialShipment: allowPartialShipment,
 		promiseDate: promiseDate, promiseCptId: promiseCptId, promiseBasis: promiseBasis,
+		promiseGroups: promiseGroups,
 	}
 }
 
@@ -145,6 +171,13 @@ func (o *Order) SetPromiseDate(d time.Time) { o.promiseDate = &d }
 // cutoff instant (kept on promiseDate for backward compatibility), the
 // CPT identity (nil for a LeadTime-basis promise), and which policy
 // produced it.
+//
+// This method's body is deliberately left untouched by ADR 0017 (it
+// predates per-group promising and every existing test exercises it
+// directly): it sets ONLY the legacy summary fields, never
+// promiseGroups. A caller that wants the full per-group breakdown
+// recorded too should call SetPromiseGroups instead, which is real,
+// additional method surface — not a replacement for this one.
 func (o *Order) SetPromise(p Promise) {
 	d := p.CutoffAt
 	o.promiseDate = &d
@@ -156,6 +189,74 @@ func (o *Order) SetPromise(p Promise) {
 	}
 	cptId := p.CptId
 	o.promiseCptId = &cptId
+}
+
+// PromiseGroups returns the full per-shipment-group promise breakdown
+// ADR 0014 §3 / ADR 0017 introduces — the real, full-fidelity source of
+// truth. A ship-complete order (or any order whose promise was set via
+// SetPromiseGroups with a single group, which is what PromisePolicy.
+// PromiseGroups always produces for AllowPartialShipment=false) has
+// exactly one entry. Empty (nil) until SetPromiseGroups has been called
+// at least once, or for an order rehydrated without a persisted group
+// breakdown (a pre-ADR-0017 row, or one whose promise was set via the
+// legacy SetPromise). The slice and its PromiseGroup values are copies:
+// mutating the returned slice cannot corrupt the aggregate.
+func (o *Order) PromiseGroups() []PromiseGroup {
+	out := make([]PromiseGroup, len(o.promiseGroups))
+	for i, g := range o.promiseGroups {
+		lineNos := make([]int, len(g.LineNos))
+		copy(lineNos, g.LineNos)
+		out[i] = PromiseGroup{LineNos: lineNos, Promise: g.Promise}
+	}
+	return out
+}
+
+// SetPromiseGroups records the full per-shipment-group promise breakdown
+// (ADR 0014 §3 / ADR 0017): groups is stored verbatim as the new,
+// full-fidelity PromiseGroups() source of truth, AND the existing
+// single-valued promiseDate/promiseCptId/promiseBasis fields are
+// re-derived from it as a backward-compatible projection, so every
+// existing reader of those three fields (the Postgres repo's write path,
+// the wire event publisher, PromiseDate()/PromiseCptId()/PromiseBasis()
+// themselves) keeps working unchanged.
+//
+// The projection rule, per ADR 0014 §3 ("the order's PromiseDate()
+// becomes the latest of them"): PromiseDate() is set to the LATEST
+// CutoffAt among all groups — so no existing reader ever sees an earlier
+// date than the single-promise behaviour would have produced. ADR 0014
+// does not specify an aggregation rule for CptId/Basis (a single string
+// cannot represent N different departures), so this method makes the
+// same honest choice ADR 0017 documents: PromiseCptId()/PromiseBasis()
+// are projected from the SAME group whose CutoffAt is that latest one —
+// i.e. all three legacy fields describe "the group with the latest
+// cutoff", consistently, rather than three independently-chosen groups.
+//
+// Calling this with a single group covering every allocated line (what
+// PromisePolicy.PromiseGroups always returns for
+// AllowPartialShipment=false) reproduces SetPromise's own single-field
+// assignment exactly, byte for byte — this is what makes the ship-
+// complete path's behaviour provably unchanged rather than merely
+// "should be the same".
+func (o *Order) SetPromiseGroups(groups []PromiseGroup) {
+	stored := make([]PromiseGroup, len(groups))
+	for i, g := range groups {
+		lineNos := make([]int, len(g.LineNos))
+		copy(lineNos, g.LineNos)
+		stored[i] = PromiseGroup{LineNos: lineNos, Promise: g.Promise}
+	}
+	o.promiseGroups = stored
+
+	if len(groups) == 0 {
+		return
+	}
+
+	latest := groups[0]
+	for _, g := range groups[1:] {
+		if g.Promise.CutoffAt.After(latest.Promise.CutoffAt) {
+			latest = g
+		}
+	}
+	o.SetPromise(latest.Promise)
 }
 
 // Status derives the order-level status from the line statuses. There is
