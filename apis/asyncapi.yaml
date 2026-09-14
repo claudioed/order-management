@@ -557,6 +557,34 @@ components:
           type: string
           enum: [SINGLE, SAME_SKU_MULTI, MULTI_LINE_MULTI]
           description: Classifies the whole order (ADR 0008); additive field.
+        promise_cpt_id:
+          type: string
+          description: >-
+            ADR 0017's additive per-line promise field: the CPT identity
+            (e.g. "sp1-1200") the PromiseGroup this line belongs to
+            targets. Present only when that group's basis is
+            "Capability" and the group has a CPT identity. Absent when
+            the order's promise has no per-group breakdown to attribute
+            this line to (a promise set via the legacy, pre-ADR-0017
+            single-Promise path). Older consumers can safely ignore it.
+        promise_basis:
+          type: string
+          enum: [Capability, LeadTime]
+          description: >-
+            ADR 0017's additive per-line promise field: which policy
+            produced the PromiseGroup this line belongs to. Absent under
+            the same condition as promise_cpt_id.
+        promise_cutoff_at:
+          type: string
+          format: date-time
+          description: >-
+            ADR 0017's additive per-line promise field: the cutoff
+            instant of the PromiseGroup this line belongs to -- may
+            differ from the order-level promise_date on a
+            partial-shipment order whose lines split across multiple
+            groups (promise_date is always the LATEST group's cutoff;
+            an individual line's own group may cut off earlier). Absent
+            under the same condition as promise_cpt_id.
 
     OrderReceivedAnalyticsEvent:
       allOf:

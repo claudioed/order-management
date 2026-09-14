@@ -73,16 +73,32 @@ func NewOrderLineBackordered(occurredAt time.Time, orderID OrderId, lineNo int, 
 
 // ReleasedLine is one line released as part of the same allocation pass
 // that produced an OrderAllocated or OrderPartiallyAllocated fact. Its
-// fields are part of the frozen wes-work-planning Kafka integration
-// contract (see the Kafka integration section of CLAUDE.md): field names
-// and shapes here are mirrored byte-for-byte by wes-work-planning's
-// consumer and must not be changed casually.
+// core fields (LineNo, SKU, PathID, GiftWrap, FulfillmentClass) are part
+// of the frozen wes-work-planning Kafka integration contract (see the
+// Kafka integration section of CLAUDE.md): field names and shapes here
+// are mirrored byte-for-byte by wes-work-planning's consumer and must
+// not be changed casually.
+//
+// PromiseCptId/PromiseBasis/PromiseCutoffAt are ADR 0017's additive
+// per-line promise fields (ADR 0014 §3's per-shipment-group promising):
+// which group this specific line belongs to, carried alongside the
+// order-level PromiseDate/PromiseCptId/PromiseBasis summary on
+// OrderAllocated/OrderPartiallyAllocated. All three are pointers —
+// nil/omitted for an order whose promise was set via the legacy
+// SetPromise path (no group breakdown to attribute a line to) — mirroring
+// this repo's existing pointer-field convention for "may not apply"
+// (see OrderLine.ReservationID). wes-work-planning's current consumer
+// does not read these fields; this is a future phase's work, not this
+// one's — see ADR 0017.
 type ReleasedLine struct {
 	LineNo           int
 	SKU              SKU
 	PathID           PathId
 	GiftWrap         bool
 	FulfillmentClass string
+	PromiseCptId     *string
+	PromiseBasis     *string
+	PromiseCutoffAt  *time.Time
 }
 
 // OrderAllocated: every line on the order is allocated — and, per the
