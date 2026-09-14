@@ -23,6 +23,7 @@ import (
 	kafkaadapter "github.com/claudioed/order-management/internal/adapters/outbound/kafka"
 	"github.com/claudioed/order-management/internal/adapters/outbound/kafkacatalog"
 	"github.com/claudioed/order-management/internal/adapters/outbound/kafkacptschedule"
+	"github.com/claudioed/order-management/internal/adapters/outbound/kafkapathcapacity"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
 	"github.com/claudioed/order-management/internal/adapters/outbound/pathcapacity"
 	"github.com/claudioed/order-management/internal/adapters/outbound/postgres"
@@ -110,9 +111,19 @@ func run() error {
 	// (kafkacptschedule) is a SEPARATE consumer instance on the SAME
 	// topic/broker as the catalogue, so it is gated identically -- it
 	// only runs when the catalogue does, since both need KAFKA_BROKERS.
+	//
+	// ADR-0015 extends it a THIRD time: the path capacity cache
+	// (kafkapathcapacity) is yet another separate consumer instance, on
+	// a DIFFERENT topic (wes-work-planning's warehouse.work-planning.
+	// events, not process-path-management's), but the SAME broker and
+	// the SAME PATH_CATALOGUE_SOURCE switch -- there is no new env knob
+	// for an operator to learn. When the switch is "none" (or unset),
+	// ports.PathCapacity stays wired to UnknownPathCapacity, exactly
+	// today's behaviour.
 	catalogueSource := getenv("PATH_CATALOGUE_SOURCE", "none")
 	var catalogue ports.ProcessPathCatalogue
 	var cptSchedule ports.CPTScheduleCache
+	var capacity ports.PathCapacity = pathcapacity.NewUnknown()
 	// catalogueConsumerCtx/cancelCatalogueConsumer are declared here
 	// (rather than inline in the switch below) because the Kafka
 	// catalogue source needs its own Run goroutine started BEFORE
@@ -160,6 +171,22 @@ func run() error {
 			}
 		}()
 
+		// A THIRD independent consumer instance, own per-process-unique
+		// consumer group, on wes-work-planning's OWN topic -- see
+		// kafkapathcapacity's package doc comment (ADR-0015).
+		pathCapacityConsumer, err := kafkapathcapacity.NewConsumer(context.Background(), brokerList, logger)
+		if err != nil {
+			return fmt.Errorf("failed to start the Kafka-sourced path capacity cache: %w", err)
+		}
+		capacity = pathCapacityConsumer
+		logger.Info("path capacity cache source configured", "source", "kafka", "topic", kafkapathcapacity.Topic)
+		go func() {
+			logger.Info("path capacity consumer running", "topic", kafkapathcapacity.Topic)
+			if err := pathCapacityConsumer.Run(catalogueConsumerCtx); err != nil {
+				logger.Error("path capacity consumer stopped", "error", err)
+			}
+		}()
+
 		logger.Info("waiting for the process-path catalogue to replay its initial history before accepting traffic")
 		waitCtx, waitCancel := context.WithTimeout(context.Background(), kafkacatalog.WaitReadyTimeout)
 		err = kafkaCatalogue.WaitReady(waitCtx)
@@ -175,8 +202,16 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("CPT schedule cache did not become ready within %s: %w", kafkacptschedule.WaitReadyTimeout, err)
 		}
+
+		logger.Info("waiting for the path capacity cache to replay its initial history before accepting traffic")
+		capacityWaitCtx, capacityWaitCancel := context.WithTimeout(context.Background(), kafkapathcapacity.WaitReadyTimeout)
+		err = pathCapacityConsumer.WaitReady(capacityWaitCtx)
+		capacityWaitCancel()
+		if err != nil {
+			return fmt.Errorf("path capacity cache did not become ready within %s: %w", kafkapathcapacity.WaitReadyTimeout, err)
+		}
 	default:
-		logger.Warn("process-path catalogue source not configured; ReceiveOrder will skip path validation",
+		logger.Warn("process-path catalogue source not configured; ReceiveOrder will skip path validation, and path capacity will remain unknown (UnknownPathCapacity)",
 			"hint", "set PATH_CATALOGUE_SOURCE=kafka for a real deployment")
 	}
 
@@ -193,7 +228,7 @@ func run() error {
 	promise := order.PromisePolicy{
 		Schedule:   cptSchedule,
 		Capability: catalogue,
-		Capacity:   pathcapacity.NewUnknown(),
+		Capacity:   capacity,
 		Fallback:   leadTime,
 		SiteId:     getenv("DEFAULT_SITE_ID", DefaultSiteId),
 	}

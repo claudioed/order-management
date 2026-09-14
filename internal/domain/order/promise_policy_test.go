@@ -44,7 +44,7 @@ func capacityKey(pathID shared.PathId, cptId string) string {
 	return pathID.String() + "|" + cptId
 }
 
-func (f *fakeCapacity) Remaining(pathID shared.PathId, cptId string) (int, bool) {
+func (f *fakeCapacity) Remaining(pathID shared.PathId, cptId string, _ time.Time) (int, bool) {
 	key := capacityKey(pathID, cptId)
 	if f.known == nil || !f.known[key] {
 		return 0, false

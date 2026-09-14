@@ -1,4 +1,4 @@
-# Architecture Decision Records (14 total, `docs/docs/adr/`)
+# Architecture Decision Records (15 total, `docs/docs/adr/`)
 
 1. **0001 — Hexagonal (ports & adapters) architecture.** The dependency
    rule this whole repo enforces (`internal/architecture/` fitness test).
@@ -59,6 +59,20 @@
     `AllowPartialShipment`; `OrderRepromised` closes the loop. Not
     implemented yet — read it before touching `promise.go` or
     `path_selection.go`.
+15. **0015 — ACCEPTED: wes-work-planning's PathCapacityChanged wired as
+    the real PathCapacity adapter.** Closes ADR-0014 step 3:
+    `kafkapathcapacity.Consumer`, a third Kafka consumer (own
+    per-process-unique group) on a NEW topic
+    (`warehouse.work-planning.events`), replaces `UnknownPathCapacity`
+    as the `PATH_CATALOGUE_SOURCE=kafka` default. `ports.PathCapacity`/
+    `order.CapacitySource.Remaining` widened to accept `cutoffAt
+    time.Time` alongside `cptId` — the caller (`PromisePolicy.
+    linesFitWindow`) already has it in scope, so the cache is keyed on
+    `(PathId, CutoffAt)` with an exact match, not `cptId` string
+    matching. `UnknownPathCapacity` stays available for
+    `PATH_CATALOGUE_SOURCE=none`/dev mode. Read it before touching
+    `ports.PathCapacity`, `promise_policy.go`, or adding a fourth Kafka
+    consumer.
 
 Other ADR-adjacent facts worth knowing without opening every file:
 

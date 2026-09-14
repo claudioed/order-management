@@ -41,9 +41,14 @@ type ScheduleSource interface {
 
 // CapacitySource is the minimal remaining-capacity question PromisePolicy
 // needs. Satisfied by ports.PathCapacity (including its current
-// always-unknown UnknownPathCapacity implementation).
+// always-unknown UnknownPathCapacity implementation, and ADR-0015's
+// Kafka-fed kafkapathcapacity.Consumer). cutoffAt is passed alongside
+// cptId because PromisePolicy already has it in hand from the CPTWindow
+// it is evaluating (see linesFitWindow below) and a capacity adapter
+// keyed on wes-work-planning's native CutoffAt currency needs it to
+// answer — see ADR-0015 for the full reasoning.
 type CapacitySource interface {
-	Remaining(pathID shared.PathId, cptId string) (units int, known bool)
+	Remaining(pathID shared.PathId, cptId string, cutoffAt time.Time) (units int, known bool)
 }
 
 // PromisePolicy is the domain service ADR 0014 introduces to replace
@@ -133,7 +138,7 @@ func (p PromisePolicy) linesFitWindow(now time.Time, lines []*OrderLine, w CPTWi
 			return false
 		}
 		if p.Capacity != nil {
-			if remaining, capKnown := p.Capacity.Remaining(l.PathID(), w.CptId); capKnown && remaining < l.Quantity() {
+			if remaining, capKnown := p.Capacity.Remaining(l.PathID(), w.CptId, w.CutoffAt); capKnown && remaining < l.Quantity() {
 				return false
 			}
 		}

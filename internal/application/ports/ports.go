@@ -168,15 +168,29 @@ type CPTScheduleCache interface {
 }
 
 // PathCapacity is the read-only outbound port for remaining capacity per
-// (path, CPT) bucket. wes-work-planning does not publish this data yet
-// (see ADR-0014's rollout step 3) — the one implementation available in
-// this phase, UnknownPathCapacity, always reports known=false, which
-// PromisePolicy treats as "capacity is not a constraint" per the ADR's
-// explicit condition (c). This is the honest v1: a saturated path is
-// still promised optimistically until wes-work-planning ships
-// PathCapacityChanged and this port gets a Kafka-fed implementation.
+// (path, CPT) bucket. Two implementations exist: UnknownPathCapacity
+// (always known=false, the pre-ADR-0015 default and the dev-mode/
+// fallback option today) and kafkapathcapacity.Consumer (ADR-0015), a
+// Kafka-fed cache of wes-work-planning's PathCapacityChanged event.
+// PromisePolicy treats known=false as "capacity is not a constraint"
+// per ADR-0014's explicit condition (c) — this is unchanged by ADR-0015;
+// what changes is that a real figure is now available whenever
+// wes-work-planning has reported one for the exact path+cutoff asked
+// about.
+//
+// Remaining's signature carries cutoffAt (ADR-0015), not just cptId: the
+// wire event wes-work-planning actually publishes carries its own native
+// CutoffAt instant (a time.Time), never process-path-management's cptId
+// string. The one caller of this port, order.PromisePolicy.linesFitWindow,
+// already has both cptId and cutoffAt in scope from the CPTWindow it is
+// evaluating (see kafkacptschedule's NextCutoffs), so passing cutoffAt
+// costs the caller nothing and lets a Kafka-fed adapter answer without
+// inventing its own cptId<->cutoffAt resolution. See ADR-0015 for the
+// full reasoning and the alternative considered.
 type PathCapacity interface {
 	// Remaining reports how many units remain available for pathId at
-	// cptId, and whether that figure is currently known.
-	Remaining(pathId shared.PathId, cptId string) (units int, known bool)
+	// the CPT identified by cptId (kept for logging/observability —
+	// implementations correlate on cutoffAt, not cptId) and cutoffAt,
+	// and whether that figure is currently known.
+	Remaining(pathId shared.PathId, cptId string, cutoffAt time.Time) (units int, known bool)
 }
