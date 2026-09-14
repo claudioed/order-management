@@ -2,17 +2,34 @@
 
 ## GitHub Actions workflows (`.github/workflows/`)
 
-### `ci.yml` — triggers on push/PR to `main`, `develop`
+### `ci.yml` — triggers on push/PR to `main`, `develop` (+ weekly schedule for `mutation`)
 
 - **`lint`** — golangci-lint v2.13.1, `--timeout=5m`.
 - **`test`** — build, vet, gofmt check, `go test ./... -race
   -coverprofile=coverage.out -coverpkg=./internal/domain/...,./internal/application/...`,
   then a 90% coverage gate on that coverprofile.
+- **`bdd`** — `go test ./... -run TestFeatures -v` (godog/Gherkin acceptance
+  suite, `features/*.feature`).
 - **`integration`** — `go build/vet -tags=integration ./...` then
-  `go test -tags=integration ./internal/adapters/outbound/kafka` against a
-  **Testcontainers** Kafka broker (no external Kafka service in this
-  workflow — do not write a `KAFKA_BROKERS`-skip-gated test, it silently
-  no-ops in CI).
+  `go test -tags=integration ./internal/adapters/outbound/kafka` (+
+  `kafkacatalog`, `kafkacptschedule`) against a **Testcontainers** Kafka
+  broker (no external Kafka service in this workflow — do not write a
+  `KAFKA_BROKERS`-skip-gated test, it silently no-ops in CI).
+- **`mutation-fast`** — blocking gremlins subset over `internal/domain/order`
+  only, every push/PR. Thresholds in `.gremlins.yaml` (gremlins fails when
+  the measured value is `<=` the threshold, so the threshold sits strictly
+  below what's currently achieved — re-measure and ratchet, don't just raise
+  the number).
+- **`mutation`** — exhaustive gremlins run over `internal/domain`, weekly
+  schedule + `workflow_dispatch` only (slow: up to 90 min).
+- **`vuln`** — `govulncheck ./...`.
+- **`api-lint`** — Spectral lint on `apis/openapi.yaml` and
+  `apis/asyncapi.yaml`.
+- **`arch-test`** — `go test ./internal/architecture/... -v` (arch-go
+  fitness tests: hexagonal dependency rule, analytics isolation, ports
+  customer-owned).
+- **`docs-api-drift`** — regenerates the Docusaurus REST reference from
+  `apis/openapi.yaml` and fails the PR on any diff.
 - **`helm-lint`** — `ct lint --charts charts/order-management` — runs ONLY
   for a `pull_request` with `base_ref == 'main'` (i.e. the develop→main
   release PR), never on develop pushes/PRs.
@@ -26,12 +43,15 @@
   and pushes the Helm chart to `oci://ghcr.io/claudioed`, creates the git
   tag + GitHub Release.
 
-Note: `bdd`, `mutation`/`mutation-fast`, `vuln`/`govulncheck`, `api-lint`
-(Spectral), and `arch-test` jobs are referenced by name in project history
-(e.g. the Makefile header comment, `.gremlins.yaml`) as part of the CI
-sensor set — **verify their exact job names and current wiring directly in
-`.github/workflows/ci.yml` before relying on this list**, since job
-composition has moved between commits and this file can drift.
+`bdd`/`mutation-fast`/`mutation`/`vuln`/`api-lint`/`arch-test`/
+`docs-api-drift` were added in PR #34 (fleet-parity quality sensors),
+silently dropped as collateral damage in PR #35's "harden security" pass
+(only `mutation`/`bdd` were documented as deliberately deferred there — the
+rest had no such rationale, and `.gremlins.yaml`/`features/*.feature`/
+`internal/architecture/` were never deleted), then restored to this list on
+2026-09-13. Verify job names directly in `.github/workflows/ci.yml` before
+relying on this summary if it's been a while — job composition has moved
+between commits before.
 
 ### `docs.yml` — Docusaurus site build + GitHub Pages deploy
 

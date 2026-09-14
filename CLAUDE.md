@@ -82,9 +82,13 @@ talks only to this service's own REST API, and never participates in
 ```bash
 # Local quality gate (mirrors .github/workflows/ci.yml)
 make check          # fmt-check + vet + build + lint + test — run after every change
-make check-all       # check + coverage (90% gate on domain+application)
+make check-all       # check + coverage (90% gate) + arch-test + bdd
 make integration     # Kafka adapter against a Testcontainers broker
 make coverage         # go test -race -coverprofile + the 90% gate
+make bdd              # godog/Gherkin acceptance suite (features/*.feature)
+make arch-test        # arch-go hexagonal/analytics-isolation/ports fitness tests
+make mutation-fast    # blocking gremlins subset (internal/domain/order)
+make vuln             # govulncheck ./...
 
 # Run locally
 go run ./cmd/order                    # in-memory adapters if DATABASE_URL unset
