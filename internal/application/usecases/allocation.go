@@ -183,13 +183,46 @@ type allocationDeps struct {
 	Promise   order.PromisePolicy
 }
 
-// setPromiseDate applies deps.Promise (PromisePolicy, ADR 0014) to o,
-// recording the full Promise value (CPT identity, cutoff instant, basis)
-// via Order.SetPromise.
+// setPromiseDate applies deps.Promise (PromisePolicy, ADR 0014/ADR 0017)
+// to o, recording the full per-shipment-group promise breakdown via
+// Order.SetPromiseGroups.
+//
+// DESIGN DECISION (documented per the task brief): this always calls the
+// new PromiseGroups/SetPromiseGroups path, for BOTH ship-complete and
+// partial-shipment orders, rather than branching on
+// o.AllowPartialShipment() to keep calling the old Promise/SetPromise
+// path for ship-complete orders. This is deliberate and smaller-diff:
+// PromisePolicy.PromiseGroups degrades to exactly one group covering
+// every allocated line for AllowPartialShipment=false, computed via the
+// UNCHANGED Promise(now, o) search (see promise_policy.go's doc
+// comment), and Order.SetPromiseGroups called with that single group
+// reproduces SetPromise's own field assignment byte for byte. The
+// OUTCOME for a ship-complete order is therefore provably identical
+// either way; calling one method here (rather than two branches, one of
+// which would need to keep being manually kept in sync with the other)
+// is the smaller, more obviously-correct change against this call site.
 func (deps allocationDeps) setPromiseDate(o *order.Order) {
-	if p, ok := deps.Promise.Promise(deps.Clock.Now(), o); ok {
-		o.SetPromise(p)
+	if groups, ok := deps.Promise.PromiseGroups(deps.Clock.Now(), o); ok {
+		o.SetPromiseGroups(groups)
 	}
+}
+
+// promiseGroupByLine indexes o.PromiseGroups() (ADR 0014 §3 / ADR 0017)
+// by line number, so allocateAndRelease can attribute each released line
+// to the specific PromiseGroup it belongs to when building the
+// integration event payload. Returns an empty map for an order with no
+// group breakdown yet (e.g. the promise was never computed, or was set
+// via the legacy single-Promise SetPromise path) — callers treat a
+// missing entry as "no per-line promise detail available", exactly like
+// a pre-ADR-0017 event.
+func promiseGroupByLine(o *order.Order) map[int]order.PromiseGroup {
+	out := make(map[int]order.PromiseGroup)
+	for _, g := range o.PromiseGroups() {
+		for _, lineNo := range g.LineNos {
+			out[lineNo] = g
+		}
+	}
+	return out
 }
 
 // allocateAndRelease is the ONE shared flow this redesign folds allocation
@@ -255,6 +288,7 @@ func allocateAndRelease(
 	// passes, every line the aggregate now reports Allocated (this pass's
 	// newly-allocated lines, and any already-Allocated from an earlier
 	// pass) is eligible and is released right here, in the same flow.
+	promiseByLine := promiseGroupByLine(o)
 	var released []shared.ReleasedLine
 	if err := o.EnsureReleasable(); err == nil {
 		class := o.FulfillmentClass().String()
@@ -262,10 +296,21 @@ func allocateAndRelease(
 			if err := o.Release(line.LineNo()); err != nil {
 				return outcome, err
 			}
-			released = append(released, shared.ReleasedLine{
+			rl := shared.ReleasedLine{
 				LineNo: line.LineNo(), SKU: line.SKU(), PathID: line.PathID(), GiftWrap: line.GiftWrap(),
 				FulfillmentClass: class,
-			})
+			}
+			if g, ok := promiseByLine[line.LineNo()]; ok {
+				cutoffAt := g.Promise.CutoffAt
+				basis := g.Promise.Basis.String()
+				rl.PromiseCutoffAt = &cutoffAt
+				rl.PromiseBasis = &basis
+				if g.Promise.CptId != "" {
+					cptId := g.Promise.CptId
+					rl.PromiseCptId = &cptId
+				}
+			}
+			released = append(released, rl)
 		}
 	}
 

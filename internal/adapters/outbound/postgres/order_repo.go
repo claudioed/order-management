@@ -67,6 +67,28 @@ func (r *OrderRepo) Save(ctx context.Context, o *order.Order) error {
 		}
 	}
 
+	// order_promise_groups (ADR 0014 §3 / ADR 0017): delete-then-reinsert
+	// this order's full group set on every save, rather than diff/upsert
+	// a breakdown whose shape (how many groups, which lines are in each)
+	// can change entirely between allocation passes as more lines
+	// allocate or a saturated path pushes a line to a different cutoff.
+	if _, err := tx.Exec(ctx, `DELETE FROM order_promise_groups WHERE order_id = $1`, o.ID().String()); err != nil {
+		return err
+	}
+	for i, g := range o.PromiseGroups() {
+		var cptId *string
+		if g.Promise.CptId != "" {
+			id := g.Promise.CptId
+			cptId = &id
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO order_promise_groups (order_id, group_no, line_nos, cpt_id, cutoff_at, basis)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, o.ID().String(), i+1, g.LineNos, cptId, g.Promise.CutoffAt, g.Promise.Basis.String()); err != nil {
+			return err
+		}
+	}
+
 	return tx.Commit(ctx)
 }
 
@@ -126,7 +148,40 @@ func (r *OrderRepo) FindByID(ctx context.Context, id shared.OrderId) (*order.Ord
 		promiseBasis = &b
 	}
 
-	return order.Rehydrate(id, lines, allowPartialShipment, promiseDate, promiseCptId, promiseBasis), nil
+	groupRows, err := r.pool.Query(ctx, `
+		SELECT line_nos, cpt_id, cutoff_at, basis
+		FROM order_promise_groups WHERE order_id = $1 ORDER BY group_no
+	`, id.String())
+	if err != nil {
+		return nil, err
+	}
+	defer groupRows.Close()
+
+	var promiseGroups []order.PromiseGroup
+	for groupRows.Next() {
+		var (
+			lineNos  []int
+			cptId    *string
+			cutoffAt time.Time
+			basisRaw string
+		)
+		if err := groupRows.Scan(&lineNos, &cptId, &cutoffAt, &basisRaw); err != nil {
+			return nil, err
+		}
+		var cptIdStr string
+		if cptId != nil {
+			cptIdStr = *cptId
+		}
+		promiseGroups = append(promiseGroups, order.PromiseGroup{
+			LineNos: lineNos,
+			Promise: order.Promise{CptId: cptIdStr, CutoffAt: cutoffAt, Basis: order.PromiseBasis(basisRaw)},
+		})
+	}
+	if err := groupRows.Err(); err != nil {
+		return nil, err
+	}
+
+	return order.RehydrateWithGroups(id, lines, allowPartialShipment, promiseDate, promiseCptId, promiseBasis, promiseGroups), nil
 }
 
 // NextID mints an order id. The `ord-<uuid>` shape mirrors the
