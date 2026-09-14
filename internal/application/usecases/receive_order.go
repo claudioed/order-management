@@ -98,7 +98,24 @@ type ReceiveOrder struct {
 	// Catalogue's nil case is a read-only membership check with no
 	// mutation to protect, so failing OPEN here just means "not yet
 	// wired", not "silently fabricating a result"). See ADR-0013.
+	//
+	// ADR-0016 (ADR-0014 step B) widens this SAME field's use: it is now
+	// also consulted for shared.DefaultPathId's declared Eligibility, via
+	// order.PathSelectionPolicy.Select's EligibilitySource parameter —
+	// ports.ProcessPathCatalogue already satisfies that narrower
+	// interface by structural typing, so this field needed no shape
+	// change, only a new caller.
 	Catalogue ports.ProcessPathCatalogue
+	// Classification looks up a line's derived product attributes
+	// (hazmat/fragile/etc.) from inventory-storage, ONCE per line at
+	// intake, so PathPolicy can evaluate them against the resolved
+	// path's Eligibility (ADR-0016). A nil Classification means "not
+	// wired": every line is evaluated with no derived attributes beyond
+	// its own GiftWrap flag, exactly PermissiveLookup's own always-
+	// Known=false behaviour — see
+	// internal/adapters/outbound/productclassification's package doc
+	// comment for why this fails open rather than blocking intake.
+	Classification ports.ProductClassificationLookup
 	// Metrics records the business-fact outcome of order intake (accepted
 	// vs. rejected). Optional — a nil Metrics means "not instrumented",
 	// same convention as every other optional port on this use case.
@@ -110,7 +127,12 @@ func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowParti
 	for i, l := range lines {
 		pathID := l.PathID
 		if pathID == "" {
-			pathID = uc.PathPolicy.Select(l.SKU, l.Quantity, l.GiftWrap)
+			resolved, ok := uc.PathPolicy.Select(l.SKU, l.Quantity, l.GiftWrap, uc.productAttributes(ctx, l.SKU), uc.Catalogue)
+			if !ok {
+				uc.recordRejected(ctx)
+				return nil, shared.ErrLineIneligibleForResolvedPath
+			}
+			pathID = resolved
 		}
 		line, err := order.NewOrderLine(i+1, l.SKU, l.Quantity, pathID, l.GiftWrap)
 		if err != nil {
@@ -199,4 +221,24 @@ func (uc *ReceiveOrder) recordRejected(ctx context.Context) {
 	if uc.Metrics != nil {
 		uc.Metrics.OrderRejected(ctx)
 	}
+}
+
+// productAttributes looks up sku's derived product-classification
+// handling tags (e.g. "Hazmat", "Fragile") ONCE, so
+// order.PathSelectionPolicy can evaluate them against a candidate path's
+// declared Eligibility (ADR-0016). A nil Classification port, an
+// unknown/unclassified SKU, or a lookup error are all treated
+// identically — no attributes — matching
+// ports.ProductClassificationLookup's own fail-open contract; this
+// method never returns an error because a classification-lookup problem
+// must never block order intake.
+func (uc *ReceiveOrder) productAttributes(ctx context.Context, sku shared.SKU) []string {
+	if uc.Classification == nil {
+		return nil
+	}
+	view, err := uc.Classification.GetClassification(ctx, sku.String())
+	if err != nil || !view.Known {
+		return nil
+	}
+	return view.HandlingTags
 }

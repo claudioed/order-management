@@ -167,6 +167,61 @@ type CPTScheduleCache interface {
 	NextCutoffs(siteId string, from time.Time, n int) (cutoffs []order.CPTWindow, known bool)
 }
 
+// ProductClassification is this context's own minimal view of a SKU's
+// product classification, as looked up from inventory-storage's
+// GET /products/{sku}/classification (see ProductClassificationLookup).
+// It carries only what order.PathSelectionPolicy's eligibility evaluation
+// needs -- the raw handling tags as free-form strings from the fleet's
+// existing product-classification vocabulary (e.g. "Hazmat", "Fragile",
+// "TemperatureSensitive") -- not inventory-storage's fuller
+// ProductClassification resource (temperatureClass, dotHazardClass are
+// omitted; narrow port, ADR-0013's own stated philosophy). Known
+// distinguishes "SKU has no registered classification, or the lookup is
+// unavailable" (Known=false, both treated identically -- permissive/
+// fail-open, mirroring wes-work-planning's ADR-0009) from "classification
+// confirmed" (Known=true).
+type ProductClassification struct {
+	SKU          string
+	HandlingTags []string
+	Known        bool
+}
+
+// HasTag reports whether tag (e.g. "Hazmat", "Fragile") is present among
+// HandlingTags.
+func (c ProductClassification) HasTag(tag string) bool {
+	for _, t := range c.HandlingTags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// ProductClassificationLookup is the outbound port for the synchronous
+// cross-context read from inventory-storage's product-classification
+// endpoint (GET /products/{sku}/classification), used at intake time so
+// order.PathSelectionPolicy can evaluate a line's derived product
+// attributes (hazmat/fragile/etc.) against a candidate path's declared
+// Eligibility -- see ADR-0016 (ADR-0014 step B). This mirrors
+// wes-work-planning's own ports.ProductClassificationLookup (its
+// ADR-0009) exactly in shape and intent; order-management never imports
+// that service's Go packages (see .claude/rules/bounded-context-boundary.md)
+// -- this is an independently-owned copy of the same pattern, calling the
+// same real inventory-storage endpoint.
+//
+// GetClassification MUST fail open on anything short of a real
+// classification: a 404 (unclassified SKU), a transport error, or any
+// non-2xx/404 status are all Known=false, never an error returned to the
+// caller -- see PermissiveLookup and Client in
+// internal/adapters/outbound/productclassification for the two
+// implementations. This is a soft routing/enrichment input, not a stock
+// reservation, so it follows this fleet's "fail loud for anything that
+// mutates real state, fail quiet/open for a soft enrichment input" rule
+// -- the opposite of InventoryReservationClient above.
+type ProductClassificationLookup interface {
+	GetClassification(ctx context.Context, sku string) (ProductClassification, error)
+}
+
 // PathCapacity is the read-only outbound port for remaining capacity per
 // (path, CPT) bucket. Two implementations exist: UnknownPathCapacity
 // (always known=false, the pre-ADR-0015 default and the dev-mode/

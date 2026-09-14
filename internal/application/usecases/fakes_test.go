@@ -193,15 +193,36 @@ func (c *fakeCatalogue) Eligibility(pathID shared.PathId) (shared.Eligibility, b
 	return e, ok
 }
 
+// fakeClassificationLookup is a scripted ports.ProductClassificationLookup.
+// By default every SKU reports Known=false (unclassified), matching
+// PermissiveLookup's own behaviour -- tests that want a specific line to
+// carry derived attributes populate tags for that SKU.
+type fakeClassificationLookup struct {
+	tags map[shared.SKU][]string
+	err  error
+}
+
+func (f *fakeClassificationLookup) GetClassification(_ context.Context, sku string) (ports.ProductClassification, error) {
+	if f.err != nil {
+		return ports.ProductClassification{}, f.err
+	}
+	tags, ok := f.tags[shared.SKU(sku)]
+	if !ok {
+		return ports.ProductClassification{SKU: sku, Known: false}, nil
+	}
+	return ports.ProductClassification{SKU: sku, HandlingTags: tags, Known: true}, nil
+}
+
 // fixture bundles everything a use-case test needs, wired to in-memory and
 // fake adapters. No test in this package touches a real network or DB.
 type fixture struct {
-	orders    ports.OrderRepo
-	inventory *fakeInventory
-	events    *recordingPublisher
-	clock     *memory.FixedClock
-	promise   order.PromisePolicy
-	catalogue *fakeCatalogue
+	orders         ports.OrderRepo
+	inventory      *fakeInventory
+	events         *recordingPublisher
+	clock          *memory.FixedClock
+	promise        order.PromisePolicy
+	catalogue      *fakeCatalogue
+	classification *fakeClassificationLookup
 }
 
 func now() time.Time {
@@ -222,13 +243,14 @@ func newFixture() *fixture {
 		// every existing test's expectations unchanged. Tests that
 		// specifically exercise PromisePolicy's capability path live
 		// in internal/domain/order, not here.
-		promise:   order.PromisePolicy{Fallback: leadTime},
-		catalogue: &fakeCatalogue{inactive: map[shared.PathId]bool{}},
+		promise:        order.PromisePolicy{Fallback: leadTime},
+		catalogue:      &fakeCatalogue{inactive: map[shared.PathId]bool{}, eligibility: map[shared.PathId]shared.Eligibility{}},
+		classification: &fakeClassificationLookup{tags: map[shared.SKU][]string{}},
 	}
 }
 
 func (f *fixture) receiveOrder() *usecases.ReceiveOrder {
-	return &usecases.ReceiveOrder{Orders: f.orders, Events: f.events, Clock: f.clock, Inventory: f.inventory, Promise: f.promise, Catalogue: f.catalogue}
+	return &usecases.ReceiveOrder{Orders: f.orders, Events: f.events, Clock: f.clock, Inventory: f.inventory, Promise: f.promise, Catalogue: f.catalogue, Classification: f.classification}
 }
 
 func (f *fixture) retryAllocation() *usecases.RetryAllocation {

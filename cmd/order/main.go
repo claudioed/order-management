@@ -27,6 +27,7 @@ import (
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
 	"github.com/claudioed/order-management/internal/adapters/outbound/pathcapacity"
 	"github.com/claudioed/order-management/internal/adapters/outbound/postgres"
+	"github.com/claudioed/order-management/internal/adapters/outbound/productclassification"
 	"github.com/claudioed/order-management/internal/adapters/outbound/telemetry"
 	"github.com/claudioed/order-management/internal/application/ports"
 	"github.com/claudioed/order-management/internal/application/usecases"
@@ -95,6 +96,14 @@ func run() error {
 	defer closeAdapters()
 
 	inventory := buildInventoryClient(getenv("INVENTORY_STORAGE_MODE", "permissive"), os.Getenv("INVENTORY_STORAGE_BASE_URL"), logger)
+
+	// The product-classification lookup (ADR-0016 / ADR-0014 step B)
+	// shares INVENTORY_STORAGE_BASE_URL with the inventory reservation
+	// client above -- both call the SAME downstream service, so there is
+	// deliberately no second base-URL knob for it, only its own
+	// independent PRODUCT_CLASSIFICATION_MODE switch, mirroring
+	// wes-work-planning's exact convention.
+	classification := buildClassificationLookup(getenv("PRODUCT_CLASSIFICATION_MODE", "permissive"), os.Getenv("INVENTORY_STORAGE_BASE_URL"), logger)
 
 	// The process-path catalogue's SOURCE is selectable, defaulting to
 	// "none" (validation skipped -- a nil ports.ProcessPathCatalogue is
@@ -235,7 +244,7 @@ func run() error {
 
 	clock := memory.SystemClock{}
 	server := &inboundhttp.Server{
-		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise, Catalogue: catalogue, Metrics: orderMetrics},
+		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise, Catalogue: catalogue, Classification: classification, Metrics: orderMetrics},
 		RetryAllocation: &usecases.RetryAllocation{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
 		CancelOrder:     &usecases.CancelOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock},
 		GetOrder:        &usecases.GetOrder{Orders: orders},
@@ -369,6 +378,26 @@ func buildInventoryClient(mode, baseURL string, logger *slog.Logger) ports.Inven
 	}
 	logger.Info("inventory-storage client configured", "mode", "http", "base_url", baseURL)
 	return inventorystorage.NewClient(baseURL, nil)
+}
+
+// buildClassificationLookup selects the outbound
+// ports.ProductClassificationLookup adapter via PRODUCT_CLASSIFICATION_MODE
+// (http|permissive), defaulting to "permissive" so existing tests, CI and
+// deployments that do not set the env var are unaffected -- mirroring
+// wes-work-planning's own buildClassificationLookup convention exactly
+// (see ADR-0016 / ADR-0014 step B). Unlike buildInventoryClient's
+// permissive mode (which fails LOUD because reserving real stock must
+// never appear to succeed against a no-op), this permissive mode fails
+// OPEN: a classification lookup is a soft routing/enrichment input, not a
+// mutation of real state.
+func buildClassificationLookup(mode, inventoryStorageBaseURL string, logger *slog.Logger) ports.ProductClassificationLookup {
+	if !strings.EqualFold(mode, "http") {
+		logger.Warn("product classification lookup in permissive (fail-open) mode; path eligibility routing will see no derived product attributes",
+			"hint", "set PRODUCT_CLASSIFICATION_MODE=http and INVENTORY_STORAGE_BASE_URL for a real deployment")
+		return productclassification.NewPermissiveLookup()
+	}
+	logger.Info("product classification lookup configured", "mode", "http", "inventory_storage_base_url", inventoryStorageBaseURL)
+	return productclassification.NewClient(inventoryStorageBaseURL, nil)
 }
 
 // durationEnv reads a Go duration (e.g. "48h", "90m") from key, falling

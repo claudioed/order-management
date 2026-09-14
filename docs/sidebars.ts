@@ -74,6 +74,7 @@ const sidebars: SidebarsConfig = {
         'adr/0013-process-path-selection-as-a-domain-policy',
         'adr/0014-promise-derived-from-fulfillment-capability',
         'adr/0015-wes-work-planning-path-capacity-changed-wired',
+        'adr/0016-eligibility-driven-process-path-selection',
       ],
     },
   ],

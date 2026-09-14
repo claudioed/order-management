@@ -1,4 +1,4 @@
-# Architecture Decision Records (15 total, `docs/docs/adr/`)
+# Architecture Decision Records (16 total, `docs/docs/adr/`)
 
 1. **0001 — Hexagonal (ports & adapters) architecture.** The dependency
    rule this whole repo enforces (`internal/architecture/` fitness test).
@@ -73,6 +73,28 @@
     `PATH_CATALOGUE_SOURCE=none`/dev mode. Read it before touching
     `ports.PathCapacity`, `promise_policy.go`, or adding a fourth Kafka
     consumer.
+16. **0016 — ACCEPTED: eligibility-driven process-path selection (ADR
+    0014 step B, ROUTING ONLY).** `order.PathSelectionPolicy.Select`
+    widened to `(sku, quantity, giftWrap, productAttributes,
+    EligibilitySource) (PathId, bool)` and now actually evaluates
+    `shared.DefaultPathId`'s declared `Eligibility` against the line
+    (`MaxUnitsPerLine`, required/excluded product attributes, gift wrap
+    folded in as the attribute string `"giftWrap"`). New
+    `ports.ProductClassificationLookup` port +
+    `internal/adapters/outbound/productclassification` (HTTP client +
+    fail-open `PermissiveLookup`, `PRODUCT_CLASSIFICATION_MODE=http|
+    permissive`) mirror wes-work-planning's own ADR-0009 pattern exactly
+    — independently written, no cross-service Go import. An ineligible
+    line is rejected with a new `shared.ErrLineIneligibleForResolvedPath`
+    (422) before anything persists. Per-shipment-group promising — ADR
+    0014's OTHER half of "step B" — is explicitly OUT OF SCOPE here and
+    deferred to a future ADR/PR: this phase never touches `Order`'s
+    promise fields, `PromisePolicy`'s single-`Promise`-per-order
+    contract, or `SetPromise`. Honest v1 limitation, documented in the
+    ADR: `ports.ProcessPathCatalogue` has no "list active paths" method,
+    so this policy can only evaluate `shared.DefaultPathId` itself, not
+    choose among multiple real paths — read the ADR before extending
+    `path_selection.go` to a real multi-path decision.
 
 Other ADR-adjacent facts worth knowing without opening every file:
 
