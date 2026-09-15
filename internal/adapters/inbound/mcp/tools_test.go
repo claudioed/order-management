@@ -3,8 +3,11 @@ package mcp
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/claudioed/order-management/internal/adapters/outbound/analyticsstore"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
+	"github.com/claudioed/order-management/internal/analytics/report"
 	"github.com/claudioed/order-management/internal/application/usecases"
 	"github.com/claudioed/order-management/internal/domain/order"
 	"github.com/claudioed/order-management/internal/domain/shared"
@@ -21,7 +24,8 @@ import (
 type harness struct {
 	t *testing.T
 
-	orders *memory.OrderRepo
+	orders  *memory.OrderRepo
+	reports *analyticsstore.MemoryStore
 
 	deps Deps
 }
@@ -29,15 +33,54 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	orders := memory.NewOrderRepo()
+	reports := analyticsstore.NewMemoryStore()
 
 	h := &harness{
-		t:      t,
-		orders: orders,
+		t:       t,
+		orders:  orders,
+		reports: reports,
 	}
 	h.deps = Deps{
-		GetOrder: &usecases.GetOrder{Orders: orders},
+		GetOrder:      &usecases.GetOrder{Orders: orders},
+		PromiseHealth: reportStoreTestAdapter{reports},
 	}
 	return h
+}
+
+// reportStoreTestAdapter adapts a report.ReportStore (the MemoryStore test
+// double) into this package's own PromiseHealthStore port, mirroring
+// cmd/mcp's real reportStoreAdapter -- kept here rather than exported from
+// the production code so tests exercise the SAME translation shape a real
+// deployment uses without the production package depending on
+// internal/analytics/report itself (see PromiseHealthStore's doc comment).
+type reportStoreTestAdapter struct {
+	store *analyticsstore.MemoryStore
+}
+
+func (a reportStoreTestAdapter) QueryPromiseHealth(ctx context.Context, from, to time.Time, pathId string) ([]PromiseHealthRow, error) {
+	rep, err := a.store.Query(ctx, report.ReportQuery{
+		From:        from,
+		To:          to,
+		PathId:      pathId,
+		Granularity: report.GranularityHour,
+	})
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]PromiseHealthRow, 0, len(rep.Rows))
+	for _, row := range rep.Rows {
+		rows = append(rows, PromiseHealthRow{
+			PathID:                    row.Key.PathId,
+			HourBucket:                row.Key.HourBucket,
+			PromiseBasisCapability:    row.PromiseBasisCapability,
+			PromiseBasisLeadTime:      row.PromiseBasisLeadTime,
+			OrdersRepromised:          row.OrdersRepromised,
+			OrdersSplitShipment:       row.OrdersSplitShipment,
+			PromiseToCutoffGapSeconds: row.PromiseToCutoffGapSeconds,
+			PromiseToCutoffGapSamples: row.PromiseToCutoffGapSamples,
+		})
+	}
+	return rows, nil
 }
 
 func (h *harness) ctx() context.Context { return context.Background() }

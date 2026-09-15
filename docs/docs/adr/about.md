@@ -78,6 +78,7 @@ Typos, broken links and formatting are of course fair game.
 | [0016](./0016-eligibility-driven-process-path-selection.md) | Eligibility-driven process-path selection (ADR 0014 step B, routing only) | Accepted |
 | [0017](./0017-per-shipment-group-promising.md) | Per-shipment-group promising (ADR 0014 step B, the second half) | Accepted |
 | [0018](./0018-repromise-order-consumer-and-order-repromised.md) | RepromiseOrder consumer and OrderRepromised — closing ADR 0014's feedback loop | Accepted |
+| [0019](./0019-promise-kpis-on-order-funnel.md) | Promise KPIs on the Order Funnel data product (ADR 0014 §6, order-management half) | Accepted |
 
 Each of these reconstructs a decision that is actually visible in this
 repository's `CLAUDE.md` and code — none is a generic placeholder.

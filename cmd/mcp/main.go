@@ -25,9 +25,11 @@ import (
 	"time"
 
 	inboundmcp "github.com/claudioed/order-management/internal/adapters/inbound/mcp"
+	"github.com/claudioed/order-management/internal/adapters/outbound/analyticsstore"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
 	"github.com/claudioed/order-management/internal/adapters/outbound/postgres"
 	"github.com/claudioed/order-management/internal/adapters/outbound/telemetry"
+	"github.com/claudioed/order-management/internal/analytics/report"
 	"github.com/claudioed/order-management/internal/application/ports"
 	"github.com/claudioed/order-management/internal/application/usecases"
 )
@@ -74,11 +76,23 @@ func run() error {
 	}
 	defer closeAdapters()
 
+	// get_promise_health reads the analytics data product (ADR 0006/0014 §6)
+	// over its own read-only pool, the SAME store the reports REST service
+	// queries -- completely separate from the OLTP DATABASE_URL orders/
+	// GetOrder use above. An unset ANALYTICS_DATABASE_URL falls back to an
+	// empty in-memory store rather than failing the whole MCP server to
+	// start: get_promise_health then simply reports all-zero KPIs, the same
+	// "degrade, don't crash" posture buildAdapters already uses for
+	// DATABASE_URL.
+	promiseHealthStore, closePromiseHealth := buildPromiseHealthStore(context.Background(), logger)
+	defer closePromiseHealth()
+
 	// The MCP adapter reuses the SAME read use case the HTTP adapter uses:
 	// GetOrder, over the same repo. No write use case is wired -- see this
 	// file's own package doc comment.
 	deps := inboundmcp.Deps{
-		GetOrder: &usecases.GetOrder{Orders: orders},
+		GetOrder:      &usecases.GetOrder{Orders: orders},
+		PromiseHealth: promiseHealthStore,
 	}
 	server := inboundmcp.NewServer(deps)
 	handler := inboundmcp.Handler(server)
@@ -124,6 +138,71 @@ func buildAdapters(ctx context.Context, databaseURL, migrationsPath string, logg
 	}
 
 	return postgres.NewOrderRepo(pool), pool.Close, nil
+}
+
+// buildPromiseHealthStore wires get_promise_health's port
+// (inboundmcp.PromiseHealthStore). ANALYTICS_DATABASE_URL set -> a
+// read-only Postgres pool over the SAME analytical database
+// cmd/order-reports reads (ADR-0006); unset -> an empty in-memory
+// report.ReportStore, so the server still starts and the tool simply
+// reports all-zero KPIs rather than the whole MCP server failing to boot
+// over an optional analytics dependency. The returned adapter translates
+// the real report.ReportStore into the MCP package's own
+// PromiseHealthStore/PromiseHealthRow shapes at this wiring boundary — see
+// inboundmcp.PromiseHealthStore's doc comment for why that indirection
+// exists (ADR-0008's MCP adapter dependency fitness rule).
+func buildPromiseHealthStore(ctx context.Context, logger *slog.Logger) (inboundmcp.PromiseHealthStore, func()) {
+	noop := func() {}
+
+	analyticsURL := os.Getenv("ANALYTICS_DATABASE_URL")
+	if analyticsURL == "" {
+		logger.Info("analytics database url not configured; get_promise_health will report empty KPIs")
+		return reportStoreAdapter{analyticsstore.NewMemoryStore()}, noop
+	}
+
+	pool, err := analyticsstore.NewReadOnlyPool(ctx, analyticsURL)
+	if err != nil {
+		logger.Warn("could not open analytics read-only pool; get_promise_health will report empty KPIs", "error", err)
+		return reportStoreAdapter{analyticsstore.NewMemoryStore()}, noop
+	}
+
+	return reportStoreAdapter{analyticsstore.NewPostgresReport(pool)}, pool.Close
+}
+
+// reportStoreAdapter adapts a report.ReportStore into
+// inboundmcp.PromiseHealthStore, translating report.Row into
+// inboundmcp.PromiseHealthRow. This composition root is the one place
+// allowed to depend on BOTH internal/analytics/report and
+// internal/adapters/inbound/mcp, so the translation lives here rather than
+// inside the MCP package itself.
+type reportStoreAdapter struct {
+	store report.ReportStore
+}
+
+func (a reportStoreAdapter) QueryPromiseHealth(ctx context.Context, from, to time.Time, pathId string) ([]inboundmcp.PromiseHealthRow, error) {
+	rep, err := a.store.Query(ctx, report.ReportQuery{
+		From:        from,
+		To:          to,
+		PathId:      pathId,
+		Granularity: report.GranularityHour,
+	})
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]inboundmcp.PromiseHealthRow, 0, len(rep.Rows))
+	for _, row := range rep.Rows {
+		rows = append(rows, inboundmcp.PromiseHealthRow{
+			PathID:                    row.Key.PathId,
+			HourBucket:                row.Key.HourBucket,
+			PromiseBasisCapability:    row.PromiseBasisCapability,
+			PromiseBasisLeadTime:      row.PromiseBasisLeadTime,
+			OrdersRepromised:          row.OrdersRepromised,
+			OrdersSplitShipment:       row.OrdersSplitShipment,
+			PromiseToCutoffGapSeconds: row.PromiseToCutoffGapSeconds,
+			PromiseToCutoffGapSamples: row.PromiseToCutoffGapSamples,
+		})
+	}
+	return rows, nil
 }
 
 // logLevel mirrors cmd/order/main.go's newLogger level parsing, kept local

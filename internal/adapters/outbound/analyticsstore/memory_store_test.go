@@ -23,7 +23,7 @@ func TestMemoryStore_FunnelCountersIdempotent(t *testing.T) {
 		}
 		must(s.ApplyOrderReceived(ctx, "r1", "pick", base))
 		must(s.ApplyLineAllocated(ctx, "la1", "pick", base.Add(time.Minute)))
-		must(s.ApplyOrderAllocated(ctx, "a1", "pick", base.Add(2*time.Minute)))
+		must(s.ApplyOrderAllocated(ctx, "a1", "pick", base.Add(2*time.Minute), "", nil, false))
 		must(s.ApplyLineReleased(ctx, "lr1", "pick", base.Add(3*time.Minute)))
 		must(s.ApplyOrderReleased(ctx, "rel1", "pick", base.Add(4*time.Minute)))
 	}
@@ -141,3 +141,79 @@ var (
 	_ report.ProjectionStore = (*analyticsstore.MemoryStore)(nil)
 	_ report.ReportStore     = (*analyticsstore.MemoryStore)(nil)
 )
+
+// TestMemoryStore_PromiseKPIs covers ADR 0014 §6 / ADR 0019: basis
+// distribution, split-shipment, promise-to-cutoff-gap mean, and the
+// path_id-free re-promise counter.
+func TestMemoryStore_PromiseKPIs(t *testing.T) {
+	base := time.Date(2026, 9, 14, 9, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	s := analyticsstore.NewMemoryStore()
+
+	cutoff1 := base.Add(2 * time.Hour)
+	cutoff2 := base.Add(4 * time.Hour)
+
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+	}
+	// Two Capability-basis allocations with different gaps, one LeadTime
+	// fallback, and one split-shipment order.
+	must(s.ApplyOrderAllocated(ctx, "e1", "pick", base, "Capability", &cutoff1, false))
+	must(s.ApplyOrderAllocated(ctx, "e2", "pick", base, "Capability", &cutoff2, true))
+	must(s.ApplyOrderPartiallyAllocated(ctx, "e3", "pick", base, "LeadTime", nil, false))
+	// Duplicate delivery of e1 must not double-count.
+	must(s.ApplyOrderAllocated(ctx, "e1", "pick", base, "Capability", &cutoff1, false))
+	// Re-promise events, path-free.
+	must(s.ApplyOrderRepromised(ctx, "r1", base))
+	must(s.ApplyOrderRepromised(ctx, "r1", base)) // duplicate, ignored
+	must(s.ApplyOrderRepromised(ctx, "r2", base))
+
+	rep, err := s.Query(ctx, report.ReportQuery{
+		From:        base.Add(-time.Hour),
+		To:          base.Add(time.Hour),
+		Granularity: report.GranularityHour,
+	})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+
+	var pickRow, repromiseRow *report.Row
+	for i := range rep.Rows {
+		switch rep.Rows[i].Key.PathId {
+		case "pick":
+			pickRow = &rep.Rows[i]
+		case "":
+			repromiseRow = &rep.Rows[i]
+		}
+	}
+	if pickRow == nil {
+		t.Fatal("expected a pick row")
+	}
+	if pickRow.PromiseBasisCapability != 2 {
+		t.Errorf("PromiseBasisCapability = %d, want 2", pickRow.PromiseBasisCapability)
+	}
+	if pickRow.PromiseBasisLeadTime != 1 {
+		t.Errorf("PromiseBasisLeadTime = %d, want 1", pickRow.PromiseBasisLeadTime)
+	}
+	if pickRow.OrdersSplitShipment != 1 {
+		t.Errorf("OrdersSplitShipment = %d, want 1", pickRow.OrdersSplitShipment)
+	}
+	// Mean of (2h, 4h) = 3h = 10800s.
+	wantGap := 3 * time.Hour.Seconds()
+	if pickRow.PromiseToCutoffGapSeconds != wantGap {
+		t.Errorf("PromiseToCutoffGapSeconds = %v, want %v", pickRow.PromiseToCutoffGapSeconds, wantGap)
+	}
+	if pickRow.PromiseToCutoffGapSamples != 2 {
+		t.Errorf("PromiseToCutoffGapSamples = %d, want 2", pickRow.PromiseToCutoffGapSamples)
+	}
+
+	if repromiseRow == nil {
+		t.Fatal("expected a path_id=\"\" repromise row")
+	}
+	if repromiseRow.OrdersRepromised != 2 {
+		t.Errorf("OrdersRepromised = %d, want 2 (idempotent)", repromiseRow.OrdersRepromised)
+	}
+}

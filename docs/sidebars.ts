@@ -77,6 +77,7 @@ const sidebars: SidebarsConfig = {
         'adr/0016-eligibility-driven-process-path-selection',
         'adr/0017-per-shipment-group-promising',
         'adr/0018-repromise-order-consumer-and-order-repromised',
+        'adr/0019-promise-kpis-on-order-funnel',
       ],
     },
   ],

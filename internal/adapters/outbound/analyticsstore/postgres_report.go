@@ -28,15 +28,53 @@ func NewPostgresReport(pool *pgxpool.Pool) *PostgresReport {
 
 // Query returns the funnel rows matching q. From is inclusive, To is
 // exclusive; an empty PathId disables that filter.
+//
+// Promise KPIs (ADR 0014 §6 / ADR 0019): the basis-distribution,
+// split-shipment and promise-to-cutoff-gap columns live on funnel_rollup at
+// the SAME (path_id, hour_bucket) grain as the pre-existing counters, so
+// they are simply extra columns in the same SELECT. OrdersRepromised is
+// different: it lives in the separate repromise_rollup table, keyed by
+// hour_bucket ONLY (see that table's own doc comment for why). The query
+// below folds it onto the path_id="" row for each hour — merging into an
+// existing ""-path funnel_rollup row when one exists (e.g. from a
+// best-effort enrichment miss), or synthesizing a repromise-only row when
+// none does — and only when the caller did not filter to a specific real
+// path (a repromise count can never belong to one).
 func (r *PostgresReport) Query(ctx context.Context, q report.ReportQuery) (report.FunnelReport, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT path_id, hour_bucket,
-			orders_received, orders_allocated, orders_partially_allocated,
-			orders_allocation_failed, orders_released, orders_cancelled,
-			lines_allocated, lines_backordered, lines_released
-		 FROM funnel_rollup
-		 WHERE hour_bucket >= $1 AND hour_bucket < $2
-		   AND ($3 = '' OR path_id = $3)
+		`WITH repromise AS (
+			SELECT hour_bucket, orders_repromised
+			FROM repromise_rollup
+			WHERE hour_bucket >= $1 AND hour_bucket < $2
+		 )
+		 SELECT
+			f.path_id, f.hour_bucket,
+			f.orders_received, f.orders_allocated, f.orders_partially_allocated,
+			f.orders_allocation_failed, f.orders_released, f.orders_cancelled,
+			f.lines_allocated, f.lines_backordered, f.lines_released,
+			f.promise_basis_capability, f.promise_basis_lead_time, f.orders_split_shipment,
+			f.promise_to_cutoff_gap_seconds_sum, f.promise_to_cutoff_gap_samples,
+			COALESCE(CASE WHEN f.path_id = '' THEN rep.orders_repromised END, 0) AS orders_repromised
+		 FROM funnel_rollup f
+		 LEFT JOIN repromise rep ON rep.hour_bucket = f.hour_bucket AND f.path_id = ''
+		 WHERE f.hour_bucket >= $1 AND f.hour_bucket < $2
+		   AND ($3 = '' OR f.path_id = $3)
+
+		 UNION ALL
+
+		 SELECT
+			'' AS path_id, rep.hour_bucket,
+			0, 0, 0, 0, 0, 0, 0, 0, 0,
+			0, 0, 0,
+			0, 0,
+			rep.orders_repromised
+		 FROM repromise rep
+		 WHERE $3 = ''
+		   AND NOT EXISTS (
+			SELECT 1 FROM funnel_rollup f2
+			WHERE f2.hour_bucket = rep.hour_bucket AND f2.path_id = ''
+		   )
+
 		 ORDER BY hour_bucket, path_id`,
 		q.From, q.To, q.PathId)
 	if err != nil {
@@ -47,18 +85,27 @@ func (r *PostgresReport) Query(ctx context.Context, q report.ReportQuery) (repor
 	var out report.FunnelReport
 	for rows.Next() {
 		var (
-			row    report.Row
-			bucket time.Time
+			row           report.Row
+			bucket        time.Time
+			gapSecondsSum float64
+			gapSamples    int
 		)
 		if err := rows.Scan(
 			&row.Key.PathId, &bucket,
 			&row.OrdersReceived, &row.OrdersAllocated, &row.OrdersPartiallyAllocated,
 			&row.OrdersAllocationFailed, &row.OrdersReleased, &row.OrdersCancelled,
 			&row.LinesAllocated, &row.LinesBackordered, &row.LinesReleased,
+			&row.PromiseBasisCapability, &row.PromiseBasisLeadTime, &row.OrdersSplitShipment,
+			&gapSecondsSum, &gapSamples,
+			&row.OrdersRepromised,
 		); err != nil {
 			return report.FunnelReport{}, fmt.Errorf("analyticsstore: scan row: %w", err)
 		}
 		row.Key.HourBucket = bucket.UTC()
+		if gapSamples > 0 {
+			row.PromiseToCutoffGapSeconds = gapSecondsSum / float64(gapSamples)
+		}
+		row.PromiseToCutoffGapSamples = gapSamples
 		out.Rows = append(out.Rows, row)
 	}
 	if err := rows.Err(); err != nil {
