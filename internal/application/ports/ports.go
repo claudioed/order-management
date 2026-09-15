@@ -249,3 +249,32 @@ type PathCapacity interface {
 	// and whether that figure is currently known.
 	Remaining(pathId shared.PathId, cptId string, cutoffAt time.Time) (units int, known bool)
 }
+
+// RepromiseProcessedEvents is RepromiseOrder's idempotency gate (ADR
+// 0014 §5 / ADR 0018): it records which Kafka event_ids have already
+// been evaluated, so fulfillment-execution's TaskCPTMissed sweep —
+// which re-fires on EVERY sweep pass for as long as a task stays
+// overdue, by that service's own ADR 0025 design — never re-evaluates
+// the same message twice. This is a NEW, OLTP-side port: the only
+// existing ProcessedEvents-shaped interface in this repo
+// (adapters/inbound/kafka.ProcessedEvents) is declared local to the
+// analytics consumer specifically so the analytics side owns its own
+// port and the OLTP application layer stays untouched — see that
+// file's doc comment. RepromiseOrder is OLTP-side (it mutates the real
+// Order aggregate and publishes a real integration event), so it gets
+// its own, distinctly-named port rather than reusing that one.
+//
+// The idempotency key is the Kafka message's event_id alone, not a
+// composite (orderId, event_id) key. ADR 0014 §5 states the requirement
+// as "idempotent on (orderId, sourceEventId)", but event_id is already
+// globally unique per message (every publisher in this fleet mints it
+// with uuid.NewString()), so scoping the check by orderId too is
+// redundant — two different orders can never coincidentally share the
+// same event_id, and the SAME event_id always refers to the SAME
+// order. This simplification is documented explicitly, not silently
+// substituted — see the RepromiseOrder ADR.
+type RepromiseProcessedEvents interface {
+	// MarkProcessed records eventId if absent, returning true iff this
+	// call newly recorded it.
+	MarkProcessed(ctx context.Context, eventId string) (bool, error)
+}

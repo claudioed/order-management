@@ -76,6 +76,7 @@ const sidebars: SidebarsConfig = {
         'adr/0015-wes-work-planning-path-capacity-changed-wired',
         'adr/0016-eligibility-driven-process-path-selection',
         'adr/0017-per-shipment-group-promising',
+        'adr/0018-repromise-order-consumer-and-order-repromised',
       ],
     },
   ],

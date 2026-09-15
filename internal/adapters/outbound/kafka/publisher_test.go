@@ -188,6 +188,77 @@ func TestPublisher_IgnoresOtherDomainEvents(t *testing.T) {
 	}
 }
 
+type repromisedData struct {
+	OrderID  string `json:"order_id"`
+	CptIdOld string `json:"cpt_id_old,omitempty"`
+	CptIdNew string `json:"cpt_id_new,omitempty"`
+	Reason   string `json:"reason"`
+}
+
+// TestPublisher_OrderRepromised_EnvelopeShape covers ADR 0014 §5 / ADR
+// 0018's new integration event: the fleet's "your delivery is delayed"
+// trigger.
+func TestPublisher_OrderRepromised_EnvelopeShape(t *testing.T) {
+	writer := &fakeWriter{}
+	pub := kafka.NewPublisher(writer)
+
+	occurredAt := time.Date(2026, 9, 14, 9, 0, 0, 0, time.UTC)
+	event := shared.NewOrderRepromised(occurredAt, "ord-42", "sp1-1200", "sp1-1800", "TaskCPTMissed")
+
+	if err := pub.Publish(context.Background(), event); err != nil {
+		t.Fatalf("Publish returned error: %v", err)
+	}
+	if len(writer.messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(writer.messages))
+	}
+
+	var env envelope
+	if err := json.Unmarshal(writer.messages[0].Value, &env); err != nil {
+		t.Fatalf("failed to unmarshal envelope: %v", err)
+	}
+	if env.EventType != "OrderRepromised" {
+		t.Errorf("EventType = %q, want OrderRepromised", env.EventType)
+	}
+	if env.Source != kafka.Source {
+		t.Errorf("Source = %q, want %q", env.Source, kafka.Source)
+	}
+
+	var data repromisedData
+	if err := json.Unmarshal(env.Data, &data); err != nil {
+		t.Fatalf("failed to unmarshal data: %v", err)
+	}
+	if data.OrderID != "ord-42" || data.CptIdOld != "sp1-1200" || data.CptIdNew != "sp1-1800" || data.Reason != "TaskCPTMissed" {
+		t.Errorf("data = %+v, want {ord-42 sp1-1200 sp1-1800 TaskCPTMissed}", data)
+	}
+}
+
+// TestPublisher_OrderRepromised_EmptyCptIdsOmitted covers a LeadTime-basis
+// re-promise: neither cpt_id_old nor cpt_id_new should appear on the wire
+// at all (omitempty), not present-and-empty.
+func TestPublisher_OrderRepromised_EmptyCptIdsOmitted(t *testing.T) {
+	writer := &fakeWriter{}
+	pub := kafka.NewPublisher(writer)
+
+	event := shared.NewOrderRepromised(time.Now(), "ord-1", "", "", "PackageManifested")
+	if err := pub.Publish(context.Background(), event); err != nil {
+		t.Fatalf("Publish returned error: %v", err)
+	}
+
+	var env envelope
+	if err := json.Unmarshal(writer.messages[0].Value, &env); err != nil {
+		t.Fatalf("failed to unmarshal envelope: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(env.Data, &raw); err != nil {
+		t.Fatalf("failed to unmarshal raw data: %v", err)
+	}
+	for _, key := range []string{"cpt_id_old", "cpt_id_new"} {
+		if _, present := raw[key]; present {
+			t.Errorf("raw data has key %q, want it entirely absent (omitempty) for a LeadTime-basis promise", key)
+		}
+	}
+}
+
 // TestPublisher_InjectsTraceContextIntoHeaders proves the published message
 // carries the W3C traceparent for the publish span, which is what lets
 // wes-work-planning's consumer parent its span onto this one. It also pins

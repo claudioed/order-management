@@ -66,13 +66,26 @@ Fleet envelope, NOT CloudEvents. Two envelope variants:
 - **Analytics envelope** on `warehouse.order-management.analytics`: adds
   `schema_version: 1`, keyed by `OrderId`.
 
-### Channel: `warehouse.order-management.events` (integration, frozen)
+### Channel: `warehouse.order-management.events` (integration)
 
 - `subscribe` operationId `consumeOrderManagementEvents`.
-- Only `OrderAllocated` / `OrderPartiallyAllocated` messages. `data.lines[]`
-  entry shape is shared verbatim with `wes-work-planning`'s consumer and
-  MUST NOT change without coordinating both sides.
-  `fulfillment_class` is additive (ADR-0008).
+- `OrderAllocated` / `OrderPartiallyAllocated` messages (frozen —
+  `data.lines[]` entry shape is shared verbatim with
+  `wes-work-planning`'s consumer and MUST NOT change without
+  coordinating both sides; `fulfillment_class` is additive, ADR-0008)
+  plus — since ADR-0018 — `OrderRepromised`, the fleet's "your delivery
+  is delayed" trigger, raised by the new `RepromiseOrder` use case.
+
+### Channel: `warehouse.fulfillment.events` (inbound, ADR-0018)
+
+- `subscribe` operationId `consumeFulfillmentEvents`. fulfillment-
+  execution's shared/fan-out topic (the SAME one `labor-performance`
+  already consumes for `TaskCompleted`); this context reacts ONLY to
+  `TaskCPTMissed` and `PackageManifested`, decoding its own independent
+  copy of that service's real wire shape — never a Go import.
+  `data.order_ref` on both is a `WorkUnitId`-shaped reference
+  (`{orderId}-line-{lineNo}`), NOT a bare `OrderId` — parsed back via
+  `usecases.ParseWorkUnitID`, the reverse of `WorkUnitID` below.
 
 ### Channel: `warehouse.order-management.analytics`
 
