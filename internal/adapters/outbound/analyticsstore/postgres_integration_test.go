@@ -59,7 +59,7 @@ func TestPostgresProjectionAndReport_RoundTrip(t *testing.T) {
 	// idempotent.
 	apply := func() {
 		must(proj.ApplyOrderReceived(ctx, "int-received", path, base))
-		must(proj.ApplyOrderAllocated(ctx, "int-allocated", path, base.Add(time.Minute)))
+		must(proj.ApplyOrderAllocated(ctx, "int-allocated", path, base.Add(time.Minute), "", nil, false))
 		must(proj.ApplyOrderReleased(ctx, "int-released", path, base.Add(2*time.Minute)))
 	}
 	apply()
@@ -145,5 +145,110 @@ func TestFreshnessLag_EmptyStore(t *testing.T) {
 	}
 	if lag != 0 {
 		t.Fatalf("empty-store lag = %v, want 0", lag)
+	}
+}
+
+// TestPostgresProjectionAndReport_PromiseKPIs proves ADR 0014 §6 / ADR
+// 0019's new columns/rollup round-trip for real against a live Postgres:
+// promise basis distribution, split-shipment, promise-to-cutoff-gap mean
+// (sum+count divided in the reader), and the path_id-free re-promise
+// counter merged in from the separate repromise_rollup table.
+func TestPostgresProjectionAndReport_PromiseKPIs(t *testing.T) {
+	url := requireAnalyticsURL(t)
+	migrateAnalytics(t, url)
+
+	pool, err := analyticsstore.NewPool(context.Background(), url)
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	ctx := context.Background()
+	base := time.Now().UTC().Truncate(time.Hour)
+	path := "pick-promise-int-" + time.Now().Format("150405.000000000")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM funnel_rollup WHERE path_id = $1`, path)
+		_, _ = pool.Exec(ctx, `DELETE FROM repromise_rollup WHERE hour_bucket = $1`, base)
+	})
+
+	proj := analyticsstore.NewPostgresProjection(pool)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+	}
+
+	cutoff1 := base.Add(2 * time.Hour)
+	cutoff2 := base.Add(4 * time.Hour)
+
+	apply := func() {
+		must(proj.ApplyOrderAllocated(ctx, "pk-alloc-1", path, base, "Capability", &cutoff1, false))
+		must(proj.ApplyOrderAllocated(ctx, "pk-alloc-2", path, base, "Capability", &cutoff2, true))
+		must(proj.ApplyOrderPartiallyAllocated(ctx, "pk-partial-1", path, base, "LeadTime", nil, false))
+		must(proj.ApplyOrderRepromised(ctx, "pk-repromise-1", base))
+	}
+	// Apply twice with the SAME event ids: idempotent.
+	apply()
+	apply()
+
+	rdr := analyticsstore.NewPostgresReport(pool)
+	rep, err := rdr.Query(ctx, report.ReportQuery{
+		From:        base.Add(-time.Hour),
+		To:          base.Add(time.Hour),
+		PathId:      path,
+		Granularity: report.GranularityHour,
+	})
+	if err != nil {
+		t.Fatalf("Query (path-filtered): %v", err)
+	}
+	if len(rep.Rows) != 1 {
+		t.Fatalf("path-filtered rows = %d, want 1", len(rep.Rows))
+	}
+	row := rep.Rows[0]
+	if row.PromiseBasisCapability != 2 {
+		t.Errorf("PromiseBasisCapability = %d, want 2", row.PromiseBasisCapability)
+	}
+	if row.PromiseBasisLeadTime != 1 {
+		t.Errorf("PromiseBasisLeadTime = %d, want 1", row.PromiseBasisLeadTime)
+	}
+	if row.OrdersSplitShipment != 1 {
+		t.Errorf("OrdersSplitShipment = %d, want 1", row.OrdersSplitShipment)
+	}
+	wantGap := 3 * time.Hour.Seconds() // mean of (2h, 4h)
+	if row.PromiseToCutoffGapSeconds != wantGap {
+		t.Errorf("PromiseToCutoffGapSeconds = %v, want %v", row.PromiseToCutoffGapSeconds, wantGap)
+	}
+	if row.PromiseToCutoffGapSamples != 2 {
+		t.Errorf("PromiseToCutoffGapSamples = %d, want 2", row.PromiseToCutoffGapSamples)
+	}
+	// Path-filtered query must never surface the repromise counter — it
+	// lives on the path_id="" row only.
+	if row.OrdersRepromised != 0 {
+		t.Errorf("path-filtered OrdersRepromised = %d, want 0", row.OrdersRepromised)
+	}
+
+	// Unfiltered query must surface a path_id="" row carrying the
+	// idempotent re-promise count.
+	repAll, err := rdr.Query(ctx, report.ReportQuery{
+		From:        base.Add(-time.Hour),
+		To:          base.Add(time.Hour),
+		Granularity: report.GranularityHour,
+	})
+	if err != nil {
+		t.Fatalf("Query (unfiltered): %v", err)
+	}
+	var repromiseRow *report.Row
+	for i := range repAll.Rows {
+		if repAll.Rows[i].Key.PathId == "" && repAll.Rows[i].Key.HourBucket.Equal(base) {
+			repromiseRow = &repAll.Rows[i]
+			break
+		}
+	}
+	if repromiseRow == nil {
+		t.Fatal("expected a path_id=\"\" row carrying the repromise counter")
+	}
+	if repromiseRow.OrdersRepromised != 1 {
+		t.Errorf("OrdersRepromised = %d, want 1 (idempotent)", repromiseRow.OrdersRepromised)
 	}
 }

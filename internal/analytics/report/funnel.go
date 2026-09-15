@@ -62,6 +62,66 @@ type Row struct {
 	LinesBackordered int
 	// LinesReleased is the number of OrderLineReleased events in this bucket.
 	LinesReleased int
+
+	// --- promise KPI counters (ADR 0014 §6 / ADR 0019) --------------------
+	//
+	// These are populated from the promise fields ADR 0014 added to
+	// OrderAllocated/OrderPartiallyAllocated (promise_basis,
+	// promise_cutoff_at, split_shipment) and from the new OrderRepromised
+	// analytics fact (ADR 0018/0019). They share this row's (path_id,
+	// hour_bucket) grain except OrdersRepromised — see its own comment.
+
+	// PromiseBasisCapability is the number of OrderAllocated/
+	// OrderPartiallyAllocated events in this bucket whose promise basis was
+	// "Capability" (a real CPT window derived from fulfillment capability —
+	// order.BasisCapability).
+	PromiseBasisCapability int
+	// PromiseBasisLeadTime is the same count for basis "LeadTime" (the
+	// tagged fallback — order.BasisLeadTime). Together with
+	// PromiseBasisCapability these two counters ARE the promise basis
+	// distribution ADR 0014 §6 asks for; a caller computes the split as a
+	// percentage itself, mirroring this read model's existing convention of
+	// exposing raw counts rather than precomputed rates.
+	PromiseBasisLeadTime int
+	// OrdersRepromised is the number of OrderRepromised events in this
+	// bucket. UNLIKE every other counter on this row, it carries NO path_id
+	// dimension: OrderRepromised (ADR 0018) does not carry a process path,
+	// and this data product deliberately does not add an OrderRepo lookup
+	// to resolve one (see ADR 0019's documented choice). Every
+	// OrderRepromised event therefore lands on the row whose Key.PathId is
+	// the empty string "" — the same "path unknown/inapplicable" sentinel
+	// this read model already uses when an order lookup misses (see the
+	// analytics publisher's best-effort enrichment). A caller wanting the
+	// fleet-wide re-promise count for an hour should read the ""-path row;
+	// filtering ReportQuery.PathId to a real path will never surface it.
+	OrdersRepromised int
+	// OrdersSplitShipment is the number of OrderAllocated/
+	// OrderPartiallyAllocated events in this bucket whose order had more
+	// than one order.PromiseGroup at allocation time (ADR 0014 §3 / ADR
+	// 0017) — i.e. lines were promised to different cutoffs. This IS
+	// path_id-dimensioned like the funnel counters above (unlike
+	// OrdersRepromised) because the triggering event already carries a
+	// path.
+	OrdersSplitShipment int
+	// PromiseToCutoffGapSeconds is the MEAN of (cutoffAt - allocatedAt), in
+	// seconds, across every OrderAllocated/OrderPartiallyAllocated event in
+	// this bucket that carried a Capability-basis promise with a real
+	// cutoffAt. It is zero when no such event landed in this bucket —
+	// mirroring fulfillment-execution's own AvgClaimToCompleteSeconds
+	// "zero when no completion had a claim" convention. LeadTime-basis
+	// promises are excluded: their "cutoff" is just now-plus-a-configured-
+	// duration, so the gap would trivially reproduce the configured lead
+	// time rather than measure anything about real fulfillment capability.
+	PromiseToCutoffGapSeconds float64
+	// PromiseToCutoffGapSamples is how many events contributed to
+	// PromiseToCutoffGapSeconds's mean for this bucket. Exposed
+	// specifically so a caller aggregating PromiseToCutoffGapSeconds
+	// across MULTIPLE rows (e.g. get_promise_health summarising a
+	// multi-hour/multi-path window) can compute a correctly WEIGHTED
+	// mean — averaging several rows' already-computed means unweighted
+	// would silently under- or over-count buckets with different sample
+	// volumes.
+	PromiseToCutoffGapSamples int
 }
 
 // FunnelReport is the full result of a report query: the matching rows.

@@ -1,4 +1,4 @@
-# Architecture Decision Records (18 total, `docs/docs/adr/`)
+# Architecture Decision Records (19 total, `docs/docs/adr/`)
 
 1. **0001 — Hexagonal (ports & adapters) architecture.** The dependency
    rule this whole repo enforces (`internal/architecture/` fitness test).
@@ -139,6 +139,31 @@
     key. No new promise-computation logic anywhere — read the ADR before
     touching `repromise_order.go`, `repromise_consumer.go`, or
     `ParseWorkUnitID`.
+19. **0019 — ACCEPTED: promise KPIs on the Order Funnel data product,
+    closing ADR 0014 §6 (order-management half).** Widens ADR 0006's
+    report.Row with `PromiseBasisCapability`/`PromiseBasisLeadTime`
+    (basis distribution), `OrdersRepromised` (NEW `repromise_rollup`
+    table, hour-only grain — deliberately not path-dimensioned, since
+    `OrderRepromised` carries no path), `OrdersSplitShipment`
+    (`len(o.PromiseGroups()) > 1` at allocation time), and
+    `PromiseToCutoffGapSeconds`/`PromiseToCutoffGapSamples` (sum+count
+    mean, fulfillment-execution's `throughput_rollup` pattern).
+    `ApplyOrderAllocated`/`ApplyOrderPartiallyAllocated` widened IN
+    PLACE (new `basis`/`cutoffAt`/`splitShipment` params) rather than a
+    second Apply* method, so the promise facts share the SAME eventId
+    claim as the funnel counter. `AnalyticsPublisher.marshalData` gains
+    the previously-missing `OrderRepromised` case plus
+    `promise_basis`/`promise_cutoff_at`/`split_shipment` enrichment on
+    `OrderAllocated`/`OrderPartiallyAllocated`. New MCP tool
+    `get_promise_health` (`internal/adapters/inbound/mcp/
+    promise_health.go`) — declares its OWN `PromiseHealthStore` port
+    (never imports `internal/analytics/report` directly, per
+    `TestMCPAdapterDependencyRule`/ADR-0008); `cmd/mcp` adapts the real
+    `report.ReportStore` into it. On-time-to-CPT is explicitly OUT OF
+    SCOPE here — fulfillment-execution's own companion analytics, a
+    separate repo/PR. Read the ADR before touching `funnel.go`,
+    `ports.go`, `postgres_projection.go`, the analytics Kafka
+    consumer/publisher, or `promise_health.go`.
 
 Other ADR-adjacent facts worth knowing without opening every file:
 

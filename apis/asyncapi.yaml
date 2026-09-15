@@ -151,8 +151,12 @@ channels:
         order-management publishes each domain event (enriched with its
         process path via an OrderRepo lookup) as an analytics envelope with
         schema_version 1. Unrecognised event types are skipped by the
-        publisher, so this channel only ever carries the nine types listed
-        under subscribe below.
+        publisher, so this channel only ever carries the ten types listed
+        under subscribe below. Since ADR 0019, OrderAllocated/
+        OrderPartiallyAllocated additionally carry promise_basis/
+        promise_cutoff_at/split_shipment (ADR 0014 §6's promise KPIs), and
+        OrderRepromised (ADR 0018) is published here too, deliberately
+        WITHOUT a path_id — see OrderRepromisedAnalytics below.
       tags:
         - name: order-management
         - name: analytics
@@ -164,7 +168,9 @@ channels:
         ONLY writer of the analytical Postgres. It is idempotent on
         event_id; a redelivery is always a no-op. The report keyed per
         path x hour (Order Funnel & Allocation Health) reads what this
-        projection writes.
+        projection writes; since ADR 0019 it also derives promise basis
+        distribution, re-promise rate, split-shipment rate, and
+        promise-to-cutoff gap from this same stream.
       tags:
         - name: analytics
       message:
@@ -178,6 +184,7 @@ channels:
           - $ref: "#/components/messages/OrderLineReleasedAnalytics"
           - $ref: "#/components/messages/OrderReleasedAnalytics"
           - $ref: "#/components/messages/OrderCancelledAnalytics"
+          - $ref: "#/components/messages/OrderRepromisedAnalytics"
 
 components:
   messages:
@@ -568,6 +575,46 @@ components:
               path_id: pick
               revoked_reservations: 1
 
+    OrderRepromisedAnalytics:
+      name: OrderRepromised
+      title: Order Repromised (analytics)
+      summary: >-
+        The promise for a shipment group moved — the re-promise-rate KPI's
+        source fact (ADR 0014 §6 / ADR 0019).
+      description: >-
+        Published on the analytics topic since ADR 0019, closing a gap
+        left when ADR 0018 shipped the RepromiseOrder consumer: this
+        event was raised on the integration topic
+        (warehouse.order-management.events) but never reached the
+        analytics publisher's marshalData switch. Deliberately carries
+        NO path_id, unlike every other analytics message on this
+        channel — OrderRepromised itself has no process-path dimension
+        in its domain event, and this data product tracks the
+        re-promise-rate KPI fleet-wide rather than adding an OrderRepo
+        lookup for a dimension nothing asked for (see ADR 0019's
+        Decision §2 for the full reasoning). cpt_id_old/cpt_id_new are
+        both omitempty for a LeadTime-basis promise on that side, same
+        as the integration-topic message.
+      tags:
+        - name: order
+        - name: analytics
+      payload:
+        $ref: "#/components/schemas/OrderRepromisedAnalyticsEvent"
+      examples:
+        - name: orderRepromisedAnalytics
+          summary: A missed CPT pushed the promise to a later cutoff.
+          payload:
+            event_id: 4b5c6d7e-8f9a-4b0c-1d2e-3f4a5b6c7d8e
+            event_type: OrderRepromised
+            occurred_at: "2026-09-14T12:00:00Z"
+            source: order-management
+            schema_version: 1
+            data:
+              order_id: ord-7c9e6679-7d5a-4b37-b2f1-93b0c4a1d8f2
+              cpt_id_old: sp1-1200
+              cpt_id_new: sp1-1800
+              reason: TaskCPTMissed
+
   schemas:
     IntegrationEnvelope:
       type: object
@@ -831,6 +878,33 @@ components:
               properties:
                 order_id: { type: string }
                 path_id: { type: string }
+                promise_basis:
+                  type: string
+                  enum: [Capability, LeadTime]
+                  description: >-
+                    ADR 0014 §6 / ADR 0019's additive promise-basis-
+                    distribution field, mirrored from the OrderAllocated
+                    domain event's own promise_basis. Absent on events
+                    published before this ADR, or when the underlying
+                    promise had no basis recorded.
+                promise_cutoff_at:
+                  type: string
+                  format: date-time
+                  description: >-
+                    ADR 0014 §6 / ADR 0019's additive promise-to-cutoff-gap
+                    source field: the promise's cutoff instant. Present
+                    ONLY when promise_basis is "Capability" — a
+                    LeadTime-basis promise's "cutoff" is just
+                    now-plus-a-configured-duration, not a real departure,
+                    and is deliberately excluded from the gap KPI.
+                split_shipment:
+                  type: boolean
+                  description: >-
+                    ADR 0014 §6 / ADR 0019's additive split-shipment-rate
+                    source field: true when the order had more than one
+                    order.PromiseGroup at allocation time (ADR 0014 §3 /
+                    ADR 0017), derived via an OrderRepo lookup at publish
+                    time.
 
     OrderLineAnalyticsEvent:
       allOf:
@@ -878,6 +952,17 @@ components:
                 path_id: { type: string }
                 allocated_lines: { type: integer, minimum: 0 }
                 backordered_lines: { type: integer, minimum: 0 }
+                promise_basis:
+                  type: string
+                  enum: [Capability, LeadTime]
+                  description: Same ADR 0014 §6 / ADR 0019 field as OrderAnalyticsEvent's.
+                promise_cutoff_at:
+                  type: string
+                  format: date-time
+                  description: Same ADR 0014 §6 / ADR 0019 field as OrderAnalyticsEvent's.
+                split_shipment:
+                  type: boolean
+                  description: Same ADR 0014 §6 / ADR 0019 field as OrderAnalyticsEvent's.
 
     OrderAllocationPartiallyFailedAnalyticsEvent:
       allOf:
@@ -907,3 +992,30 @@ components:
                 order_id: { type: string }
                 path_id: { type: string }
                 revoked_reservations: { type: integer, minimum: 0 }
+
+    OrderRepromisedAnalyticsEvent:
+      allOf:
+        - $ref: "#/components/schemas/AnalyticsEnvelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              description: >-
+                Deliberately has NO path_id property, unlike every other
+                analytics event's data object on this channel — see
+                OrderRepromisedAnalytics' own description for why (ADR
+                0014 §6 / ADR 0019).
+              additionalProperties: false
+              required: [order_id, reason]
+              properties:
+                order_id: { type: string }
+                cpt_id_old:
+                  type: string
+                  description: The CPT identity the affected group targeted BEFORE the recompute. Absent for a LeadTime-basis previous promise.
+                cpt_id_new:
+                  type: string
+                  description: The CPT identity the affected group targets AFTER the recompute. Absent for a LeadTime-basis new promise.
+                reason:
+                  type: string
+                  enum: [TaskCPTMissed, PackageManifested]
+                  description: The fulfillment-execution event_type that triggered this recompute, verbatim.

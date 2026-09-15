@@ -17,8 +17,8 @@ import (
 const tracerName = "github.com/claudioed/order-management/internal/adapters/inbound/mcp"
 
 // Deps is everything the MCP tools need, injected by the composition root.
-// It carries the SAME read use case the HTTP adapter uses; the adapter
-// never constructs an outbound adapter itself.
+// It carries the SAME read use case the HTTP adapter uses for get_order;
+// the adapter never constructs an outbound adapter itself.
 //
 // order-management exposes no write use case over MCP: CancelOrder,
 // ReceiveOrder, Allocate and RetryAllocate are all order-lifecycle
@@ -30,6 +30,13 @@ type Deps struct {
 	// GetOrder is the existing read use case behind get_order, reused
 	// unchanged.
 	GetOrder *usecases.GetOrder
+
+	// PromiseHealth backs get_promise_health (ADR 0014 §6 / ADR 0019): a
+	// port THIS package declares (promise_health.go's PromiseHealthStore),
+	// not internal/analytics/report.ReportStore directly -- see that
+	// interface's doc comment for why (ADR-0008's MCP adapter dependency
+	// fitness rule). cmd/mcp adapts the real analytics store into it.
+	PromiseHealth PromiseHealthStore
 }
 
 // --- get_order ------------------------------------------------------------
@@ -56,7 +63,7 @@ func (d Deps) getOrder(ctx context.Context, in getOrderInput) (orderDTO, error) 
 // runs inside an OTel span named "mcp.tool <name>".
 //
 // order-management exposes no write use case over MCP (see Deps' own doc
-// comment): the one registered tool is a read tool.
+// comment): both registered tools are read tools.
 func (d Deps) registerTools(server *mcp.Server) {
 	readOnly := true
 
@@ -65,6 +72,12 @@ func (d Deps) registerTools(server *mcp.Server) {
 		Description: "Return one order's current state by id: status, allow-partial-shipment flag, promise date, and every line's SKU/quantity/process-path/gift-wrap/status/reservation-id. Use it to answer 'what is the state of this order' questions -- allocation, backorder, release, or cancellation progress.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: readOnly},
 	}, d.getOrder)
+
+	addTool(server, &mcp.Tool{
+		Name:        "get_promise_health",
+		Description: "Return promise-health KPIs for a time window (and optional process-path filter) from the Order Funnel & Allocation Health data product: promise basis distribution (how many promises were a real capability-derived CPT window vs. the LeadTimePolicy fallback), re-promise rate (orders whose promise moved after a missed CPT or SLAM pass -- fleet-wide, not path-scoped), split-shipment rate (orders whose lines were promised to more than one cutoff), and the mean promise-to-cutoff gap in seconds (how far in advance of the departure the promise was made). Does NOT include on-time-to-CPT -- that KPI is measured in fulfillment-execution's own analytics, where the evidence (cpt vs manifested_at) actually lives.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: readOnly},
+	}, d.getPromiseHealth)
 }
 
 // addTool registers one tool. It centralises the cross-cutting concern
