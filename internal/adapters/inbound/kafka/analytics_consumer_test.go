@@ -12,10 +12,13 @@ import (
 
 // projCall captures one projection-store method invocation.
 type projCall struct {
-	method  string
-	eventID string
-	pathID  string
-	at      time.Time
+	method        string
+	eventID       string
+	pathID        string
+	at            time.Time
+	promiseBasis  string
+	cutoffAt      *time.Time
+	splitShipment bool
 }
 
 // fakeProjection records the calls the consumer makes so a test can assert the
@@ -26,18 +29,26 @@ type fakeProjection struct {
 }
 
 func (f *fakeProjection) record(method, eventID, pathID string, at time.Time) error {
-	f.calls = append(f.calls, projCall{method, eventID, pathID, at})
+	f.calls = append(f.calls, projCall{method: method, eventID: eventID, pathID: pathID, at: at})
+	return nil
+}
+
+func (f *fakeProjection) recordPromise(method, eventID, pathID string, at time.Time, basis string, cutoffAt *time.Time, splitShipment bool) error {
+	f.calls = append(f.calls, projCall{
+		method: method, eventID: eventID, pathID: pathID, at: at,
+		promiseBasis: basis, cutoffAt: cutoffAt, splitShipment: splitShipment,
+	})
 	return nil
 }
 
 func (f *fakeProjection) ApplyOrderReceived(_ context.Context, e, p string, at time.Time) error {
 	return f.record("received", e, p, at)
 }
-func (f *fakeProjection) ApplyOrderAllocated(_ context.Context, e, p string, at time.Time) error {
-	return f.record("allocated", e, p, at)
+func (f *fakeProjection) ApplyOrderAllocated(_ context.Context, e, p string, at time.Time, basis string, cutoffAt *time.Time, split bool) error {
+	return f.recordPromise("allocated", e, p, at, basis, cutoffAt, split)
 }
-func (f *fakeProjection) ApplyOrderPartiallyAllocated(_ context.Context, e, p string, at time.Time) error {
-	return f.record("partially", e, p, at)
+func (f *fakeProjection) ApplyOrderPartiallyAllocated(_ context.Context, e, p string, at time.Time, basis string, cutoffAt *time.Time, split bool) error {
+	return f.recordPromise("partially", e, p, at, basis, cutoffAt, split)
 }
 func (f *fakeProjection) ApplyOrderAllocationFailed(_ context.Context, e, p string, at time.Time) error {
 	return f.record("failed", e, p, at)
@@ -56,6 +67,9 @@ func (f *fakeProjection) ApplyLineBackordered(_ context.Context, e, p string, at
 }
 func (f *fakeProjection) ApplyLineReleased(_ context.Context, e, p string, at time.Time) error {
 	return f.record("line-released", e, p, at)
+}
+func (f *fakeProjection) ApplyOrderRepromised(_ context.Context, e string, at time.Time) error {
+	return f.record("repromised", e, "", at)
 }
 
 // fakeProcessed is an in-memory ProcessedEvents.
@@ -173,5 +187,66 @@ func TestAnalyticsConsumer_IgnoresUnknownEventType(t *testing.T) {
 	// later contract change could reprocess it.
 	if processed.seen["e1"] {
 		t.Error("non-projecting event should not be marked processed")
+	}
+}
+
+// TestAnalyticsConsumer_RoutesOrderRepromised covers ADR 0018/0019's
+// path_id-free counter: OrderRepromised has no path_id in its payload, and
+// the consumer must still route it to ApplyOrderRepromised (not silently
+// drop it as unknown).
+func TestAnalyticsConsumer_RoutesOrderRepromised(t *testing.T) {
+	at := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	proj := &fakeProjection{}
+	processed := newFakeProcessed()
+	c := &inboundkafka.AnalyticsConsumer{Projection: proj, Processed: processed, Logger: slog.Default()}
+
+	raw := analyticsEnvelope(t, "e-repromised", "OrderRepromised", at, map[string]any{
+		"order_id": "o1", "cpt_id_old": "sp1-1200", "cpt_id_new": "sp1-1800", "reason": "TaskCPTMissed",
+	})
+	if err := c.HandleMessage(context.Background(), raw); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if len(proj.calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(proj.calls))
+	}
+	got := proj.calls[0]
+	if got.method != "repromised" {
+		t.Errorf("method = %q, want repromised", got.method)
+	}
+	if !got.at.Equal(at) {
+		t.Errorf("at = %v, want %v", got.at, at)
+	}
+}
+
+// TestAnalyticsConsumer_RoutesPromiseKPIFields covers ADR 0014 §6:
+// OrderAllocated's promise_basis/promise_cutoff_at/split_shipment fields
+// must reach ApplyOrderAllocated alongside the funnel counter.
+func TestAnalyticsConsumer_RoutesPromiseKPIFields(t *testing.T) {
+	at := time.Date(2026, 5, 1, 8, 0, 0, 0, time.UTC)
+	cutoff := at.Add(6 * time.Hour)
+	proj := &fakeProjection{}
+	processed := newFakeProcessed()
+	c := &inboundkafka.AnalyticsConsumer{Projection: proj, Processed: processed, Logger: slog.Default()}
+
+	raw := analyticsEnvelope(t, "e-alloc", "OrderAllocated", at, map[string]any{
+		"order_id": "o1", "path_id": "pick",
+		"promise_basis": "Capability", "promise_cutoff_at": cutoff.Format(time.RFC3339Nano),
+		"split_shipment": true,
+	})
+	if err := c.HandleMessage(context.Background(), raw); err != nil {
+		t.Fatalf("HandleMessage: %v", err)
+	}
+	if len(proj.calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(proj.calls))
+	}
+	got := proj.calls[0]
+	if got.promiseBasis != "Capability" {
+		t.Errorf("promiseBasis = %q, want Capability", got.promiseBasis)
+	}
+	if got.cutoffAt == nil || !got.cutoffAt.Equal(cutoff) {
+		t.Errorf("cutoffAt = %v, want %v", got.cutoffAt, cutoff)
+	}
+	if !got.splitShipment {
+		t.Error("splitShipment = false, want true")
 	}
 }

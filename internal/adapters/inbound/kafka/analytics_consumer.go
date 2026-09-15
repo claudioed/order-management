@@ -58,10 +58,20 @@ type analyticsEnvelope struct {
 // Every report-moving event carries path_id (enriched by the publisher); the
 // rest of the fields are unused by the projection and present only so the
 // decode is total.
+//
+// PromiseBasis/PromiseCutoffAt/SplitShipment are ADR 0014 §6's additive
+// promise KPI fields, present only on OrderAllocated/
+// OrderPartiallyAllocated (see the analytics publisher's
+// promiseAllocationData). PromiseCutoffAt is a pointer so "absent" (a
+// LeadTime-basis promise, or an event published before this ADR) is
+// distinguishable from the zero time.
 type analyticsData struct {
-	OrderID string `json:"order_id"`
-	PathID  string `json:"path_id"`
-	LineNo  int    `json:"line_no"`
+	OrderID         string     `json:"order_id"`
+	PathID          string     `json:"path_id"`
+	LineNo          int        `json:"line_no"`
+	PromiseBasis    string     `json:"promise_basis"`
+	PromiseCutoffAt *time.Time `json:"promise_cutoff_at"`
+	SplitShipment   bool       `json:"split_shipment"`
 }
 
 // AnalyticsConsumer reads analytics events off the analytics topic and applies
@@ -177,7 +187,7 @@ func (c *AnalyticsConsumer) HandleMessage(ctx context.Context, raw []byte) error
 		return fmt.Errorf("analytics: decode data: %w", err)
 	}
 
-	return c.apply(ctx, env.EventType, env.EventID, data.PathID, env.OccurredAt)
+	return c.apply(ctx, env.EventType, env.EventID, data, env.OccurredAt)
 }
 
 // isProjecting reports whether eventType moves a funnel counter.
@@ -185,7 +195,8 @@ func isProjecting(eventType string) bool {
 	switch eventType {
 	case "OrderReceived", "OrderAllocated", "OrderPartiallyAllocated",
 		"OrderAllocationPartiallyFailed", "OrderReleased", "OrderCancelled",
-		"OrderLineAllocated", "OrderLineBackordered", "OrderLineReleased":
+		"OrderLineAllocated", "OrderLineBackordered", "OrderLineReleased",
+		"OrderRepromised":
 		return true
 	default:
 		return false
@@ -193,26 +204,33 @@ func isProjecting(eventType string) bool {
 }
 
 // apply routes a decoded event to the projection method for its type.
-func (c *AnalyticsConsumer) apply(ctx context.Context, eventType, eventID, pathID string, at time.Time) error {
+// OrderAllocated/OrderPartiallyAllocated additionally carry ADR 0014 §6's
+// promise KPI fields (data.PromiseBasis/PromiseCutoffAt/SplitShipment),
+// applied in the SAME call as the funnel counter — see
+// report.ProjectionStore.ApplyOrderAllocated's doc comment for why.
+// OrderRepromised (ADR 0018) routes to the path_id-free counter.
+func (c *AnalyticsConsumer) apply(ctx context.Context, eventType, eventID string, data analyticsData, at time.Time) error {
 	switch eventType {
 	case "OrderReceived":
-		return c.Projection.ApplyOrderReceived(ctx, eventID, pathID, at)
+		return c.Projection.ApplyOrderReceived(ctx, eventID, data.PathID, at)
 	case "OrderAllocated":
-		return c.Projection.ApplyOrderAllocated(ctx, eventID, pathID, at)
+		return c.Projection.ApplyOrderAllocated(ctx, eventID, data.PathID, at, data.PromiseBasis, data.PromiseCutoffAt, data.SplitShipment)
 	case "OrderPartiallyAllocated":
-		return c.Projection.ApplyOrderPartiallyAllocated(ctx, eventID, pathID, at)
+		return c.Projection.ApplyOrderPartiallyAllocated(ctx, eventID, data.PathID, at, data.PromiseBasis, data.PromiseCutoffAt, data.SplitShipment)
 	case "OrderAllocationPartiallyFailed":
-		return c.Projection.ApplyOrderAllocationFailed(ctx, eventID, pathID, at)
+		return c.Projection.ApplyOrderAllocationFailed(ctx, eventID, data.PathID, at)
 	case "OrderReleased":
-		return c.Projection.ApplyOrderReleased(ctx, eventID, pathID, at)
+		return c.Projection.ApplyOrderReleased(ctx, eventID, data.PathID, at)
 	case "OrderCancelled":
-		return c.Projection.ApplyOrderCancelled(ctx, eventID, pathID, at)
+		return c.Projection.ApplyOrderCancelled(ctx, eventID, data.PathID, at)
 	case "OrderLineAllocated":
-		return c.Projection.ApplyLineAllocated(ctx, eventID, pathID, at)
+		return c.Projection.ApplyLineAllocated(ctx, eventID, data.PathID, at)
 	case "OrderLineBackordered":
-		return c.Projection.ApplyLineBackordered(ctx, eventID, pathID, at)
+		return c.Projection.ApplyLineBackordered(ctx, eventID, data.PathID, at)
 	case "OrderLineReleased":
-		return c.Projection.ApplyLineReleased(ctx, eventID, pathID, at)
+		return c.Projection.ApplyLineReleased(ctx, eventID, data.PathID, at)
+	case "OrderRepromised":
+		return c.Projection.ApplyOrderRepromised(ctx, eventID, at)
 	default:
 		return nil
 	}

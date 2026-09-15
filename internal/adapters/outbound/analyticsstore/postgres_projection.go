@@ -55,12 +55,12 @@ func claim(ctx context.Context, tx pgx.Tx, eventId string, occurredAt time.Time)
 	return tag.RowsAffected() > 0, nil
 }
 
-// applyCount is the whole of every Apply* method: in one transaction, claim
-// the eventId and — only if the claim is new — increment column on the
-// (path_id, hour_bucket) row. col is a fixed value from the funnelColumn
-// constants above (never model input), so interpolating it into the SQL is
-// safe.
-func (p *PostgresProjection) applyCount(ctx context.Context, eventId, pathId string, at time.Time, col funnelColumn) error {
+// withClaim runs fn inside a transaction that has already claimed eventId.
+// fn is called only when the claim is new; the transaction commits either
+// way (a duplicate claim is a committed no-op, matching applyCount's
+// existing behaviour). This centralises the claim+commit/rollback ceremony
+// that applyCount and applyPromise both need.
+func (p *PostgresProjection) withClaim(ctx context.Context, eventId string, at time.Time, fn func(tx pgx.Tx) error) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -81,19 +81,94 @@ func (p *PostgresProjection) applyCount(ctx context.Context, eventId, pathId str
 		return tx.Commit(ctx)
 	}
 
-	bucket := at.UTC().Truncate(time.Hour)
-	// #nosec G201 -- col is a fixed funnelColumn constant, never user input.
-	sql := fmt.Sprintf(
-		`INSERT INTO funnel_rollup (path_id, hour_bucket, %[1]s)
-		 VALUES ($1, $2, 1)
-		 ON CONFLICT (path_id, hour_bucket) DO UPDATE SET
-		 	%[1]s = funnel_rollup.%[1]s + 1`, col)
-	if _, err := tx.Exec(ctx, sql, pathId, bucket); err != nil {
-		return fmt.Errorf("analyticsstore: upsert rollup %s: %w", col, err)
+	if err := fn(tx); err != nil {
+		return err
 	}
 
 	committed = true
 	return tx.Commit(ctx)
+}
+
+// applyCount is the whole of every simple counter Apply* method: in one
+// transaction, claim the eventId and — only if the claim is new — increment
+// column on the (path_id, hour_bucket) row. col is a fixed value from the
+// funnelColumn constants above (never model input), so interpolating it into
+// the SQL is safe.
+func (p *PostgresProjection) applyCount(ctx context.Context, eventId, pathId string, at time.Time, col funnelColumn) error {
+	return p.withClaim(ctx, eventId, at, func(tx pgx.Tx) error {
+		bucket := at.UTC().Truncate(time.Hour)
+		// #nosec G201 -- col is a fixed funnelColumn constant, never user input.
+		sql := fmt.Sprintf(
+			`INSERT INTO funnel_rollup (path_id, hour_bucket, %[1]s)
+			 VALUES ($1, $2, 1)
+			 ON CONFLICT (path_id, hour_bucket) DO UPDATE SET
+			 	%[1]s = funnel_rollup.%[1]s + 1`, col)
+		if _, err := tx.Exec(ctx, sql, pathId, bucket); err != nil {
+			return fmt.Errorf("analyticsstore: upsert rollup %s: %w", col, err)
+		}
+		return nil
+	})
+}
+
+// applyAllocationOutcome is the shared body of ApplyOrderAllocated and
+// ApplyOrderPartiallyAllocated: increment the funnel-stage counter AND the
+// promise KPI columns (basis distribution, split-shipment, promise-to-
+// cutoff-gap sum/count) on the SAME (path_id, hour_bucket) row, inside the
+// SAME eventId claim — see report.ProjectionStore.ApplyOrderAllocated's doc
+// comment for why these are not two separate Apply* calls.
+func (p *PostgresProjection) applyAllocationOutcome(
+	ctx context.Context,
+	eventId, pathId string,
+	at time.Time,
+	funnelCol funnelColumn,
+	basis string,
+	cutoffAt *time.Time,
+	splitShipment bool,
+) error {
+	return p.withClaim(ctx, eventId, at, func(tx pgx.Tx) error {
+		bucket := at.UTC().Truncate(time.Hour)
+
+		var basisCapability, basisLeadTime int
+		switch basis {
+		case "Capability":
+			basisCapability = 1
+		case "LeadTime":
+			basisLeadTime = 1
+		}
+
+		var split int
+		if splitShipment {
+			split = 1
+		}
+
+		var gapSeconds float64
+		var gapSamples int
+		if basis == "Capability" && cutoffAt != nil {
+			gapSeconds = cutoffAt.Sub(at).Seconds()
+			gapSamples = 1
+		}
+
+		// #nosec G201 -- funnelCol is a fixed funnelColumn constant, never user input.
+		sql := fmt.Sprintf(
+			`INSERT INTO funnel_rollup (
+				path_id, hour_bucket, %[1]s,
+				promise_basis_capability, promise_basis_lead_time, orders_split_shipment,
+				promise_to_cutoff_gap_seconds_sum, promise_to_cutoff_gap_samples
+			 )
+			 VALUES ($1, $2, 1, $3, $4, $5, $6, $7)
+			 ON CONFLICT (path_id, hour_bucket) DO UPDATE SET
+			 	%[1]s = funnel_rollup.%[1]s + 1,
+			 	promise_basis_capability = funnel_rollup.promise_basis_capability + $3,
+			 	promise_basis_lead_time = funnel_rollup.promise_basis_lead_time + $4,
+			 	orders_split_shipment = funnel_rollup.orders_split_shipment + $5,
+			 	promise_to_cutoff_gap_seconds_sum = funnel_rollup.promise_to_cutoff_gap_seconds_sum + $6,
+			 	promise_to_cutoff_gap_samples = funnel_rollup.promise_to_cutoff_gap_samples + $7`,
+			funnelCol)
+		if _, err := tx.Exec(ctx, sql, pathId, bucket, basisCapability, basisLeadTime, split, gapSeconds, gapSamples); err != nil {
+			return fmt.Errorf("analyticsstore: upsert rollup %s with promise KPIs: %w", funnelCol, err)
+		}
+		return nil
+	})
 }
 
 // ApplyOrderReceived counts one received order. Idempotent on eventId.
@@ -101,15 +176,16 @@ func (p *PostgresProjection) ApplyOrderReceived(ctx context.Context, eventId, pa
 	return p.applyCount(ctx, eventId, pathId, at, colOrdersReceived)
 }
 
-// ApplyOrderAllocated counts one fully-allocated order. Idempotent on eventId.
-func (p *PostgresProjection) ApplyOrderAllocated(ctx context.Context, eventId, pathId string, at time.Time) error {
-	return p.applyCount(ctx, eventId, pathId, at, colOrdersAllocated)
+// ApplyOrderAllocated counts one fully-allocated order and its promise KPI
+// facts. Idempotent on eventId.
+func (p *PostgresProjection) ApplyOrderAllocated(ctx context.Context, eventId, pathId string, at time.Time, basis string, cutoffAt *time.Time, splitShipment bool) error {
+	return p.applyAllocationOutcome(ctx, eventId, pathId, at, colOrdersAllocated, basis, cutoffAt, splitShipment)
 }
 
-// ApplyOrderPartiallyAllocated counts one partially-allocated order.
-// Idempotent on eventId.
-func (p *PostgresProjection) ApplyOrderPartiallyAllocated(ctx context.Context, eventId, pathId string, at time.Time) error {
-	return p.applyCount(ctx, eventId, pathId, at, colOrdersPartiallyAllocated)
+// ApplyOrderPartiallyAllocated counts one partially-allocated order and its
+// promise KPI facts. Idempotent on eventId.
+func (p *PostgresProjection) ApplyOrderPartiallyAllocated(ctx context.Context, eventId, pathId string, at time.Time, basis string, cutoffAt *time.Time, splitShipment bool) error {
+	return p.applyAllocationOutcome(ctx, eventId, pathId, at, colOrdersPartiallyAllocated, basis, cutoffAt, splitShipment)
 }
 
 // ApplyOrderAllocationFailed counts one hard allocation failure. Idempotent
@@ -141,6 +217,26 @@ func (p *PostgresProjection) ApplyLineBackordered(ctx context.Context, eventId, 
 // ApplyLineReleased counts one released order line. Idempotent on eventId.
 func (p *PostgresProjection) ApplyLineReleased(ctx context.Context, eventId, pathId string, at time.Time) error {
 	return p.applyCount(ctx, eventId, pathId, at, colLinesReleased)
+}
+
+// ApplyOrderRepromised counts one OrderRepromised event (ADR 0018) onto the
+// (hour_bucket)-only repromise_rollup table — deliberately not path_id
+// dimensioned, see report.ProjectionStore.ApplyOrderRepromised's doc
+// comment. Idempotent on eventId, via the SAME analytics_processed_events
+// claim table every other Apply* method uses.
+func (p *PostgresProjection) ApplyOrderRepromised(ctx context.Context, eventId string, at time.Time) error {
+	return p.withClaim(ctx, eventId, at, func(tx pgx.Tx) error {
+		bucket := at.UTC().Truncate(time.Hour)
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO repromise_rollup (hour_bucket, orders_repromised)
+			 VALUES ($1, 1)
+			 ON CONFLICT (hour_bucket) DO UPDATE SET
+			 	orders_repromised = repromise_rollup.orders_repromised + 1`,
+			bucket); err != nil {
+			return fmt.Errorf("analyticsstore: upsert repromise rollup: %w", err)
+		}
+		return nil
+	})
 }
 
 // Compile-time assertion that PostgresProjection satisfies the write port.
