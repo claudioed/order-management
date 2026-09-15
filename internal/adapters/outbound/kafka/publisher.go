@@ -2,11 +2,11 @@
 // warehouse-systems Kafka broker. It implements ports.EventPublisher, so it
 // drops in wherever the log or Postgres outbox publisher is used today.
 //
-// Only OrderAllocated and OrderPartiallyAllocated are part of the
-// published integration contract (see CLAUDE.md's Kafka integration
-// section); every other domain event is a local concern and is not
-// forwarded here — mirroring inventory-storage's own precedent of
-// forwarding only two of its several domain events.
+// OrderAllocated, OrderPartiallyAllocated, and — since ADR 0014 §5 / ADR
+// 0018 — OrderRepromised are the published integration contract (see
+// CLAUDE.md's Kafka integration section); every other domain event is a
+// local concern and is not forwarded here — mirroring inventory-storage's
+// own precedent of forwarding only a subset of its several domain events.
 package kafka
 
 import (
@@ -98,6 +98,18 @@ type allocationData struct {
 	Lines        []releasedLineData `json:"lines"`
 }
 
+// repromisedData is the `data` payload shape for OrderRepromised (ADR
+// 0014 §5 / ADR 0018): the fleet's "your delivery is delayed" trigger.
+// cpt_id_old/cpt_id_new are omitempty for the same reason
+// allocationData's promise_cpt_id is — a LeadTime-basis promise (either
+// side) has no CPT departure identity, only a computed cutoff instant.
+type repromisedData struct {
+	OrderID  string `json:"order_id"`
+	CptIdOld string `json:"cpt_id_old,omitempty"`
+	CptIdNew string `json:"cpt_id_new,omitempty"`
+	Reason   string `json:"reason"`
+}
+
 // Publisher publishes OrderAllocated and OrderPartiallyAllocated domain
 // events as integration events on Topic.
 type Publisher struct {
@@ -150,7 +162,7 @@ func toReleasedLineData(lines []shared.ReleasedLine) []releasedLineData {
 }
 
 func (p *Publisher) Publish(ctx context.Context, event shared.DomainEvent) error {
-	var data allocationData
+	var data any
 
 	switch e := event.(type) {
 	case shared.OrderAllocated:
@@ -168,6 +180,13 @@ func (p *Publisher) Publish(ctx context.Context, event shared.DomainEvent) error
 			PromiseCptId: e.PromiseCptId,
 			PromiseBasis: e.PromiseBasis,
 			Lines:        toReleasedLineData(e.Lines),
+		}
+	case shared.OrderRepromised:
+		data = repromisedData{
+			OrderID:  e.OrderID.String(),
+			CptIdOld: e.CptIdOld,
+			CptIdNew: e.CptIdNew,
+			Reason:   e.Reason,
 		}
 	default:
 		return nil

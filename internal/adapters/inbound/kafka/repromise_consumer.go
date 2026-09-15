@@ -1,0 +1,274 @@
+// Package kafka's repromise_consumer.go implements ADR 0014 §5 / ADR
+// 0018's inbound half: a Kafka consumer of fulfillment-execution's real
+// shipped warehouse.fulfillment.events topic — the SAME shared/fan-out
+// topic labor-performance already consumes for TaskCompleted — reacting
+// only to TaskCPTMissed and PackageManifested (see fulfillment-
+// execution's own ADR 0025, the companion decision that publishes
+// these). Every other event type on that topic is silently skipped,
+// mirroring labor-performance's own consumer's skip-unrecognized-
+// event-type convention exactly (see that repo's
+// internal/adapters/inbound/kafka/consumer.go, read as ground truth for
+// this file's shape).
+//
+// Unlike the full-replay local-cache consumers in this same repo
+// (kafkacatalog, kafkacptschedule, kafkapathcapacity — which build an
+// in-memory read model by replaying a topic from FirstOffset under a
+// PER-PROCESS-UNIQUE consumer group), this is a normal at-least-once
+// "process each new message once, commit as you go" consumer: it drives
+// a real use case (RepromiseOrder) exactly once per event_id via that
+// use case's own idempotency gate, and commits its own offset as it
+// goes. That is a DIFFERENT correctness shape than the local-cache
+// pattern — see the fleet skill's explicit distinction — so this
+// consumer uses a STABLE, meaningful, SHARED consumer group
+// (RepromiseConsumerGroup), never a per-process-unique one. Using a
+// per-process-unique group here would be wrong: it would make every
+// process replay the ENTIRE topic history from the start on every
+// restart, driving RepromiseOrder for years of already-handled
+// TaskCPTMissed/PackageManifested messages (a real, previously-hit bug
+// class in this fleet when the two patterns are conflated).
+package kafka
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"time"
+
+	kafkago "github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/claudioed/order-management/internal/application/usecases"
+)
+
+// FulfillmentEventsTopic is fulfillment-execution's shared/fan-out
+// integration topic, the same one labor-performance already consumes
+// for TaskCompleted.
+const FulfillmentEventsTopic = "warehouse.fulfillment.events"
+
+// RepromiseConsumerGroup is this consumer's stable, shared Kafka
+// consumer group id — see the package doc comment for why this MUST be
+// a fixed shared name, not a per-process-unique one.
+const RepromiseConsumerGroup = "order-management-repromise"
+
+// repromiseTracerName scopes the consume spans this adapter emits.
+const repromiseTracerName = "github.com/claudioed/order-management/internal/adapters/inbound/kafka"
+
+const (
+	eventTypeTaskCPTMissed      = "TaskCPTMissed"
+	eventTypePackageManifested  = "PackageManifested"
+	repromiseConsumeSpanNameFmt = "kafka.consume %s"
+)
+
+// fulfillmentEnvelope is the inbound decode shape of the fleet envelope
+// on warehouse.fulfillment.events, as verified against
+// fulfillment-execution's real, merged, shipped publisher (ADR 0025).
+// Declared independently here — order-management NEVER imports another
+// service's Go packages (see .claude/rules/bounded-context-boundary.md)
+// — this is this repo's own copy of the same wire shape, not a shared
+// type.
+type fulfillmentEnvelope struct {
+	EventID    string          `json:"event_id"`
+	EventType  string          `json:"event_type"`
+	OccurredAt time.Time       `json:"occurred_at"`
+	Source     string          `json:"source"`
+	Data       json.RawMessage `json:"data"`
+}
+
+// taskCPTMissedData is fulfillment-execution's real TaskCPTMissed
+// payload (its own internal/adapters/outbound/kafka/publisher.go,
+// TaskCPTMissedData struct, ADR 0025 §7). TaskType/Cpt are decoded for
+// completeness/future use even though RepromiseOrder itself does not
+// need them today — order_ref is the one field this consumer actually
+// acts on.
+type taskCPTMissedData struct {
+	TaskId   string    `json:"task_id"`
+	OrderRef string    `json:"order_ref"`
+	TaskType string    `json:"task_type,omitempty"`
+	Cpt      time.Time `json:"cpt"`
+}
+
+// packageManifestedData is fulfillment-execution's real
+// PackageManifested payload (ADR 0025 §7).
+type packageManifestedData struct {
+	PackageId string `json:"package_id"`
+	OrderRef  string `json:"order_ref"`
+}
+
+// RepromiseConsumer consumes FulfillmentEventsTopic, driving
+// RepromiseOrder for every TaskCPTMissed/PackageManifested message whose
+// order_ref parses as a valid WorkUnitId-shaped
+// "{orderId}-line-{lineNo}" reference.
+type RepromiseConsumer struct {
+	reader         *kafkago.Reader
+	repromiseOrder *usecases.RepromiseOrder
+	logger         *slog.Logger
+}
+
+// NewRepromiseConsumer constructs a RepromiseConsumer reading
+// FulfillmentEventsTopic on brokers under RepromiseConsumerGroup.
+func NewRepromiseConsumer(brokers []string, repromiseOrder *usecases.RepromiseOrder, logger *slog.Logger) *RepromiseConsumer {
+	return NewRepromiseConsumerForTopic(brokers, RepromiseConsumerGroup, FulfillmentEventsTopic, repromiseOrder, logger)
+}
+
+// NewRepromiseConsumerForTopic constructs a RepromiseConsumer reading
+// topic on brokers under groupID. It supports isolated integration
+// topics/groups while NewRepromiseConsumer retains the production
+// topic/group.
+func NewRepromiseConsumerForTopic(brokers []string, groupID, topic string, repromiseOrder *usecases.RepromiseOrder, logger *slog.Logger) *RepromiseConsumer {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &RepromiseConsumer{
+		reader: kafkago.NewReader(kafkago.ReaderConfig{
+			Brokers: brokers,
+			GroupID: groupID,
+			Topic:   topic,
+		}),
+		repromiseOrder: repromiseOrder,
+		logger:         logger,
+	}
+}
+
+// Close releases the underlying Kafka reader.
+func (c *RepromiseConsumer) Close() error {
+	return c.reader.Close()
+}
+
+// Run consumes the topic until ctx is cancelled.
+func (c *RepromiseConsumer) Run(ctx context.Context) error {
+	for {
+		msg, err := c.reader.FetchMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if err := c.handleMessage(ctx, msg); err != nil {
+			return err
+		}
+	}
+}
+
+// handleMessage processes one fetched message inside a
+// "kafka.consume <topic>" span whose parent is the producing service's
+// publish span, recovered from the message's W3C trace-context headers.
+// A malformed or unhandleable message (bad JSON, an order_ref that does
+// not parse as a WorkUnitId, or a RepromiseOrder fail-soft outcome) is
+// logged and committed rather than redelivered forever — mirroring
+// labor-performance's own consumer and this fleet's other Kafka
+// consumers' commit-and-skip-on-error convention. Only a genuine
+// commit failure, or a genuine infrastructure error from RepromiseOrder
+// itself (Processed/Orders/Events erroring), aborts the consume loop.
+func (c *RepromiseConsumer) handleMessage(ctx context.Context, msg kafkago.Message) error {
+	topic := c.reader.Config().Topic
+
+	msgCtx, span := c.startConsumeSpan(ctx, topic, msg)
+	defer span.End()
+
+	var env fulfillmentEnvelope
+	if err := json.Unmarshal(msg.Value, &env); err != nil {
+		recordSpanError(span, err)
+		c.log(msgCtx, "skipping unparseable kafka message", "topic", topic, "error", err)
+		return c.commit(ctx, msg)
+	}
+
+	span.SetAttributes(
+		attribute.String("messaging.message.event_id", env.EventID),
+		attribute.String("messaging.message.event_type", env.EventType),
+		attribute.String("messaging.message.source", env.Source),
+	)
+
+	if err := c.handleFulfillmentEvent(msgCtx, env); err != nil {
+		recordSpanError(span, err)
+		c.log(msgCtx, "skipping kafka event",
+			"topic", topic, "event_id", env.EventID, "event_type", env.EventType, "error", err)
+		return c.commit(ctx, msg)
+	}
+
+	return c.commit(ctx, msg)
+}
+
+// handleFulfillmentEvent filters for TaskCPTMissed/PackageManifested and
+// drives RepromiseOrder. Every other event type on this shared topic is
+// silently skipped, not an error — the same shared-topic convention
+// labor-performance's own consumer already established for this exact
+// topic. A returned error here means a genuine infrastructure failure
+// from RepromiseOrder.Execute (Processed/Orders/Events erroring); every
+// other condition (unparseable order_ref, no matching line, no promise
+// movement) is RepromiseOrder's own fail-soft path and returns nil.
+func (c *RepromiseConsumer) handleFulfillmentEvent(ctx context.Context, env fulfillmentEnvelope) error {
+	var orderRef, reason string
+
+	switch env.EventType {
+	case eventTypeTaskCPTMissed:
+		var data taskCPTMissedData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			return fmt.Errorf("repromise: decode %s data: %w", env.EventType, err)
+		}
+		orderRef, reason = data.OrderRef, eventTypeTaskCPTMissed
+	case eventTypePackageManifested:
+		var data packageManifestedData
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			return fmt.Errorf("repromise: decode %s data: %w", env.EventType, err)
+		}
+		orderRef, reason = data.OrderRef, eventTypePackageManifested
+	default:
+		return nil
+	}
+
+	orderID, lineNo, ok := usecases.ParseWorkUnitID(orderRef)
+	if !ok {
+		c.log(ctx, "repromise: order_ref does not parse as a WorkUnitId, skipping",
+			"event_id", env.EventID, "event_type", env.EventType, "order_ref", orderRef)
+		return nil
+	}
+
+	return c.repromiseOrder.Execute(ctx, usecases.RepromiseOrderRequest{
+		SourceEventId: env.EventID,
+		OrderId:       orderID,
+		LineNo:        lineNo,
+		Reason:        reason,
+	})
+}
+
+// commit acknowledges msg so it is never redelivered. Only a commit
+// failure itself aborts the consume loop.
+func (c *RepromiseConsumer) commit(ctx context.Context, msg kafkago.Message) error {
+	if err := c.reader.CommitMessages(ctx, msg); err != nil {
+		return err
+	}
+	return nil
+}
+
+// startConsumeSpan mirrors AnalyticsConsumer.Handle's span setup for
+// this consumer's own topic/group.
+func (c *RepromiseConsumer) startConsumeSpan(ctx context.Context, topic string, msg kafkago.Message) (context.Context, trace.Span) {
+	ctx = otel.GetTextMapPropagator().Extract(ctx, headerCarrier{headers: &msg.Headers})
+	return otel.Tracer(repromiseTracerName).Start(ctx,
+		fmt.Sprintf(repromiseConsumeSpanNameFmt, topic),
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			semconv.MessagingSystemKafka,
+			semconv.MessagingDestinationName(topic),
+			semconv.MessagingOperationName("process"),
+		),
+	)
+}
+
+// recordSpanError marks span as failed without changing any control flow.
+func recordSpanError(span trace.Span, err error) {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+}
+
+func (c *RepromiseConsumer) log(ctx context.Context, msg string, args ...any) {
+	if c.logger != nil {
+		c.logger.WarnContext(ctx, msg, args...)
+	}
+}

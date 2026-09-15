@@ -14,6 +14,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/claudioed/order-management/internal/application/ports"
@@ -336,4 +338,53 @@ func allocateAndRelease(
 // sides.
 func WorkUnitID(orderID shared.OrderId, lineNo int) string {
 	return fmt.Sprintf("%s-line-%d", orderID.String(), lineNo)
+}
+
+// workUnitIDLineMarker is the literal separator WorkUnitID's format
+// string embeds between the order id and the 1-based line number. It is
+// pulled out as a named constant purely so ParseWorkUnitID's reversal
+// and WorkUnitID's construction visibly share the same literal — there
+// is still exactly one place either side of this contract could drift,
+// and this constant is it.
+const workUnitIDLineMarker = "-line-"
+
+// ParseWorkUnitID reverses WorkUnitID: given a wire value shaped like
+// "{orderID}-line-{lineNo}" (fulfillment-execution's real TaskCPTMissed/
+// PackageManifested order_ref, itself sourced from wes-work-planning's
+// WorkUnitId at task-creation time — see ADR 0018), it recovers the
+// OrderId and 1-based line number RepromiseOrder needs to find the
+// affected PromiseGroup.
+//
+// It splits on the LAST occurrence of the "-line-" marker, not the
+// first: order-management mints OrderId as "ord-" + a UUID (see
+// OrderRepo.NextID), which is hex digits and hyphens only and can never
+// itself contain the literal substring "line" — so first-vs-last split
+// is not observable against this repo's real OrderId values today.
+// Splitting on the last occurrence is still the deliberately safer
+// choice: it degrades correctly even against a hypothetical future
+// OrderId shape that legitimately contains "-line-" as a substring,
+// where a first-occurrence split would silently truncate the order id
+// and misattribute the line number.
+//
+// ok is false — never a panic — for any input that is not a lineNo
+// trailing an order id via that exact marker: no marker present, an
+// empty order-id portion, a non-numeric or non-positive line number.
+// The caller (the repromise Kafka consumer) treats ok=false as "skip
+// this event, log it", mirroring how every other consumer in this fleet
+// handles a malformed inbound message.
+func ParseWorkUnitID(workUnitID string) (orderID shared.OrderId, lineNo int, ok bool) {
+	idx := strings.LastIndex(workUnitID, workUnitIDLineMarker)
+	if idx <= 0 {
+		return "", 0, false
+	}
+	orderPart := workUnitID[:idx]
+	lineNoPart := workUnitID[idx+len(workUnitIDLineMarker):]
+	if lineNoPart == "" {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(lineNoPart)
+	if err != nil || n <= 0 {
+		return "", 0, false
+	}
+	return shared.OrderId(orderPart), n, true
 }

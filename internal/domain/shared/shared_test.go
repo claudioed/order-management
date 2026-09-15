@@ -125,6 +125,7 @@ func TestDomainEventsCarryNameAndTimestamp(t *testing.T) {
 		{"OrderLineReleased", shared.NewOrderLineReleased(at, "ord-1", 1, "pick", "wu-1"), "OrderLineReleased"},
 		{"OrderReleased", shared.NewOrderReleased(at, "ord-1"), "OrderReleased"},
 		{"OrderCancelled", shared.NewOrderCancelled(at, "ord-1", 2), "OrderCancelled"},
+		{"OrderRepromised", shared.NewOrderRepromised(at, "ord-1", "sp1-1200", "sp1-1800", "TaskCPTMissed"), "OrderRepromised"},
 	}
 
 	for _, tt := range tests {
@@ -182,5 +183,15 @@ func TestEventPayloadsCarryTheirDetail(t *testing.T) {
 	received := shared.NewOrderReceived(at, "ord-7", 4)
 	if received.LineCount != 4 {
 		t.Fatalf("OrderReceived lost line count: %+v", received)
+	}
+
+	repromised := shared.NewOrderRepromised(at, "ord-7", "sp1-1200", "sp1-1800", "TaskCPTMissed")
+	if repromised.OrderID != "ord-7" || repromised.CptIdOld != "sp1-1200" || repromised.CptIdNew != "sp1-1800" || repromised.Reason != "TaskCPTMissed" {
+		t.Fatalf("OrderRepromised lost detail: %+v", repromised)
+	}
+
+	repromisedFromLeadTime := shared.NewOrderRepromised(at, "ord-7", "", "sp1-1800", "PackageManifested")
+	if repromisedFromLeadTime.CptIdOld != "" {
+		t.Fatalf("OrderRepromised should allow an empty CptIdOld for a LeadTime-basis previous promise: %+v", repromisedFromLeadTime)
 	}
 }

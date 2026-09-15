@@ -28,14 +28,20 @@ info:
     be idempotent, de-duplicating on `event_id` (the projector does exactly
     that via its `analytics_processed_events` table).
 
-    ## Integration contract (frozen)
+    ## Integration contract (frozen for OrderAllocated/OrderPartiallyAllocated;
+    additive for OrderRepromised)
 
-    Only `OrderAllocated` and `OrderPartiallyAllocated` are published to
+    `OrderAllocated`, `OrderPartiallyAllocated`, and — since ADR 0014 §5 /
+    ADR 0018 — `OrderRepromised` are published to
     `warehouse.order-management.events` — mirroring
     inventory-storage's precedent of forwarding a minimal subset of domain
-    events cross-context. The `data.lines[]` entry shape is shared verbatim
-    with wes-work-planning's Kafka consumer and MUST NOT change without
-    coordinating both sides. `fulfillment_class` is additive (ADR 0008).
+    events cross-context. The `data.lines[]` entry shape on the first two
+    is shared verbatim with wes-work-planning's Kafka consumer and MUST
+    NOT change without coordinating both sides. `fulfillment_class` is
+    additive (ADR 0008). `OrderRepromised` is the fleet's "your delivery
+    is delayed" trigger, raised by the new `RepromiseOrder` consumer
+    (ADR 0018) reacting to fulfillment-execution's `TaskCPTMissed`/
+    `PackageManifested` on `warehouse.fulfillment.events`.
   contact:
     name: Order Management Team
     url: https://warehouse-systems.internal/teams/order-management
@@ -74,28 +80,61 @@ channels:
   warehouse.order-management.events:
     description: >-
       The outbound integration topic owned by the Order Management bounded
-      context (`kafka.Topic` in the code). Only the two allocation-outcome
-      events are forwarded here; every other domain event is a local
-      concern. wes-work-planning's Kafka consumer derives each line's work
-      unit id from the frozen formula `{orderID}-line-{lineNo}`.
+      context (`kafka.Topic` in the code). `OrderAllocated`/
+      `OrderPartiallyAllocated` and — since ADR 0018 — `OrderRepromised`
+      are forwarded here; every other domain event is a local concern.
+      wes-work-planning's Kafka consumer derives each line's work unit id
+      from the frozen formula `{orderID}-line-{lineNo}`.
     subscribe:
       operationId: consumeOrderManagementEvents
-      summary: Consume order allocation-outcome integration events.
+      summary: Consume order allocation-outcome and re-promise integration events.
       description: >-
         Subscribe to this channel to learn that an order's
-        allocation-then-release pass concluded. `OrderAllocated` means
-        every line was allocated (and every eligible line released in the
-        same pass); `OrderPartiallyAllocated` means some lines allocated
-        and some backordered on a partial-shipment order. `data.lines[]`
-        carries exactly the lines released in this pass. Consumers must be
-        idempotent and should ignore `event_type` values they do not
-        recognise.
+        allocation-then-release pass concluded, or that its promise moved.
+        `OrderAllocated` means every line was allocated (and every
+        eligible line released in the same pass); `OrderPartiallyAllocated`
+        means some lines allocated and some backordered on a
+        partial-shipment order. `OrderRepromised` (ADR 0018) means the
+        promise for a shipment group moved, discovered by reacting to a
+        fulfillment-execution fact (a missed CPT or a SLAM pass) — the
+        fleet's "your delivery is delayed" trigger. `data.lines[]` on the
+        first two carries exactly the lines released in this pass.
+        Consumers must be idempotent and should ignore `event_type`
+        values they do not recognise.
       tags:
         - name: order-management
       message:
         oneOf:
           - $ref: "#/components/messages/OrderAllocatedIntegration"
           - $ref: "#/components/messages/OrderPartiallyAllocatedIntegration"
+          - $ref: "#/components/messages/OrderRepromisedIntegration"
+
+  warehouse.fulfillment.events:
+    description: >-
+      fulfillment-execution's shared/fan-out integration topic — the SAME
+      one labor-performance already consumes for `TaskCompleted`. This
+      context consumes it ONLY for `TaskCPTMissed`/`PackageManifested`
+      (ADR 0018, reacting to fulfillment-execution's own ADR 0025); every
+      other event type on this topic is silently skipped. order-management
+      does not import fulfillment-execution's Go code — this channel's
+      messages below are this context's own independently-declared copy
+      of that service's real, shipped wire shape.
+    subscribe:
+      operationId: consumeFulfillmentEvents
+      summary: React to a missed CPT or a SLAM pass to re-promise the affected order.
+      description: >-
+        `order_ref` on both message types is shaped like this context's
+        own `WorkUnitID` formula (`{orderId}-line-{lineNo}`) — NOT a bare
+        OrderId — because fulfillment-execution populates it from
+        wes-work-planning's `WorkUnitId`, itself derived from this
+        context's formula at release time. The `RepromiseOrder` consumer
+        parses it back apart via `usecases.ParseWorkUnitID`.
+      tags:
+        - name: order-management
+      message:
+        oneOf:
+          - $ref: "#/components/messages/TaskCPTMissedInbound"
+          - $ref: "#/components/messages/PackageManifestedInbound"
 
   warehouse.order-management.analytics:
     description: >-
@@ -210,6 +249,94 @@ components:
                   path_id: pick
                   gift_wrap: false
                   fulfillment_class: MULTI_LINE_MULTI
+
+    OrderRepromisedIntegration:
+      name: OrderRepromised
+      title: Order Repromised (integration)
+      summary: >-
+        The promise for a shipment group moved — the fleet's "your
+        delivery is delayed" trigger (ADR 0014 §5 / ADR 0018).
+      description: >-
+        Raised by the RepromiseOrder use case when reacting to
+        fulfillment-execution's TaskCPTMissed (a task still open past its
+        CPT) or PackageManifested (a SLAM pass) reveals that the affected
+        PromiseGroup's fresh recompute differs from its current promise.
+        `cpt_id_old`/`cpt_id_new` are both absent (omitempty) for a
+        LeadTime-basis promise on that side — a LeadTime-basis promise has
+        no CPT departure identity, only a computed cutoff instant. This
+        event does not itself contact a customer: it is the trigger, not
+        the notification.
+      tags:
+        - name: order
+      payload:
+        $ref: "#/components/schemas/RepromisedEvent"
+      examples:
+        - name: orderRepromised
+          summary: A missed CPT pushed the promise to a later cutoff.
+          payload:
+            event_id: 1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+            event_type: OrderRepromised
+            occurred_at: "2026-09-14T12:00:00Z"
+            source: order-management
+            data:
+              order_id: ord-7c9e6679-7d5a-4b37-b2f1-93b0c4a1d8f2
+              cpt_id_old: sp1-1200
+              cpt_id_new: sp1-1800
+              reason: TaskCPTMissed
+
+    TaskCPTMissedInbound:
+      name: TaskCPTMissed
+      title: Task CPT Missed (inbound, fulfillment-execution)
+      summary: A fulfillment-execution task is still open past its CPT.
+      description: >-
+        Consumed from warehouse.fulfillment.events (ADR 0018). Re-fires on
+        every sweep pass fulfillment-execution runs, for as long as the
+        task stays overdue (that service's own ADR 0025 §4) — this
+        context's own event_id-keyed idempotency gate is what makes that
+        safe to consume. order_ref is a WorkUnitId-shaped reference
+        (`{orderId}-line-{lineNo}`), not a bare OrderId.
+      tags:
+        - name: order-management
+      payload:
+        $ref: "#/components/schemas/TaskCPTMissedEvent"
+      examples:
+        - name: taskCPTMissed
+          summary: A PICK task for order line 2 is still open past its CPT.
+          payload:
+            event_id: 2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e
+            event_type: TaskCPTMissed
+            occurred_at: "2026-09-14T11:59:00Z"
+            source: fulfillment-execution
+            data:
+              task_id: task-42
+              order_ref: ord-7c9e6679-7d5a-4b37-b2f1-93b0c4a1d8f2-line-2
+              task_type: PICK
+              cpt: "2026-09-14T11:55:00Z"
+
+    PackageManifestedInbound:
+      name: PackageManifested
+      title: Package Manifested (inbound, fulfillment-execution)
+      summary: A package passed SLAM (weigh-check succeeded).
+      description: >-
+        Consumed from warehouse.fulfillment.events (ADR 0018). Raised
+        alongside LabelApplied on fulfillment-execution's own outbox
+        (its ADR 0025 §5). order_ref is a WorkUnitId-shaped reference,
+        not a bare OrderId.
+      tags:
+        - name: order-management
+      payload:
+        $ref: "#/components/schemas/PackageManifestedEvent"
+      examples:
+        - name: packageManifested
+          summary: A package for order line 1 passed SLAM.
+          payload:
+            event_id: 3c4d5e6f-7a8b-4c9d-0e1f-2a3b4c5d6e7f
+            event_type: PackageManifested
+            occurred_at: "2026-09-14T12:01:00Z"
+            source: fulfillment-execution
+            data:
+              package_id: pkg-99
+              order_ref: ord-7c9e6679-7d5a-4b37-b2f1-93b0c4a1d8f2-line-1
 
     OrderReceivedAnalytics:
       name: OrderReceived
@@ -454,7 +581,7 @@ components:
           description: De-duplication key; delivery is at-least-once.
         event_type:
           type: string
-          enum: [OrderAllocated, OrderPartiallyAllocated]
+          enum: [OrderAllocated, OrderPartiallyAllocated, OrderRepromised]
         occurred_at:
           type: string
           format: date-time
@@ -494,6 +621,98 @@ components:
     AllocationEvent:
       allOf:
         - $ref: "#/components/schemas/IntegrationEnvelope"
+
+    RepromisedEvent:
+      allOf:
+        - type: object
+          additionalProperties: false
+          required: [event_id, event_type, occurred_at, source, data]
+          properties:
+            event_id: { type: string, format: uuid }
+            event_type: { type: string, enum: [OrderRepromised] }
+            occurred_at: { type: string, format: date-time }
+            source: { type: string, enum: [order-management] }
+            data:
+              $ref: "#/components/schemas/RepromisedData"
+
+    TaskCPTMissedEvent:
+      allOf:
+        - type: object
+          additionalProperties: false
+          required: [event_id, event_type, occurred_at, source, data]
+          properties:
+            event_id: { type: string, format: uuid }
+            event_type: { type: string, enum: [TaskCPTMissed] }
+            occurred_at: { type: string, format: date-time }
+            source: { type: string, enum: [fulfillment-execution] }
+            data:
+              $ref: "#/components/schemas/TaskCPTMissedData"
+
+    PackageManifestedEvent:
+      allOf:
+        - type: object
+          additionalProperties: false
+          required: [event_id, event_type, occurred_at, source, data]
+          properties:
+            event_id: { type: string, format: uuid }
+            event_type: { type: string, enum: [PackageManifested] }
+            occurred_at: { type: string, format: date-time }
+            source: { type: string, enum: [fulfillment-execution] }
+            data:
+              $ref: "#/components/schemas/PackageManifestedData"
+
+    RepromisedData:
+      type: object
+      description: >-
+        The `data` payload shape for OrderRepromised (ADR 0014 §5 / ADR
+        0018). cpt_id_old/cpt_id_new are both omitempty for a
+        LeadTime-basis promise on that side.
+      additionalProperties: false
+      required: [order_id, reason]
+      properties:
+        order_id:
+          type: string
+          pattern: '^ord-[0-9a-f-]{36}$'
+        cpt_id_old:
+          type: string
+          description: The CPT identity the affected group targeted BEFORE the recompute. Absent for a LeadTime-basis previous promise.
+        cpt_id_new:
+          type: string
+          description: The CPT identity the affected group targets AFTER the recompute. Absent for a LeadTime-basis new promise.
+        reason:
+          type: string
+          enum: [TaskCPTMissed, PackageManifested]
+          description: The fulfillment-execution event_type that triggered this recompute, verbatim.
+
+    TaskCPTMissedData:
+      type: object
+      description: >-
+        fulfillment-execution's real, shipped TaskCPTMissed payload
+        (its own ADR 0025 §7) — decoded independently here, never
+        imported.
+      additionalProperties: false
+      required: [task_id, order_ref, cpt]
+      properties:
+        task_id: { type: string }
+        order_ref:
+          type: string
+          description: A WorkUnitId-shaped reference (`{orderId}-line-{lineNo}`), NOT a bare OrderId.
+        task_type: { type: string, enum: [PICK, PACK, SLAM, REBIN] }
+        cpt: { type: string, format: date-time }
+
+    PackageManifestedData:
+      type: object
+      description: >-
+        fulfillment-execution's real, shipped PackageManifested payload
+        (its own ADR 0025 §7) — decoded independently here, never
+        imported.
+      additionalProperties: false
+      required: [package_id, order_ref]
+      properties:
+        package_id: { type: string }
+        order_ref:
+          type: string
+          description: A WorkUnitId-shaped reference (`{orderId}-line-{lineNo}`), NOT a bare OrderId.
 
     AllocationData:
       type: object

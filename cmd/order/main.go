@@ -16,8 +16,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	inboundhttp "github.com/claudioed/order-management/internal/adapters/inbound/http"
+	inboundkafka "github.com/claudioed/order-management/internal/adapters/inbound/kafka"
 	"github.com/claudioed/order-management/internal/adapters/outbound/events"
 	"github.com/claudioed/order-management/internal/adapters/outbound/inventorystorage"
 	kafkaadapter "github.com/claudioed/order-management/internal/adapters/outbound/kafka"
@@ -89,11 +91,13 @@ func run() error {
 	databaseURL := os.Getenv("DATABASE_URL")
 	migrationsPath := getenv("MIGRATIONS_PATH", "migrations")
 
-	orders, publisher, closeAdapters, err := buildRepoAdapters(databaseURL, migrationsPath, getenv("EVENT_PUBLISHER", "log"), logger)
+	orders, publisher, dbPool, closeAdapters, err := buildRepoAdapters(databaseURL, migrationsPath, getenv("EVENT_PUBLISHER", "log"), logger)
 	if err != nil {
 		return err
 	}
 	defer closeAdapters()
+
+	repromiseProcessed := buildRepromiseProcessedEvents(dbPool, logger)
 
 	inventory := buildInventoryClient(getenv("INVENTORY_STORAGE_MODE", "permissive"), os.Getenv("INVENTORY_STORAGE_BASE_URL"), logger)
 
@@ -250,19 +254,58 @@ func run() error {
 		GetOrder:        &usecases.GetOrder{Orders: orders},
 	}
 
+	// RepromiseOrder consumer (ADR 0014 §5 / ADR 0018) — the final
+	// piece of ADR 0014's rollout. It is wired independently of
+	// PATH_CATALOGUE_SOURCE/EVENT_PUBLISHER: it needs its own inbound
+	// Kafka consumer on fulfillment-execution's warehouse.fulfillment.events
+	// topic, gated on KAFKA_BROKERS alone, mirroring this repo's other
+	// KAFKA_BROKERS-gated conditional constructions. A STABLE, shared
+	// consumer group (kafka.RepromiseConsumerGroup) is used — this is a
+	// normal at-least-once "process and commit" consumer, not a
+	// full-replay local-cache one, so it must NOT use a
+	// per-process-unique group (see that package's doc comment).
+	repromiseOrder := &usecases.RepromiseOrder{
+		Orders: orders, Promise: promise, Events: publisher, Clock: clock,
+		Processed: repromiseProcessed, Logger: logger,
+	}
+	repromiseConsumerCtx, cancelRepromiseConsumer := context.WithCancel(context.Background())
+	defer cancelRepromiseConsumer()
+	var repromiseConsumer *inboundkafka.RepromiseConsumer
+	if kafkaBrokers := os.Getenv("KAFKA_BROKERS"); kafkaBrokers != "" {
+		repromiseConsumer = inboundkafka.NewRepromiseConsumer(strings.Split(kafkaBrokers, ","), repromiseOrder, logger)
+		logger.Info("repromise consumer configured",
+			"topic", inboundkafka.FulfillmentEventsTopic, "group_id", inboundkafka.RepromiseConsumerGroup)
+	} else {
+		logger.Warn("KAFKA_BROKERS not configured; RepromiseOrder consumer will not run, OrderRepromised will never fire",
+			"hint", "set KAFKA_BROKERS for a real deployment")
+	}
+
 	httpServer := &http.Server{
 		Addr:              httpAddr,
 		Handler:           inboundhttp.NewRouter(server, logger, serviceName),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		logger.Info("http server listening", "addr", httpAddr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
 	}()
+	if repromiseConsumer != nil {
+		defer func() {
+			if err := repromiseConsumer.Close(); err != nil {
+				logger.Error("error closing repromise consumer", "error", err)
+			}
+		}()
+		go func() {
+			logger.Info("repromise consumer running", "topic", inboundkafka.FulfillmentEventsTopic)
+			if err := repromiseConsumer.Run(repromiseConsumerCtx); err != nil {
+				errCh <- err
+			}
+		}()
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -273,6 +316,7 @@ func run() error {
 	case <-ctx.Done():
 	}
 
+	cancelRepromiseConsumer()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpServer.Shutdown(shutdownCtx)
@@ -302,15 +346,18 @@ func newLogger(level string) *slog.Logger {
 // choice ("log"), or can be switched to the Kafka integration-events
 // publisher via eventPublisher="kafka" (EVENT_PUBLISHER env), independent
 // of which repos are in use — mirroring inventory-storage's
-// EVENT_PUBLISHER=kafka|log pattern exactly.
+// EVENT_PUBLISHER=kafka|log pattern exactly. The returned *pgxpool.Pool is
+// nil for the in-memory case; buildRepromiseProcessedEvents reuses it
+// rather than opening a second pool against the same database.
 func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logger *slog.Logger) (
-	ports.OrderRepo, ports.EventPublisher, func(), error,
+	ports.OrderRepo, ports.EventPublisher, *pgxpool.Pool, func(), error,
 ) {
 	noop := func() {}
 
 	var (
 		orders     ports.OrderRepo
 		defaultPub ports.EventPublisher
+		pool       *pgxpool.Pool
 		closeRepos = noop
 	)
 
@@ -320,11 +367,12 @@ func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logge
 		defaultPub = events.NewLogPublisher(logger)
 	} else {
 		if err := postgres.RunMigrations(databaseURL, migrationsPath); err != nil {
-			return nil, nil, noop, err
+			return nil, nil, nil, noop, err
 		}
-		pool, err := postgres.NewPool(context.Background(), databaseURL)
+		var err error
+		pool, err = postgres.NewPool(context.Background(), databaseURL)
 		if err != nil {
-			return nil, nil, noop, err
+			return nil, nil, nil, noop, err
 		}
 		orders = postgres.NewOrderRepo(pool)
 		defaultPub = postgres.NewEventPublisher(pool)
@@ -332,13 +380,14 @@ func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logge
 	}
 
 	if !strings.EqualFold(eventPublisher, "kafka") {
-		return orders, defaultPub, closeRepos, nil
+		return orders, defaultPub, pool, closeRepos, nil
 	}
 
 	brokers := strings.Split(getenv("KAFKA_BROKERS", "localhost:9092"), ",")
 
-	// Integration publisher: forwards OrderAllocated/OrderPartiallyAllocated
-	// onto warehouse.order-management.events. Left exactly as-is.
+	// Integration publisher: forwards OrderAllocated/OrderPartiallyAllocated/
+	// OrderRepromised onto warehouse.order-management.events. Left
+	// exactly as-is.
 	writer := kafkaadapter.NewWriter(brokers...)
 	integration := kafkaadapter.NewPublisher(writer)
 
@@ -363,7 +412,21 @@ func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logge
 		closeRepos()
 	}
 
-	return orders, fanOut, closeAll, nil
+	return orders, fanOut, pool, closeAll, nil
+}
+
+// buildRepromiseProcessedEvents selects RepromiseOrder's idempotency-gate
+// adapter (ADR 0014 §5 / ADR 0018): Postgres-backed when pool is non-nil
+// (the same pool buildRepoAdapters already opened against DATABASE_URL —
+// migration 0004 already ran as part of that same RunMigrations call), or
+// in-memory for local development with no DATABASE_URL, mirroring every
+// other repo adapter's memory/Postgres selection in this composition root.
+func buildRepromiseProcessedEvents(pool *pgxpool.Pool, logger *slog.Logger) ports.RepromiseProcessedEvents {
+	if pool == nil {
+		logger.Info("database url not configured; using in-memory repromise idempotency gate")
+		return memory.NewRepromiseProcessedEventsRepo()
+	}
+	return postgres.NewRepromiseProcessedEventsRepo(pool)
 }
 
 // buildInventoryClient selects the outbound InventoryReservationClient via

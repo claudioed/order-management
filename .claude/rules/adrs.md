@@ -1,4 +1,4 @@
-# Architecture Decision Records (17 total, `docs/docs/adr/`)
+# Architecture Decision Records (18 total, `docs/docs/adr/`)
 
 1. **0001 — Hexagonal (ports & adapters) architecture.** The dependency
    rule this whole repo enforces (`internal/architecture/` fitness test).
@@ -115,6 +115,30 @@
     needs zero changes (verified against its real consumer decode
     struct) — read the ADR before extending `promise_policy.go`,
     `order.go`'s promise fields, or the Postgres/Kafka promise wiring.
+18. **0018 — ACCEPTED: RepromiseOrder consumer and OrderRepromised —
+    closing ADR 0014's feedback loop.** The final piece of ADR 0014's
+    entire rollout. New inbound Kafka consumer
+    (`internal/adapters/inbound/kafka/repromise_consumer.go`) on
+    fulfillment-execution's real `warehouse.fulfillment.events` topic
+    (its own ADR 0025), reacting to `TaskCPTMissed`/`PackageManifested`
+    only, under a STABLE shared consumer group
+    (`order-management-repromise` — NOT per-process-unique, a different
+    correctness shape than `kafkacatalog`/`kafkacptschedule`/
+    `kafkapathcapacity`'s full-replay pattern). New
+    `usecases.ParseWorkUnitID` reverses this repo's own frozen
+    `WorkUnitID` formula to recover `(OrderId, LineNo)` from the wire's
+    `order_ref`. New use case `RepromiseOrder` finds the line's current
+    `PromiseGroup`, calls the EXISTING `PromisePolicy.PromiseGroups`
+    again fresh, and — if the group's promise moved — saves the new
+    breakdown and publishes the new `shared.OrderRepromised` event on
+    `warehouse.order-management.events`. Idempotent on the Kafka
+    message's `event_id` alone via a NEW OLTP-side port
+    `ports.RepromiseProcessedEvents` (Postgres migration
+    `0004_repromise_processed_events`) — a deliberate, documented
+    simplification of ADR 0014 §5's stated `(orderId, sourceEventId)`
+    key. No new promise-computation logic anywhere — read the ADR before
+    touching `repromise_order.go`, `repromise_consumer.go`, or
+    `ParseWorkUnitID`.
 
 Other ADR-adjacent facts worth knowing without opening every file:
 

@@ -249,3 +249,35 @@ func NewOrderAllocationPartiallyFailed(occurredAt time.Time, orderID OrderId, al
 		OrderID: orderID, AllocatedLines: allocatedLines, RemainingLines: remainingLines, Cause: cause,
 	}
 }
+
+// OrderRepromised: the promise for this order moved, discovered by
+// reacting to a downstream fulfillment-execution fact (a task still open
+// past its CPT, or a SLAM pass) — ADR 0014 §5's feedback loop, closed by
+// ADR 0018's RepromiseOrder use case. This is the fleet's "your delivery
+// is delayed" trigger; nothing here contacts a customer, it is the
+// trigger, not the notification.
+//
+// CptIdOld/CptIdNew are the CPT identity (e.g. "sp1-1800") the affected
+// PromiseGroup targeted before and after the recompute. Either — or both
+// — may be empty: a LeadTime-basis promise has no CPT departure
+// identity, only a computed cutoff instant (see order.Promise's doc
+// comment), so an empty string here means "that basis had no CPT
+// identity", never "no promise existed". Reason names the
+// fulfillment-execution event_type that triggered the recompute —
+// "TaskCPTMissed" or "PackageManifested", verbatim — so a downstream
+// reader can tell which kind of signal moved the promise without a
+// second lookup.
+type OrderRepromised struct {
+	base
+	OrderID  OrderId
+	CptIdOld string
+	CptIdNew string
+	Reason   string
+}
+
+func NewOrderRepromised(occurredAt time.Time, orderID OrderId, cptIdOld, cptIdNew, reason string) OrderRepromised {
+	return OrderRepromised{
+		base:    newBase("OrderRepromised", occurredAt),
+		OrderID: orderID, CptIdOld: cptIdOld, CptIdNew: cptIdNew, Reason: reason,
+	}
+}

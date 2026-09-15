@@ -133,6 +133,7 @@ jobs:
           go test -tags=integration ./internal/adapters/outbound/kafkacatalog
           go test -tags=integration ./internal/adapters/outbound/kafkacptschedule
           go test -tags=integration ./internal/adapters/outbound/kafkapathcapacity
+          go test -tags=integration ./internal/adapters/inbound/kafka
 
 
   # ============================================================
