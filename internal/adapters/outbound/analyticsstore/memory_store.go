@@ -42,6 +42,14 @@ type rowAcc struct {
 	linesAllocated           int
 	linesBackordered         int
 	linesReleased            int
+
+	// --- promise KPIs (ADR 0014 §6 / ADR 0019) ---
+	promiseBasisCapability    int
+	promiseBasisLeadTime      int
+	ordersRepromised          int
+	ordersSplitShipment       int
+	promiseToCutoffGapSum     float64
+	promiseToCutoffGapSamples int
 }
 
 // NewMemoryStore constructs an empty MemoryStore.
@@ -97,16 +105,44 @@ func (s *MemoryStore) ApplyOrderReceived(_ context.Context, eventId, pathId stri
 	return nil
 }
 
-// ApplyOrderAllocated counts one fully-allocated order. Idempotent on eventId.
-func (s *MemoryStore) ApplyOrderAllocated(_ context.Context, eventId, pathId string, at time.Time) error {
-	s.bump(eventId, pathId, at, func(r *rowAcc) { r.ordersAllocated++ })
+// applyPromiseKPIs mutates r with the promise KPI facts shared by
+// ApplyOrderAllocated/ApplyOrderPartiallyAllocated — see
+// report.ProjectionStore.ApplyOrderAllocated's doc comment for why these
+// facts are applied in the same call as the funnel counter, not a separate
+// method.
+func applyPromiseKPIs(r *rowAcc, at time.Time, basis string, cutoffAt *time.Time, splitShipment bool) {
+	switch basis {
+	case "Capability":
+		r.promiseBasisCapability++
+	case "LeadTime":
+		r.promiseBasisLeadTime++
+	}
+	if splitShipment {
+		r.ordersSplitShipment++
+	}
+	if basis == "Capability" && cutoffAt != nil {
+		r.promiseToCutoffGapSum += cutoffAt.Sub(at).Seconds()
+		r.promiseToCutoffGapSamples++
+	}
+}
+
+// ApplyOrderAllocated counts one fully-allocated order and its promise KPI
+// facts. Idempotent on eventId.
+func (s *MemoryStore) ApplyOrderAllocated(_ context.Context, eventId, pathId string, at time.Time, basis string, cutoffAt *time.Time, splitShipment bool) error {
+	s.bump(eventId, pathId, at, func(r *rowAcc) {
+		r.ordersAllocated++
+		applyPromiseKPIs(r, at, basis, cutoffAt, splitShipment)
+	})
 	return nil
 }
 
-// ApplyOrderPartiallyAllocated counts one partially-allocated order.
-// Idempotent on eventId.
-func (s *MemoryStore) ApplyOrderPartiallyAllocated(_ context.Context, eventId, pathId string, at time.Time) error {
-	s.bump(eventId, pathId, at, func(r *rowAcc) { r.ordersPartiallyAllocated++ })
+// ApplyOrderPartiallyAllocated counts one partially-allocated order and its
+// promise KPI facts. Idempotent on eventId.
+func (s *MemoryStore) ApplyOrderPartiallyAllocated(_ context.Context, eventId, pathId string, at time.Time, basis string, cutoffAt *time.Time, splitShipment bool) error {
+	s.bump(eventId, pathId, at, func(r *rowAcc) {
+		r.ordersPartiallyAllocated++
+		applyPromiseKPIs(r, at, basis, cutoffAt, splitShipment)
+	})
 	return nil
 }
 
@@ -147,6 +183,15 @@ func (s *MemoryStore) ApplyLineReleased(_ context.Context, eventId, pathId strin
 	return nil
 }
 
+// ApplyOrderRepromised counts one OrderRepromised event onto the
+// path_id=""-row for the hour — deliberately not path_id dimensioned, see
+// report.ProjectionStore.ApplyOrderRepromised's doc comment. Idempotent on
+// eventId.
+func (s *MemoryStore) ApplyOrderRepromised(_ context.Context, eventId string, at time.Time) error {
+	s.bump(eventId, "", at, func(r *rowAcc) { r.ordersRepromised++ })
+	return nil
+}
+
 // Query returns the rows matching q. From is inclusive, To is exclusive,
 // both compared against a row's HourBucket; empty PathId means no filter on
 // that dimension.
@@ -162,7 +207,7 @@ func (s *MemoryStore) Query(_ context.Context, q report.ReportQuery) (report.Fun
 		if q.PathId != "" && k.PathId != q.PathId {
 			continue
 		}
-		out.Rows = append(out.Rows, report.Row{
+		row := report.Row{
 			Key:                      k,
 			OrdersReceived:           r.ordersReceived,
 			OrdersAllocated:          r.ordersAllocated,
@@ -173,7 +218,16 @@ func (s *MemoryStore) Query(_ context.Context, q report.ReportQuery) (report.Fun
 			LinesAllocated:           r.linesAllocated,
 			LinesBackordered:         r.linesBackordered,
 			LinesReleased:            r.linesReleased,
-		})
+			PromiseBasisCapability:   r.promiseBasisCapability,
+			PromiseBasisLeadTime:     r.promiseBasisLeadTime,
+			OrdersRepromised:         r.ordersRepromised,
+			OrdersSplitShipment:      r.ordersSplitShipment,
+		}
+		if r.promiseToCutoffGapSamples > 0 {
+			row.PromiseToCutoffGapSeconds = r.promiseToCutoffGapSum / float64(r.promiseToCutoffGapSamples)
+		}
+		row.PromiseToCutoffGapSamples = r.promiseToCutoffGapSamples
+		out.Rows = append(out.Rows, row)
 	}
 	return out, nil
 }

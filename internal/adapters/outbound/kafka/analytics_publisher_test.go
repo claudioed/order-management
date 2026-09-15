@@ -211,6 +211,123 @@ func TestAnalyticsPublisher_SkipsUnknownEvents(t *testing.T) {
 	}
 }
 
+// TestAnalyticsPublisher_OrderRepromised covers the newly-shipped
+// OrderRepromised case (ADR 0018) in marshalData -- previously absent, per
+// this task's brief.
+func TestAnalyticsPublisher_OrderRepromised(t *testing.T) {
+	at := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	w := &fakeWriter{}
+	p := kafka.NewAnalyticsPublisher(nil, fakeOrderRepo{}, func() string { return "evt-repromise" })
+	p.Writer = w
+
+	ev := shared.NewOrderRepromised(at, "o1", "sp1-1200", "sp1-1800", "TaskCPTMissed")
+	if err := p.Publish(context.Background(), ev); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(w.messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(w.messages))
+	}
+	env, data := decodeAnalytics(t, w.messages[0].Value)
+	if env.EventType != "OrderRepromised" {
+		t.Errorf("event_type = %q, want OrderRepromised", env.EventType)
+	}
+	if string(w.messages[0].Key) != "o1" {
+		t.Errorf("key = %q, want o1", string(w.messages[0].Key))
+	}
+	if data["cpt_id_old"] != "sp1-1200" || data["cpt_id_new"] != "sp1-1800" || data["reason"] != "TaskCPTMissed" {
+		t.Errorf("data = %+v, unexpected fields", data)
+	}
+	// OrderRepromised carries no path_id -- unlike every other analytics
+	// event type, its payload is deliberately path-free (ADR 0019).
+	if _, hasPath := data["path_id"]; hasPath {
+		t.Errorf("data unexpectedly carries path_id: %+v", data)
+	}
+}
+
+// TestAnalyticsPublisher_PromiseEnrichment covers ADR 0014 §6's additive
+// promise_basis/promise_cutoff_at/split_shipment fields on
+// OrderAllocated/OrderPartiallyAllocated.
+func TestAnalyticsPublisher_PromiseEnrichment(t *testing.T) {
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	sku, _ := shared.NewSKU("SKU-1")
+	cutoff := at.Add(6 * time.Hour)
+
+	t.Run("Capability basis carries promise_cutoff_at", func(t *testing.T) {
+		w := &fakeWriter{}
+		p := kafka.NewAnalyticsPublisher(nil, fakeOrderRepo{order: orderOnPath(t, "o1", "pick")}, func() string { return "evt" })
+		p.Writer = w
+
+		ev := shared.NewOrderAllocatedWithPromise(at, "o1", cutoff, "sp1-1800", "Capability", []shared.ReleasedLine{{LineNo: 1, SKU: sku, PathID: "pick"}})
+		if err := p.Publish(context.Background(), ev); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		_, data := decodeAnalytics(t, w.messages[0].Value)
+		if data["promise_basis"] != "Capability" {
+			t.Errorf("promise_basis = %v, want Capability", data["promise_basis"])
+		}
+		if _, ok := data["promise_cutoff_at"]; !ok {
+			t.Error("expected promise_cutoff_at to be present for a Capability-basis promise")
+		}
+	})
+
+	t.Run("LeadTime basis omits promise_cutoff_at", func(t *testing.T) {
+		w := &fakeWriter{}
+		p := kafka.NewAnalyticsPublisher(nil, fakeOrderRepo{order: orderOnPath(t, "o1", "pick")}, func() string { return "evt" })
+		p.Writer = w
+
+		ev := shared.NewOrderAllocatedWithPromise(at, "o1", cutoff, "", "LeadTime", []shared.ReleasedLine{{LineNo: 1, SKU: sku, PathID: "pick"}})
+		if err := p.Publish(context.Background(), ev); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		_, data := decodeAnalytics(t, w.messages[0].Value)
+		if data["promise_basis"] != "LeadTime" {
+			t.Errorf("promise_basis = %v, want LeadTime", data["promise_basis"])
+		}
+		if _, ok := data["promise_cutoff_at"]; ok {
+			t.Error("expected promise_cutoff_at to be absent for a LeadTime-basis promise")
+		}
+	})
+
+	t.Run("split shipment true when order has multiple promise groups", func(t *testing.T) {
+		w := &fakeWriter{}
+		o := orderOnPath(t, "o1", "pick")
+		o.SetPromiseGroups([]order.PromiseGroup{
+			{LineNos: []int{1}, Promise: order.Promise{CptId: "sp1-1200", CutoffAt: cutoff, Basis: order.BasisCapability}},
+			{LineNos: []int{2}, Promise: order.Promise{CptId: "sp1-1800", CutoffAt: cutoff.Add(time.Hour), Basis: order.BasisCapability}},
+		})
+		p := kafka.NewAnalyticsPublisher(nil, fakeOrderRepo{order: o}, func() string { return "evt" })
+		p.Writer = w
+
+		ev := shared.NewOrderAllocatedWithPromise(at, "o1", cutoff, "sp1-1800", "Capability", []shared.ReleasedLine{{LineNo: 1, SKU: sku, PathID: "pick"}})
+		if err := p.Publish(context.Background(), ev); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		_, data := decodeAnalytics(t, w.messages[0].Value)
+		if data["split_shipment"] != true {
+			t.Errorf("split_shipment = %v, want true", data["split_shipment"])
+		}
+	})
+
+	t.Run("split shipment false for a single-group order", func(t *testing.T) {
+		w := &fakeWriter{}
+		o := orderOnPath(t, "o1", "pick")
+		o.SetPromiseGroups([]order.PromiseGroup{
+			{LineNos: []int{1}, Promise: order.Promise{CptId: "sp1-1200", CutoffAt: cutoff, Basis: order.BasisCapability}},
+		})
+		p := kafka.NewAnalyticsPublisher(nil, fakeOrderRepo{order: o}, func() string { return "evt" })
+		p.Writer = w
+
+		ev := shared.NewOrderAllocatedWithPromise(at, "o1", cutoff, "sp1-1200", "Capability", []shared.ReleasedLine{{LineNo: 1, SKU: sku, PathID: "pick"}})
+		if err := p.Publish(context.Background(), ev); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		_, data := decodeAnalytics(t, w.messages[0].Value)
+		if data["split_shipment"] != false {
+			t.Errorf("split_shipment = %v, want false", data["split_shipment"])
+		}
+	})
+}
+
 type unknownAnalyticsEvent struct{}
 
 func (unknownAnalyticsEvent) EventName() string     { return "Unknown" }

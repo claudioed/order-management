@@ -105,14 +105,23 @@ consumer independently reconstructs the SAME formula from
 byte-for-byte or idempotent redelivery breaks. Nothing catches a drift
 except manual review and cross-repo test discipline.
 
-## MCP server (`cmd/mcp`, ADR-0010) — read-only, one tool
+## MCP server (`cmd/mcp`, ADR-0010) — read-only, two tools
 
-- `internal/adapters/inbound/mcp/` — second driving adapter over the
-  **existing** `GetOrder` use case, calling the same use case struct the
-  HTTP handler calls (never a parallel code path).
-- Exactly **one tool, `get_order`**, no resource, no prompt, **no write
-  tool** — every write use case here (`ReceiveOrder`, `CancelOrder`,
-  `RetryAllocation`) enforces a real domain invariant an MCP-calling agent
-  should not trigger directly.
+- `internal/adapters/inbound/mcp/` — driving adapters over the
+  **existing** `GetOrder` use case (`get_order`) and, since ADR-0019, the
+  analytics `report.ReportStore` (`get_promise_health`) — never a
+  parallel code path for `get_order`.
+- **`get_order`**: one order's current state by id.
+- **`get_promise_health`** (ADR-0019, closing ADR 0014 §6's
+  order-management half): promise basis distribution, re-promise rate,
+  split-shipment rate, and promise-to-cutoff gap for a `from`/`to`/
+  optional `pathId` window — the same query shape `GET /reports/funnel`
+  accepts. Declares its own `PromiseHealthStore` port (never imports
+  `internal/analytics/report` directly, per the MCP adapter's own
+  arch-test dependency rule); `cmd/mcp` adapts the real
+  `report.ReportStore` into it.
+- **No write tool** — every write use case here (`ReceiveOrder`,
+  `CancelOrder`, `RetryAllocation`) enforces a real domain invariant an
+  MCP-calling agent should not trigger directly.
 - No auth (ADR-0012 rolled back the bearer-key layer this adapter
   originally had per ADR-0011).

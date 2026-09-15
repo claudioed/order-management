@@ -178,17 +178,17 @@ func (p *AnalyticsPublisher) marshalData(ctx context.Context, e shared.DomainEve
 			"line_count": ev.LineCount,
 		}), true
 	case shared.OrderAllocated:
-		return "OrderAllocated", ev.OrderID.String(), mustMarshal(map[string]any{
+		return "OrderAllocated", ev.OrderID.String(), mustMarshal(p.promiseAllocationData(ctx, map[string]any{
 			"order_id": ev.OrderID.String(),
 			"path_id":  p.firstReleasedLinePath(ctx, ev.OrderID, ev.Lines),
-		}), true
+		}, ev.OrderID, ev.PromiseBasis, ev.PromiseDate)), true
 	case shared.OrderPartiallyAllocated:
-		return "OrderPartiallyAllocated", ev.OrderID.String(), mustMarshal(map[string]any{
+		return "OrderPartiallyAllocated", ev.OrderID.String(), mustMarshal(p.promiseAllocationData(ctx, map[string]any{
 			"order_id":          ev.OrderID.String(),
 			"path_id":           p.firstReleasedLinePath(ctx, ev.OrderID, ev.Lines),
 			"allocated_lines":   ev.AllocatedLines,
 			"backordered_lines": ev.BackorderedLines,
-		}), true
+		}, ev.OrderID, ev.PromiseBasis, ev.PromiseDate)), true
 	case shared.OrderAllocationPartiallyFailed:
 		return "OrderAllocationPartiallyFailed", ev.OrderID.String(), mustMarshal(map[string]any{
 			"order_id":        ev.OrderID.String(),
@@ -228,9 +228,53 @@ func (p *AnalyticsPublisher) marshalData(ctx context.Context, e shared.DomainEve
 			"path_id":      ev.PathID.String(),
 			"work_unit_id": ev.WorkUnitID,
 		}), true
+	case shared.OrderRepromised:
+		return "OrderRepromised", ev.OrderID.String(), mustMarshal(map[string]any{
+			"order_id":   ev.OrderID.String(),
+			"cpt_id_old": ev.CptIdOld,
+			"cpt_id_new": ev.CptIdNew,
+			"reason":     ev.Reason,
+		}), true
 	default:
 		return "", "", nil, false
 	}
+}
+
+// promiseAllocationData enriches an OrderAllocated/OrderPartiallyAllocated
+// analytics payload with ADR 0014 §6's promise KPI fields: promise_basis
+// (mirrored from the event, unchanged), promise_cutoff_at (the promise's
+// CutoffAt -- the same instant as promiseDate on the event -- present only
+// for a Capability-basis promise, since a LeadTime-basis "cutoff" is just
+// now-plus-a-configured-duration and not a real departure), and
+// split_shipment (true when the order had more than one order.PromiseGroup
+// at allocation time, ADR 0014 §3 / ADR 0017). split_shipment needs an
+// OrderRepo lookup -- the SAME repo-lookup-enrichment posture this file's
+// orderPath/linePath/firstReleasedLinePath helpers already use for path_id,
+// extended here to inspect PromiseGroups() rather than Lines(). Best-effort,
+// like the rest of this file's enrichment: an order the repo cannot find
+// (or which was rehydrated with no group breakdown at all) leaves
+// split_shipment false rather than failing the publish.
+func (p *AnalyticsPublisher) promiseAllocationData(ctx context.Context, data map[string]any, orderID shared.OrderId, promiseBasis string, promiseDate time.Time) map[string]any {
+	if promiseBasis != "" {
+		data["promise_basis"] = promiseBasis
+	}
+	if promiseBasis == string(order.BasisCapability) {
+		data["promise_cutoff_at"] = promiseDate
+	}
+	data["split_shipment"] = p.hasSplitShipment(ctx, orderID)
+	return data
+}
+
+// hasSplitShipment reports whether orderID's current PromiseGroups()
+// breakdown has more than one group, i.e. its lines were promised to
+// different cutoffs (ADR 0014 §3 / ADR 0017). false for a missing order or
+// one with no recorded group breakdown -- never a failed publish.
+func (p *AnalyticsPublisher) hasSplitShipment(ctx context.Context, orderID shared.OrderId) bool {
+	o := p.findOrder(ctx, orderID)
+	if o == nil {
+		return false
+	}
+	return len(o.PromiseGroups()) > 1
 }
 
 // mustMarshal marshals a map whose shape is fully controlled by marshalData,
