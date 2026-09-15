@@ -166,7 +166,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
       - name: Run govulncheck
         run: govulncheck ./...
 
@@ -252,7 +252,12 @@ jobs:
         with:
           node-version: "20"
       - name: Install Spectral
-        run: npm install -g @stoplight/spectral-cli
+        # `npm ci` against a pinned local package-lock.json (apis/tooling/)
+        # instead of an unpinned global `npm install -g` -- installs the
+        # CLI into that directory's node_modules and PATH-prefixes it.
+        run: |
+          npm ci --prefix apis/tooling
+          echo "$PWD/apis/tooling/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Lint OpenAPI spec
         run: spectral lint apis/openapi.yaml --ruleset .spectral.yaml --fail-severity=warn
       - name: Lint AsyncAPI spec
