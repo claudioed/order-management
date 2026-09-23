@@ -70,6 +70,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		RetryAllocation: &usecases.RetryAllocation{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
 		CancelOrder:     &usecases.CancelOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock},
 		GetOrder:        &usecases.GetOrder{Orders: orders},
+		ReleaseHeld:     &usecases.ReleaseHeldOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
 	}
 
 	// A discard logger keeps the middleware on the code path (so it is
@@ -462,5 +463,63 @@ func TestUnmappedErrorBecomesAProblem500(t *testing.T) {
 	p := assertProblem(t, rec, http.StatusInternalServerError)
 	if !strings.HasSuffix(p.Type, "internal-error") {
 		t.Fatalf("problem.type = %q", p.Type)
+	}
+}
+
+func TestReleaseUnheldOrder_CarriesItsOwnProblemType(t *testing.T) {
+	// Regression: ErrOrderNotHeld was mapped in the STATUS table (409)
+	// but never in the problem-type table, so the response carried
+	// type=internal-error / "An unexpected internal error occurred"
+	// alongside a 409. A deliberate business rule was presented to the
+	// caller as a server bug — in the running cluster, verbatim:
+	//
+	//   {"type":".../internal-error","status":409,
+	//    "detail":"order was not held at intake"}
+	//
+	// Two tables, one of them updated. This test reads the type, not
+	// just the status, because the status alone was already correct.
+	e := newTestEnv(t)
+	id := e.receiveOrder(t, false) // unheld: releases at allocation
+
+	rec := e.do(t, http.MethodPost, "/orders/"+id+"/release", "")
+	body := assertProblem(t, rec, http.StatusConflict)
+
+	if !strings.HasSuffix(body.Type, "/order-not-held") {
+		t.Fatalf("problem.type = %q, want the order-not-held slug", body.Type)
+	}
+	if strings.Contains(body.Title, "unexpected internal error") {
+		t.Fatalf("a deliberate business rule must not be titled as an internal error: %q", body.Title)
+	}
+}
+
+func TestNo4xxProblemFallsBackToInternalError(t *testing.T) {
+	// The general form of the bug above: any error the status table maps
+	// to a 4xx MUST also have its own problem type. A per-error mapping
+	// kept in two tables is exactly the thing that drifts, and the
+	// failure mode is silent — the status looks right, so a status-only
+	// assertion passes while the caller is told it hit a server fault.
+	//
+	// This drives real 4xx paths through the router and asserts none of
+	// them lands on the internal-error slug.
+	cases := []struct {
+		name, method, path, body string
+		want                     int
+	}{
+		{"unknown order", http.MethodPost, "/orders/ord-does-not-exist/release", "", http.StatusNotFound},
+		{"malformed json", http.MethodPost, "/orders", "{", http.StatusBadRequest},
+		{"empty lines", http.MethodPost, "/orders", `{"lines":[]}`, http.StatusBadRequest},
+		{"non-positive quantity", http.MethodPost, "/orders", `{"lines":[{"sku":"SKU-1","quantity":0}]}`, http.StatusUnprocessableEntity},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t)
+			rec := e.do(t, tc.method, tc.path, tc.body)
+			body := assertProblem(t, rec, tc.want)
+
+			if strings.HasSuffix(body.Type, "/internal-error") {
+				t.Fatalf("a %d response fell back to the internal-error problem type: %+v", tc.want, body)
+			}
+		})
 	}
 }

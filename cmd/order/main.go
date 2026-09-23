@@ -249,6 +249,7 @@ func run() error {
 	clock := memory.SystemClock{}
 	server := &inboundhttp.Server{
 		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise, Catalogue: catalogue, Classification: classification, Metrics: orderMetrics},
+		ReleaseHeld:     &usecases.ReleaseHeldOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise},
 		RetryAllocation: &usecases.RetryAllocation{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
 		CancelOrder:     &usecases.CancelOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock},
 		GetOrder:        &usecases.GetOrder{Orders: orders},
