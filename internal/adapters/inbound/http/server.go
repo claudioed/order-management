@@ -27,6 +27,7 @@ const DefaultServiceName = "order-management"
 type Server struct {
 	ReceiveOrder    *usecases.ReceiveOrder
 	RetryAllocation *usecases.RetryAllocation
+	ReleaseHeld     *usecases.ReleaseHeldOrder
 	CancelOrder     *usecases.CancelOrder
 	GetOrder        *usecases.GetOrder
 }
@@ -69,6 +70,7 @@ func NewRouter(s *Server, logger *slog.Logger, serviceName string) http.Handler 
 	r.Post("/orders", s.handleReceiveOrder)
 	r.Get("/orders/{id}", s.handleGetOrder)
 	r.Post("/orders/{id}/retry-allocation", s.handleRetryAllocation)
+	r.Post("/orders/{id}/release", s.handleReleaseHeldOrder)
 	r.Delete("/orders/{id}", s.handleCancelOrder)
 
 	return r
@@ -106,7 +108,11 @@ func (s *Server) handleReceiveOrder(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	o, err := s.ReceiveOrder.Execute(r.Context(), lines, req.AllowPartialShipment)
+	releaseOnAllocation := true
+	if req.ReleaseOnAllocation != nil {
+		releaseOnAllocation = *req.ReleaseOnAllocation
+	}
+	o, err := s.ReceiveOrder.ExecuteHeld(r.Context(), lines, req.AllowPartialShipment, releaseOnAllocation)
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -135,6 +141,23 @@ func (s *Server) handleRetryAllocation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	o, err := s.RetryAllocation.Execute(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toOrderResponse(o))
+}
+
+// handleReleaseHeldOrder commits an order held at intake
+// (releaseOnAllocation=false) to the floor. Idempotent: releasing an
+// already-released order returns 200, because the caller may be retrying
+// a lost response and must not be punished for it (ADR 0020 §1).
+func (s *Server) handleReleaseHeldOrder(w http.ResponseWriter, r *http.Request) {
+	id, ok := orderIDParam(w, r)
+	if !ok {
+		return
+	}
+	o, err := s.ReleaseHeld.Execute(r.Context(), id)
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -191,6 +214,7 @@ func toOrderResponse(o *order.Order) orderResponse {
 		ID:                   o.ID().String(),
 		Status:               string(o.Status()),
 		AllowPartialShipment: o.AllowPartialShipment(),
+		ReleaseOnAllocation:  o.ReleaseOnAllocation(),
 		PromiseDate:          promiseDate,
 		Lines:                lines,
 	}

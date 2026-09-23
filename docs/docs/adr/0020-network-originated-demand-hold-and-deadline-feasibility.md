@@ -171,6 +171,47 @@ terms of allocation and release — concepts this service already owns —
 and is useful to any future caller that must decide before committing.
 Nothing about it names a network.
 
+#### Amendment (2026-09-23, during implementation): the hold intent is persisted
+
+This record originally claimed the hold needed no storage, because
+"allocated but not released" is expressible in the line statuses the
+aggregate already owns. **That is wrong for the partially-allocated
+case, and implementing it surfaced the hole.**
+
+A held order can have a backordered line. When stock arrives,
+`RetryAllocation` allocates it — and a held order whose lines are
+`Allocated`-but-not-`Released` is *indistinguishable, by line status
+alone*, from an ordinary ship-complete order that BR3 held back while it
+waited for that same stock. Without stored intent, retry releases the
+order, putting work on the floor for demand nobody has committed to:
+precisely the failure the hold exists to prevent, arriving by the one
+path nobody was watching.
+
+So `orders.release_on_allocation BOOLEAN NOT NULL DEFAULT TRUE` is added
+(migration `0005`), and callers pass `o.ReleaseOnAllocation()` into the
+allocation flow rather than a literal. The intent is read from the
+aggregate, which is what makes a *later* pass — triggered by a different
+caller, minutes or hours afterwards — behave correctly.
+
+Three details worth keeping:
+
+- The aggregate field is stored as its **inverse** (`heldAtIntake`).
+  Go's zero value for a bool is `false`, and every existing constructor,
+  test literal and `Rehydrate` call site leaves the field unset; storing
+  `releaseOnAllocation` directly would make all of them silently produce
+  *held* orders — failing in the worst direction, as work that never
+  reaches the floor.
+- `release_on_allocation` is deliberately **absent from the `INSERT …
+  ON CONFLICT DO UPDATE SET` list**. The hold is an intake fact; a later
+  `Save` (e.g. after release) must never rewrite it.
+- `ReleaseHeldOrder` does **not** clear the flag. It records what the
+  order was *received as*, not where it is now — line statuses already
+  carry current state. Clearing it would erase the order's history and
+  destroy exactly the retry-safety it was added for.
+
+`DEFAULT TRUE` keeps this additive: every pre-existing row, and every
+caller that never sends the field, is unchanged.
+
 ### 2. `PromisePolicy.FeasibleBy(deadline)` — the dual of `Promise`
 
 `PromisePolicy` gains one method alongside `Promise`:
