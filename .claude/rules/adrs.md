@@ -1,4 +1,4 @@
-# Architecture Decision Records (19 total, `docs/docs/adr/`)
+# Architecture Decision Records (20 total, `docs/docs/adr/`)
 
 1. **0001 — Hexagonal (ports & adapters) architecture.** The dependency
    rule this whole repo enforces (`internal/architecture/` fitness test).
@@ -164,6 +164,34 @@
     separate repo/PR. Read the ADR before touching `funnel.go`,
     `ports.go`, `postgres_projection.go`, the analytics Kafka
     consumer/publisher, or `promise_health.go`.
+
+20. **0020 — network-originated demand — release-on-allocation,
+    deadline feasibility, and the `Network` promise basis.** Companion to
+    `network-fulfillment` ADR 0001 (the bounded context that speaks
+    Amazon's Selling Partner API and owns the 24h acknowledgement clock);
+    neither is meaningful alone. Three additive capabilities here: (a) an
+    optional `releaseOnAllocation` intake flag, DEFAULT `true` so every
+    existing caller is byte-identical — `false` stops the ADR-0005 folded
+    saga after allocation (lines reach `Allocated`, `OrderAllocated` still
+    publishes, nothing is released), plus a `ReleaseHeldOrder` use case
+    reusing `allocation.go`'s release leg; (b)
+    `PromisePolicy.FeasibleBy(now, o, deadline)`, the dual of `Promise` —
+    same three ADR-0014 §2 conditions, returns the LATEST qualifying
+    window at-or-before the deadline, and **never falls back to
+    `LeadTimePolicy`** (cold cache/unknown cycle time ⇒ `false`, because
+    "could not determine" and "can meet it" must not be the same answer);
+    (c) `BasisNetwork`, a third `PromiseBasis` for a promise DICTATED by
+    an external deadline, keeping ADR 0019's KPIs separable. Plus a 422
+    invariant: `releaseOnAllocation=false` + `allowPartialShipment=true`
+    is contradictory (ADR 0017 group promising gives several answers where
+    a whole-order accept/reject can send one). Hold state is deliberately
+    "allocated, not released" — NOT a new `Held` status — so ADR 0004's
+    cancellation boundary stays intact and rejection cancels cleanly.
+    Amazon/PO/ASIN/acknowledgement vocabulary and customer PII are
+    explicitly OUT: they live in `network-fulfillment`, and `arch-go`
+    cannot catch a vocabulary leak — that check is human. Known gap
+    recorded: nothing here sweeps an orphaned hold, which sits on real
+    inventory reservations.
 
 Other ADR-adjacent facts worth knowing without opening every file:
 

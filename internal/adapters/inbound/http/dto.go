@@ -3,6 +3,8 @@
 // boundary — every response below is a DTO owned by this package.
 package http
 
+import "time"
+
 type receiveOrderLineRequest struct {
 	SKU      string `json:"sku"`
 	Quantity int    `json:"quantity"`
@@ -13,6 +15,19 @@ type receiveOrderRequest struct {
 	Lines []receiveOrderLineRequest `json:"lines"`
 	// AllowPartialShipment defaults to false — ship-complete (BR3).
 	AllowPartialShipment bool `json:"allowPartialShipment,omitempty"`
+	// ReleaseOnAllocation is a POINTER so an absent field is
+	// distinguishable from an explicit false. ADR 0020 §1 makes the
+	// default true, which is the opposite of Go's zero value: a plain
+	// bool would silently HOLD every order from every existing caller
+	// that never sends the field. nil means true.
+	ReleaseOnAllocation *bool `json:"releaseOnAllocation,omitempty"`
+	// RequiredShipBy is an externally-dictated deadline (ADR 0020 §2).
+	// When present, the promise is CONSTRAINED to a window at or before
+	// it rather than chosen as the earliest this service can manage, and
+	// an order that cannot make it comes back with NO promiseDate —
+	// which is the answer a caller holding a fill-or-kill commitment
+	// actually needs.
+	RequiredShipBy *time.Time `json:"requiredShipBy,omitempty"`
 }
 
 type orderLineResponse struct {
@@ -37,6 +52,8 @@ type orderResponse struct {
 	ID                   string              `json:"id"`
 	Status               string              `json:"status"`
 	AllowPartialShipment bool                `json:"allowPartialShipment"`
+	ReleaseOnAllocation  bool                `json:"releaseOnAllocation"`
+	RequiredShipBy       *time.Time          `json:"requiredShipBy,omitempty"`
 	PromiseDate          *string             `json:"promiseDate,omitempty"`
 	Lines                []orderLineResponse `json:"lines"`
 }

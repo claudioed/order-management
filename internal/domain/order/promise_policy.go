@@ -118,6 +118,91 @@ func (p PromisePolicy) Promise(now time.Time, o *Order) (Promise, bool) {
 	return p.fallback(now, o)
 }
 
+// FeasibleBy answers the DUAL of Promise: not "what is the earliest
+// window we can make?" but "is there a window at or before a deadline
+// someone else set, that every allocated line can make?".
+//
+// External retail networks send demand with the ship date already
+// stamped on it (network-fulfillment ADR 0001) and require a whole-order
+// commit or reject inside a fixed acknowledgement window. That inverts
+// the question this policy was built to answer, but NOT the machinery
+// that answers it: the eligibility / cycle-time / capacity rule per line
+// is identical, so this reuses linesFitWindow rather than restating it.
+// If the two ever diverge, the divergence is the bug.
+//
+// The returned Promise carries the window we actually found — its real
+// CptId and CutoffAt, which are at or before deadline — tagged
+// BasisNetwork because we did not choose it. Callers should treat
+// ok=true as "safe to commit to the network", and the returned CutoffAt
+// as the departure we are now on the hook for.
+//
+// Of the qualifying windows it returns the LATEST, not the earliest.
+// See the loop below for why; it is the opposite of Promise's choice
+// and deliberate.
+//
+// Deliberately NOT symmetric with Promise in one respect: there is no
+// LeadTimePolicy fallback. Promise falls back because a building that
+// cannot say WHEN is still a building that will ship — an approximate
+// internal promise beats refusing to take the order. A feasibility
+// answer cannot borrow that reasoning: ok=true here becomes a
+// fill-or-kill commitment to an external party who measures us on it,
+// and a guess dressed as a commitment is how a vendor loses its
+// account. Missing schedule, missing capability, unknown cycle time or
+// an empty horizon therefore all return false — "we cannot show this is
+// feasible", never "probably fine".
+//
+// That means FeasibleBy returns false on a cold cache at startup, which
+// will look like a bug the first time someone sees it. It is not. The
+// caller's correct response is to retry once the caches are warm, never
+// to substitute an estimate.
+func (p PromisePolicy) FeasibleBy(now time.Time, o *Order, deadline time.Time) (Promise, bool) {
+	lines := allocatedLines(o)
+	if len(lines) == 0 {
+		return Promise{}, false
+	}
+
+	// No fallback: absent inputs mean we cannot demonstrate feasibility.
+	if p.Schedule == nil || p.Capability == nil {
+		return Promise{}, false
+	}
+
+	windows, known := p.Schedule.NextCutoffs(p.SiteId, now, p.horizon())
+	if !known || len(windows) == 0 {
+		return Promise{}, false
+	}
+
+	var best Promise
+	var found bool
+
+	for _, w := range windows {
+		// Skip windows the deadline excludes. Do NOT break: a window
+		// past the deadline says nothing about later entries, because
+		// ScheduleSource guarantees no ordering — ascending cutoffs are
+		// a property of today's adapters, not of the domain interface.
+		if w.CutoffAt.After(deadline) {
+			continue
+		}
+		if !p.linesFitWindow(now, lines, w) {
+			continue
+		}
+		// Keep the LATEST qualifying window, not the first. When the
+		// date is fixed by someone else, shipping earlier than required
+		// buys nothing — the network has already quoted the customer a
+		// date — while consuming path capacity before a cutoff that
+		// other demand may genuinely need. So we commit to the last
+		// departure that still meets the deadline and leave the floor
+		// the most slack. This is the one place this policy's goal
+		// differs from Promise's: Promise races to the earliest cutoff
+		// because sooner is better when WE choose; FeasibleBy has
+		// nothing to gain from sooner.
+		if !found || w.CutoffAt.After(best.CutoffAt) {
+			best = Promise{CptId: w.CptId, CutoffAt: w.CutoffAt, Basis: BasisNetwork}
+			found = true
+		}
+	}
+	return best, found
+}
+
 // linesFitWindow reports whether every line in lines can make w, per the
 // three conditions in Promise's doc comment.
 func (p PromisePolicy) linesFitWindow(now time.Time, lines []*OrderLine, w CPTWindow) bool {

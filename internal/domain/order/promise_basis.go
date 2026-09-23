@@ -19,6 +19,22 @@ const (
 	// make. This is the same policy and behaviour this service used
 	// before ADR 0014, kept unchanged as the honest fallback.
 	BasisLeadTime PromiseBasis = "LeadTime"
+
+	// BasisNetwork: the promise was DICTATED by an external party's
+	// deadline rather than chosen by us. An external retail network
+	// (ADR 0020 / network-fulfillment ADR 0001) sends demand with the
+	// ship date already stamped on it; we do not select the earliest
+	// window we can make, we answer whether a window exists at or
+	// before a date someone else set, and promise that.
+	//
+	// This is a third basis rather than a flag on BasisCapability
+	// because a dictated promise and a derived one cannot be averaged:
+	// ADR 0019's promise KPIs measure how well our chosen promises
+	// track reality, and silently mixing in promises we never chose
+	// would corrupt that signal in the direction of whoever is sending
+	// us demand. Same discipline ADR 0014 applied when it refused to
+	// average Capability and LeadTime promises together.
+	BasisNetwork PromiseBasis = "Network"
 )
 
 func (b PromiseBasis) String() string { return string(b) }
