@@ -165,7 +165,7 @@
     `ports.go`, `postgres_projection.go`, the analytics Kafka
     consumer/publisher, or `promise_health.go`.
 
-20. **0020 — PROPOSED: network-originated demand — release-on-allocation,
+20. **0020 — network-originated demand — release-on-allocation,
     deadline feasibility, and the `Network` promise basis.** Companion to
     `network-fulfillment` ADR 0001 (the bounded context that speaks
     Amazon's Selling Partner API and owns the 24h acknowledgement clock);

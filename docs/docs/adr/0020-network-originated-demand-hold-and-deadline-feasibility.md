@@ -10,7 +10,7 @@ description: "ADR 0020 — order-management's half of the network-fulfillment bo
 
 ## Status
 
-Proposed. Companion to `network-fulfillment` ADR 0001 (the bounded
+Accepted (2026-09-23). Companion to `network-fulfillment` ADR 0001 (the bounded
 context that speaks Amazon's Selling Partner API and owns the
 acknowledgement clock). Neither is meaningful without the other: this
 record adds three narrow capabilities to this service that have no
