@@ -84,13 +84,60 @@ func TestFeasibleBy_WindowExactlyAtDeadline_IsFeasible(t *testing.T) {
 	}
 }
 
+func TestFeasibleBy_PicksLatestQualifyingWindow_NotEarliest(t *testing.T) {
+	now := testTime()
+	o := newAllocatedOrder(t, pq("pick", 2))
+
+	// Three windows, all within the deadline and all makeable. ADR 0020
+	// §2 requires the LATEST — shipping earlier than a fixed external
+	// date gains nothing and burns capacity other demand may need.
+	policy := feasibleByPolicy([]order.CPTWindow{
+		{CptId: "sp1-1000", CutoffAt: now.Add(4 * time.Hour), EligiblePathIds: []string{"pick"}},
+		{CptId: "sp1-1400", CutoffAt: now.Add(6 * time.Hour), EligiblePathIds: []string{"pick"}},
+		{CptId: "sp1-1800", CutoffAt: now.Add(8 * time.Hour), EligiblePathIds: []string{"pick"}},
+	}, map[shared.PathId]time.Duration{"pick": 2 * time.Hour})
+
+	got, ok := policy.FeasibleBy(now, o, now.Add(9*time.Hour))
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if got.CptId != "sp1-1800" {
+		t.Fatalf("CptId = %q, want sp1-1800 (the latest qualifying window); picking the earliest wastes slack", got.CptId)
+	}
+}
+
+func TestFeasibleBy_LatestQualifying_IgnoresUnmakeableLaterWindows(t *testing.T) {
+	now := testTime()
+	o := newAllocatedOrder(t, pq("pick", 5))
+
+	// The latest window is within the deadline but lacks capacity, so
+	// the answer must fall back to the latest window that genuinely
+	// qualifies — not simply "the last one before the deadline".
+	policy := feasibleByPolicy([]order.CPTWindow{
+		{CptId: "sp1-1400", CutoffAt: now.Add(6 * time.Hour), EligiblePathIds: []string{"pick"}},
+		{CptId: "sp1-1800", CutoffAt: now.Add(8 * time.Hour), EligiblePathIds: []string{"pick"}},
+	}, map[shared.PathId]time.Duration{"pick": 2 * time.Hour})
+	policy.Capacity = &fakeCapacity{
+		remaining: map[string]int{capacityKey("pick", "sp1-1800"): 1},
+		known:     map[string]bool{capacityKey("pick", "sp1-1800"): true},
+	}
+
+	got, ok := policy.FeasibleBy(now, o, now.Add(9*time.Hour))
+	if !ok {
+		t.Fatal("expected ok=true: the earlier window still qualifies")
+	}
+	if got.CptId != "sp1-1400" {
+		t.Fatalf("CptId = %q, want sp1-1400 — a later window that fails capacity must not be chosen", got.CptId)
+	}
+}
+
 func TestFeasibleBy_SkipsLateWindowAndPicksEarlierFeasibleOne(t *testing.T) {
 	now := testTime()
 	o := newAllocatedOrder(t, pq("pick", 2))
 
-	// Deliberately UNSORTED: the late window comes first. FeasibleBy
-	// must not stop at the first out-of-range window — the domain
-	// interface promises no ordering, only today's adapters do.
+	// Deliberately UNSORTED: the out-of-range window comes first.
+	// FeasibleBy must not stop at the first out-of-range window — the
+	// domain interface promises no ordering, only today's adapters do.
 	policy := feasibleByPolicy([]order.CPTWindow{
 		{CptId: "sp1-2200", CutoffAt: now.Add(10 * time.Hour), EligiblePathIds: []string{"pick"}},
 		{CptId: "sp1-1800", CutoffAt: now.Add(6 * time.Hour), EligiblePathIds: []string{"pick"}},
@@ -276,21 +323,21 @@ func TestFeasibleBy_NoAllocatedLines_IsNotFeasible(t *testing.T) {
 
 // --- agreement with Promise ----------------------------------------------
 
-func TestFeasibleBy_AgreesWithPromise_WhenPromiseIsCapabilityBased(t *testing.T) {
+func TestFeasibleBy_AgreesWithPromise_OnTheSingleFeasibleWindow(t *testing.T) {
 	now := testTime()
 	o := newAllocatedOrder(t, pq("pick", 2))
 
+	// With exactly ONE qualifying window, "earliest" and "latest" are
+	// the same window, so the two policies must name it identically.
+	// This is the honest agreement test: where they can differ they
+	// SHOULD differ (Promise takes the earliest, FeasibleBy the
+	// latest), so asserting agreement on a multi-window horizon would
+	// just re-encode a bug.
 	policy := feasibleByPolicy(
-		[]order.CPTWindow{
-			{CptId: "sp1-1800", CutoffAt: now.Add(6 * time.Hour), EligiblePathIds: []string{"pick"}},
-			{CptId: "sp1-2200", CutoffAt: now.Add(10 * time.Hour), EligiblePathIds: []string{"pick"}},
-		},
+		[]order.CPTWindow{{CptId: "sp1-1800", CutoffAt: now.Add(6 * time.Hour), EligiblePathIds: []string{"pick"}}},
 		map[shared.PathId]time.Duration{"pick": 2 * time.Hour},
 	)
 
-	// Given a deadline generous enough to admit the window Promise
-	// itself would choose, both must name the SAME window. Only the
-	// basis differs — same machinery, different question.
 	promised, pok := policy.Promise(now, o)
 	if !pok || promised.Basis != order.BasisCapability {
 		t.Fatalf("precondition failed: Promise ok=%v basis=%q", pok, promised.Basis)
@@ -301,11 +348,36 @@ func TestFeasibleBy_AgreesWithPromise_WhenPromiseIsCapabilityBased(t *testing.T)
 		t.Fatal("expected ok=true")
 	}
 	if feasible.CptId != promised.CptId || !feasible.CutoffAt.Equal(promised.CutoffAt) {
-		t.Fatalf("FeasibleBy chose (%s, %v), Promise chose (%s, %v) — the two must agree on the window",
+		t.Fatalf("FeasibleBy chose (%s, %v), Promise chose (%s, %v) — with one window they must agree",
 			feasible.CptId, feasible.CutoffAt, promised.CptId, promised.CutoffAt)
 	}
 	if feasible.Basis == promised.Basis {
 		t.Fatal("basis must differ: Promise chose this window, FeasibleBy was handed the deadline")
+	}
+}
+
+func TestFeasibleBy_DivergesFromPromise_WhenSeveralWindowsQualify(t *testing.T) {
+	now := testTime()
+	o := newAllocatedOrder(t, pq("pick", 2))
+
+	// The inverse of the test above, and the one that pins ADR 0020 §2:
+	// given a choice, Promise takes the EARLIEST and FeasibleBy the
+	// LATEST. They must not agree here.
+	policy := feasibleByPolicy([]order.CPTWindow{
+		{CptId: "sp1-1000", CutoffAt: now.Add(4 * time.Hour), EligiblePathIds: []string{"pick"}},
+		{CptId: "sp1-1800", CutoffAt: now.Add(8 * time.Hour), EligiblePathIds: []string{"pick"}},
+	}, map[shared.PathId]time.Duration{"pick": 2 * time.Hour})
+
+	promised, _ := policy.Promise(now, o)
+	feasible, ok := policy.FeasibleBy(now, o, now.Add(9*time.Hour))
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if promised.CptId != "sp1-1000" {
+		t.Fatalf("Promise chose %q, want the earliest sp1-1000", promised.CptId)
+	}
+	if feasible.CptId != "sp1-1800" {
+		t.Fatalf("FeasibleBy chose %q, want the latest sp1-1800", feasible.CptId)
 	}
 }
 

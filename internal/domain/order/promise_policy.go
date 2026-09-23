@@ -136,6 +136,10 @@ func (p PromisePolicy) Promise(now time.Time, o *Order) (Promise, bool) {
 // ok=true as "safe to commit to the network", and the returned CutoffAt
 // as the departure we are now on the hook for.
 //
+// Of the qualifying windows it returns the LATEST, not the earliest.
+// See the loop below for why; it is the opposite of Promise's choice
+// and deliberate.
+//
 // Deliberately NOT symmetric with Promise in one respect: there is no
 // LeadTimePolicy fallback. Promise falls back because a building that
 // cannot say WHEN is still a building that will ship — an approximate
@@ -167,22 +171,36 @@ func (p PromisePolicy) FeasibleBy(now time.Time, o *Order, deadline time.Time) (
 		return Promise{}, false
 	}
 
+	var best Promise
+	var found bool
+
 	for _, w := range windows {
-		// Windows arrive in ascending cutoff order, so the first
-		// qualifying one is also the earliest — but a window PAST the
-		// deadline is skipped rather than breaking the loop, because
-		// ScheduleSource's ordering is a property of today's adapters,
-		// not a guarantee of the domain interface. Scanning the whole
-		// horizon costs a few comparisons and cannot silently miss a
-		// feasible window if an adapter ever returns them unsorted.
+		// Skip windows the deadline excludes. Do NOT break: a window
+		// past the deadline says nothing about later entries, because
+		// ScheduleSource guarantees no ordering — ascending cutoffs are
+		// a property of today's adapters, not of the domain interface.
 		if w.CutoffAt.After(deadline) {
 			continue
 		}
-		if p.linesFitWindow(now, lines, w) {
-			return Promise{CptId: w.CptId, CutoffAt: w.CutoffAt, Basis: BasisNetwork}, true
+		if !p.linesFitWindow(now, lines, w) {
+			continue
+		}
+		// Keep the LATEST qualifying window, not the first. When the
+		// date is fixed by someone else, shipping earlier than required
+		// buys nothing — the network has already quoted the customer a
+		// date — while consuming path capacity before a cutoff that
+		// other demand may genuinely need. So we commit to the last
+		// departure that still meets the deadline and leave the floor
+		// the most slack. This is the one place this policy's goal
+		// differs from Promise's: Promise races to the earliest cutoff
+		// because sooner is better when WE choose; FeasibleBy has
+		// nothing to gain from sooner.
+		if !found || w.CutoffAt.After(best.CutoffAt) {
+			best = Promise{CptId: w.CptId, CutoffAt: w.CutoffAt, Basis: BasisNetwork}
+			found = true
 		}
 	}
-	return Promise{}, false
+	return best, found
 }
 
 // linesFitWindow reports whether every line in lines can make w, per the
