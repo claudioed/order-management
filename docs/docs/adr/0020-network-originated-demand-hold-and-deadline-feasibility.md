@@ -243,6 +243,42 @@ empty horizon: all `false`.
 
 `Promise` is not modified. Its tests remain valid.
 
+#### Amendment (2026-09-23, phase 4): the deadline reaches intake
+
+Phase 2 added `FeasibleBy` and stopped there, which left this record
+describing a method **nothing in the service ever called**. `POST /orders`
+accepted no deadline, so the only way to reach it was a domain unit test.
+`network-fulfillment` discovered this the moment it tried: its ADR 0001
+§7 says feasibility is *asked* of `order-management`, and there was no
+way to ask.
+
+Intake therefore accepts an optional `requiredShipBy`:
+
+- `orders.required_ship_by TIMESTAMPTZ NULL` (migration `0006`),
+  nullable with no default, because "no deadline" is the overwhelming
+  majority and must stay distinguishable from "a deadline at the zero
+  instant" — the latter would make every ordinary order look infeasible.
+- `Order.requiredShipBy` is a `*time.Time` for the same reason, set via
+  a `SetRequiredShipBy` mutator rather than a fourth `Rehydrate`
+  parameter (the chain is already `Rehydrate` / `RehydrateWithGroups` /
+  `RehydrateHeld`; widening it again costs every call site an argument
+  it does not care about).
+- `allocationDeps.setPromiseDate` routes on it: a deadline present means
+  `FeasibleBy`, absent means `PromiseGroups` exactly as before.
+
+**An infeasible order is left with no promise at all**, and is still
+created, still allocated, still returned `201`. "We cannot make your
+date" is an answer, not a rejection — and an optimistic promise we
+already know breaks the deadline would tell the caller we can do
+something we cannot, when finding that out is their entire reason for
+sending a deadline.
+
+The deadline is persisted rather than passed transiently for the same
+reason the hold is (§1's own amendment): a later `RetryAllocation`
+re-promises, and a deadline that did not survive the round trip would
+silently drop back to the ordinary earliest-window promise and break the
+external commitment with no trace.
+
 ### 3. `PromiseBasis` gains a third value: `Network`
 
 ```go

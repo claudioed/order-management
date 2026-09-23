@@ -3,6 +3,7 @@ package order_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/claudioed/order-management/internal/domain/order"
 )
@@ -48,5 +49,29 @@ func TestOrder_ReleaseOnAllocation_DefaultsTrue(t *testing.T) {
 	o.Hold()
 	if o.ReleaseOnAllocation() {
 		t.Fatal("after Hold() the order must report ReleaseOnAllocation()=false")
+	}
+}
+
+func TestOrder_RequiredShipBy_AbsentByDefault(t *testing.T) {
+	line, err := order.NewOrderLine(1, "SKU-1", 1, "pick", false)
+	if err != nil {
+		t.Fatalf("NewOrderLine: %v", err)
+	}
+	o, err := order.New("ord-1", []*order.OrderLine{line}, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Absent, not a zero time.Time: "no deadline" must stay
+	// distinguishable from "a deadline at the zero instant", which would
+	// make every ordinary order look infeasible.
+	if o.RequiredShipBy() != nil {
+		t.Fatal("a newly-constructed order must carry no deadline")
+	}
+
+	deadline := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+	o.SetRequiredShipBy(deadline)
+	if got := o.RequiredShipBy(); got == nil || !got.Equal(deadline) {
+		t.Fatalf("requiredShipBy = %v, want %v", got, deadline)
 	}
 }

@@ -80,6 +80,18 @@ type Order struct {
 	// HELD order, which fails closed in the worst possible direction:
 	// work that never reaches the floor, on orders nobody asked to hold.
 	heldAtIntake bool
+
+	// requiredShipBy is an externally-dictated deadline attached at
+	// intake (ADR 0020 §2). When set, the promise is not CHOSEN by this
+	// service — it is constrained to a window at or before this instant,
+	// and an order that cannot make it gets no promise at all rather
+	// than an optimistic one.
+	//
+	// A pointer, not a zero time.Time: "no deadline" is the overwhelming
+	// majority of orders and must be distinguishable from "a deadline
+	// that happens to be the zero instant", which would otherwise make
+	// every ordinary order look infeasible.
+	requiredShipBy *time.Time
 }
 
 // New constructs an Order in Received status. lines must be non-empty;
@@ -159,6 +171,19 @@ func (o *Order) ReleaseOnAllocation() bool { return !o.heldAtIntake }
 // deliberately no way to hold an order that has already released work,
 // because the floor cannot un-see a task it has been given.
 func (o *Order) Hold() { o.heldAtIntake = true }
+
+// RequiredShipBy returns the externally-dictated deadline, or nil when
+// this order has none (the overwhelming majority).
+func (o *Order) RequiredShipBy() *time.Time { return o.requiredShipBy }
+
+// SetRequiredShipBy attaches an external deadline (ADR 0020 §2).
+//
+// A mutator rather than a fourth Rehydrate parameter: the constructor
+// chain is already Rehydrate / RehydrateWithGroups / RehydrateHeld, and
+// widening it again would force every existing call site to grow an
+// argument it does not care about. Repositories call this after
+// rehydrating, the same way intake calls Hold().
+func (o *Order) SetRequiredShipBy(t time.Time) { o.requiredShipBy = &t }
 
 // Lines returns the order's lines. The slice is a copy, but the
 // *OrderLine values are the aggregate's own entities: they are read-only

@@ -112,7 +112,7 @@ func (s *Server) handleReceiveOrder(w http.ResponseWriter, r *http.Request) {
 	if req.ReleaseOnAllocation != nil {
 		releaseOnAllocation = *req.ReleaseOnAllocation
 	}
-	o, err := s.ReceiveOrder.ExecuteHeld(r.Context(), lines, req.AllowPartialShipment, releaseOnAllocation)
+	o, err := s.ReceiveOrder.ExecuteWithDeadline(r.Context(), lines, req.AllowPartialShipment, releaseOnAllocation, req.RequiredShipBy)
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -215,6 +215,7 @@ func toOrderResponse(o *order.Order) orderResponse {
 		Status:               string(o.Status()),
 		AllowPartialShipment: o.AllowPartialShipment(),
 		ReleaseOnAllocation:  o.ReleaseOnAllocation(),
+		RequiredShipBy:       o.RequiredShipBy(),
 		PromiseDate:          promiseDate,
 		Lines:                lines,
 	}
