@@ -292,17 +292,20 @@ paths:
         per-line payload.
 
 
-        IDEMPOTENT: releasing an order whose lines are already released
-        returns `200` with no state change and no event. A caller working
-        against an external fill-or-kill deadline cannot distinguish "my
-        release was lost" from "my release failed", so retrying must be
+        IDEMPOTENT for a HELD order: releasing one whose lines are already
+        released returns `200` with no state change and no event. A caller
+        working against an external fill-or-kill deadline cannot distinguish
+        "my release was lost" from "my release failed", so retrying must be
         safe.
 
 
         An order that was never held has nothing to release on demand — its
         lines release themselves at allocation — so calling this on one is
         rejected with `409` rather than silently succeeding, since it means
-        the caller has the wrong order id or the wrong expectation.
+        the caller has the wrong order id or the wrong expectation. This
+        holds even when that order has no allocated lines of its own (a
+        backordered order, say): "never held" and "already released" are
+        different answers and must not collapse into one.
       tags: [Allocation]
       parameters:
         - $ref: "#/components/parameters/OrderId"

@@ -164,10 +164,68 @@ func TestReleaseHeldOrder_OnUnheldOrder_IsRejected(t *testing.T) {
 		Orders: f.orders, Events: f.events, Clock: f.clock,
 		Inventory: f.inventory, Promise: f.promise,
 	}
-	// Already released by intake, so the idempotent branch answers
-	// first — releasing an unheld order is a no-op success, not a 409.
+
+	// This test previously asserted the OPPOSITE of its own name: it
+	// accepted the idempotent no-op success, which made ErrOrderNotHeld
+	// unreachable for every order intake can produce. Found by calling
+	// POST /orders/{id}/release against a plain order in the running
+	// cluster and getting 200.
+	_, err = uc.Execute(context.Background(), o.ID())
+	if !errors.Is(err, usecases.ErrOrderNotHeld) {
+		t.Fatalf("releasing an order that was never held: err = %v, want ErrOrderNotHeld", err)
+	}
+}
+
+func TestReleaseHeldOrder_UnheldAndBackordered_IsStillRejected(t *testing.T) {
+	// The exact cluster shape: an unheld order with NO allocated lines
+	// (no stock). Both the hold check and the idempotency check match it,
+	// so this pins the ordering between them — with idempotency first it
+	// answered 200.
+	f := newFixture()
+	f.inventory.reserveErr = ports.ErrInsufficientStock
+	rec := f.receiveOrder()
+	o, err := rec.Execute(context.Background(), []usecases.NewLine{
+		{SKU: "SKU-1", Quantity: 1, PathID: "pick"},
+	}, false)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(o.LinesWithStatus(order.LineAllocated)) != 0 {
+		t.Fatalf("fixture precondition: expected no allocated lines, got %d",
+			len(o.LinesWithStatus(order.LineAllocated)))
+	}
+
+	uc := &usecases.ReleaseHeldOrder{
+		Orders: f.orders, Events: f.events, Clock: f.clock,
+		Inventory: f.inventory, Promise: f.promise,
+	}
+	_, err = uc.Execute(context.Background(), o.ID())
+	if !errors.Is(err, usecases.ErrOrderNotHeld) {
+		t.Fatalf("releasing a never-held backordered order: err = %v, want ErrOrderNotHeld", err)
+	}
+}
+
+func TestReleaseHeldOrder_HeldAndAlreadyReleased_IsStillIdempotent(t *testing.T) {
+	// The case idempotency actually protects must keep working after the
+	// reordering: a HELD order, released, then released again.
+	f := newFixture()
+	rec := f.receiveOrder()
+	o, err := rec.ExecuteHeld(context.Background(), []usecases.NewLine{
+		{SKU: "SKU-1", Quantity: 1, PathID: "pick"},
+	}, false, false)
+	if err != nil {
+		t.Fatalf("ExecuteHeld: %v", err)
+	}
+
+	uc := &usecases.ReleaseHeldOrder{
+		Orders: f.orders, Events: f.events, Clock: f.clock,
+		Inventory: f.inventory, Promise: f.promise,
+	}
 	if _, err := uc.Execute(context.Background(), o.ID()); err != nil {
-		t.Fatalf("expected idempotent success on an already-released order, got %v", err)
+		t.Fatalf("first release: %v", err)
+	}
+	if _, err := uc.Execute(context.Background(), o.ID()); err != nil {
+		t.Fatalf("second release must be an idempotent success, got %v", err)
 	}
 }
 

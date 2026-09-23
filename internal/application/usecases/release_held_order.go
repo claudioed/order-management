@@ -22,12 +22,17 @@ import (
 // per-line payload. A second implementation of release would be a second
 // thing to keep in sync with ADR 0017's promise-group payload.
 //
-// IDEMPOTENT by design: an order whose lines are already Released
-// returns success with no state change and no event. The caller may be
-// retrying after a network failure or a lost response, and must not be
-// punished for it — an external caller holding a fill-or-kill deadline
-// cannot distinguish "my release was lost" from "my release failed", so
-// the safe action for it must be to retry.
+// IDEMPOTENT for the case that matters: a HELD order whose lines are
+// already Released returns success with no state change and no event.
+// The caller may be retrying after a network failure or a lost response,
+// and must not be punished for it — an external caller holding a
+// fill-or-kill deadline cannot distinguish "my release was lost" from
+// "my release failed", so the safe action for it must be to retry.
+//
+// An order that was never held is a different question and answers 409,
+// even though it too has no Allocated lines: that is a caller with the
+// wrong id or the wrong mental model, and the two cases must not share
+// an answer.
 //
 // It deliberately does NOT clear the hold flag. The flag records what
 // the order was received as, not where it is now; line statuses already
@@ -50,20 +55,34 @@ func (uc *ReleaseHeldOrder) Execute(ctx context.Context, id shared.OrderId) (*or
 		return nil, ErrOrderNotFound
 	}
 
-	// Already released: succeed without touching anything. Checked
-	// before the hold check so that a retry against an order that was
-	// successfully released still returns success rather than a 409
-	// about the hold.
-	if len(o.LinesWithStatus(order.LineAllocated)) == 0 {
-		return o, nil
-	}
-
 	// An order that was never held has nothing to release on demand: its
 	// lines release themselves at allocation. Reaching here means the
 	// caller has the wrong order id or a wrong mental model, and silently
-	// releasing would hide that.
+	// returning success would hide that.
+	//
+	// Checked BEFORE the idempotency branch, deliberately. The two
+	// branches overlap for every unheld order, because an unheld order's
+	// lines are Released (or Backordered) and never Allocated — so with
+	// the idempotency check first, this one was unreachable for anything
+	// intake can produce, and "release an order that was never held"
+	// answered 200. Verified against the running cluster: a plain order
+	// returned 200 from POST /orders/{id}/release, which is precisely
+	// the wrong mental model this error exists to surface.
+	//
+	// Ordering them this way costs nothing for the case idempotency
+	// protects: a HELD order that was already released still reaches the
+	// branch below and still returns success, because its flag is false.
 	if o.ReleaseOnAllocation() {
 		return nil, ErrOrderNotHeld
+	}
+
+	// Already released: succeed without touching anything. The caller may
+	// be retrying after a network failure or a lost response, and must
+	// not be punished for it — an external caller holding a fill-or-kill
+	// deadline cannot distinguish "my release was lost" from "my release
+	// failed", so the safe action for it must be to retry.
+	if len(o.LinesWithStatus(order.LineAllocated)) == 0 {
+		return o, nil
 	}
 
 	deps := allocationDeps{Orders: uc.Orders, Inventory: uc.Inventory, Events: uc.Events, Clock: uc.Clock, Promise: uc.Promise}
