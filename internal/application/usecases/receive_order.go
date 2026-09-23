@@ -2,6 +2,7 @@ package usecases
 
 import (
 	"context"
+	"time"
 
 	"github.com/claudioed/order-management/internal/application/ports"
 	"github.com/claudioed/order-management/internal/domain/order"
@@ -130,6 +131,18 @@ func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowParti
 // Execute delegates here with true, so every existing caller and test is
 // unchanged.
 func (uc *ReceiveOrder) ExecuteHeld(ctx context.Context, lines []NewLine, allowPartialShipment, releaseOnAllocation bool) (*order.Order, error) {
+	return uc.ExecuteWithDeadline(ctx, lines, allowPartialShipment, releaseOnAllocation, nil)
+}
+
+// ExecuteWithDeadline is ExecuteHeld plus ADR 0020 §2's externally
+// dictated deadline. A nil requiredShipBy is the ordinary case and
+// behaves exactly as before: the promise is CHOSEN by this service.
+//
+// With a deadline the promise is instead CONSTRAINED to it, via
+// PromisePolicy.FeasibleBy — and an order that cannot make it comes back
+// with no promise at all rather than an optimistic one, which is the
+// signal a caller holding a fill-or-kill commitment needs.
+func (uc *ReceiveOrder) ExecuteWithDeadline(ctx context.Context, lines []NewLine, allowPartialShipment, releaseOnAllocation bool, requiredShipBy *time.Time) (*order.Order, error) {
 	// ADR 0020 §4: reject the contradictory combination BEFORE minting an
 	// id or persisting anything — a rejected intake must leave no trace.
 	if err := order.ValidateIntakeIntent(allowPartialShipment, releaseOnAllocation); err != nil {
@@ -179,6 +192,9 @@ func (uc *ReceiveOrder) ExecuteHeld(ctx context.Context, lines []NewLine, allowP
 	}
 	if !releaseOnAllocation {
 		o.Hold()
+	}
+	if requiredShipBy != nil {
+		o.SetRequiredShipBy(*requiredShipBy)
 	}
 
 	if err := uc.Orders.Save(ctx, o); err != nil {

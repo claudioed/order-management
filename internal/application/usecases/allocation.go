@@ -204,9 +204,52 @@ type allocationDeps struct {
 // which would need to keep being manually kept in sync with the other)
 // is the smaller, more obviously-correct change against this call site.
 func (deps allocationDeps) setPromiseDate(o *order.Order) {
+	// ADR 0020 §2: an order carrying an externally-dictated deadline is
+	// promised by FeasibleBy, not by PromiseGroups. This is the routing
+	// that makes FeasibleBy reachable at all — without it the method
+	// exists but nothing in the service ever calls it, which was true
+	// between phase 2 and this change.
+	//
+	// The two differ in KIND, not just in inputs. PromiseGroups asks
+	// "what is the earliest we can manage?" and always answers with
+	// something, falling back to lead-time when capability data is
+	// missing. FeasibleBy asks "is there a window at or before a date
+	// somebody else set?" and answers false rather than guessing,
+	// because its true is a fill-or-kill commitment an external party
+	// measures us on.
+	//
+	// An infeasible order is therefore left with NO promise, deliberately.
+	// The alternative — writing an optimistic promise we already know
+	// breaks the deadline — would tell the caller we can do something we
+	// cannot, and the caller's whole reason for sending a deadline is to
+	// find out before committing.
+	if deadline := o.RequiredShipBy(); deadline != nil {
+		if p, ok := deps.Promise.FeasibleBy(deps.Clock.Now(), o, *deadline); ok {
+			o.SetPromiseGroups([]order.PromiseGroup{{
+				LineNos: allocatedLineNos(o),
+				Promise: p,
+			}})
+		}
+		return
+	}
+
 	if groups, ok := deps.Promise.PromiseGroups(deps.Clock.Now(), o); ok {
 		o.SetPromiseGroups(groups)
 	}
+}
+
+// allocatedLineNos lists the line numbers FeasibleBy actually reasoned
+// about. FeasibleBy is all-or-nothing across the allocated set — network
+// demand is ship-complete (ADR 0020 §4), so there is exactly one group
+// and it covers every allocated line.
+func allocatedLineNos(o *order.Order) []int {
+	var out []int
+	for _, l := range o.Lines() {
+		if l.Status() == order.LineAllocated {
+			out = append(out, l.LineNo())
+		}
+	}
+	return out
 }
 
 // promiseGroupByLine indexes o.PromiseGroups() (ADR 0014 §3 / ADR 0017)

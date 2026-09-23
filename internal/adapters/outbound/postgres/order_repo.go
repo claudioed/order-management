@@ -45,13 +45,13 @@ func (r *OrderRepo) Save(ctx context.Context, o *order.Order) error {
 	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO orders (id, allow_partial_shipment, promise_date, promise_cpt_id, promise_basis, release_on_allocation)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO orders (id, allow_partial_shipment, promise_date, promise_cpt_id, promise_basis, release_on_allocation, required_ship_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (id) DO UPDATE SET
 			promise_date = EXCLUDED.promise_date,
 			promise_cpt_id = EXCLUDED.promise_cpt_id,
 			promise_basis = EXCLUDED.promise_basis
-	`, o.ID().String(), o.AllowPartialShipment(), promiseDate, promiseCptId, promiseBasis, o.ReleaseOnAllocation()); err != nil {
+	`, o.ID().String(), o.AllowPartialShipment(), promiseDate, promiseCptId, promiseBasis, o.ReleaseOnAllocation(), o.RequiredShipBy()); err != nil {
 		return err
 	}
 
@@ -100,10 +100,11 @@ func (r *OrderRepo) FindByID(ctx context.Context, id shared.OrderId) (*order.Ord
 	var promiseCptId *string
 	var promiseBasisRaw *string
 	var releaseOnAllocation bool
+	var requiredShipBy *time.Time
 
 	err := r.pool.QueryRow(ctx, `
-		SELECT allow_partial_shipment, promise_date, promise_cpt_id, promise_basis, release_on_allocation FROM orders WHERE id = $1
-	`, id.String()).Scan(&allowPartialShipment, &promiseDate, &promiseCptId, &promiseBasisRaw, &releaseOnAllocation)
+		SELECT allow_partial_shipment, promise_date, promise_cpt_id, promise_basis, release_on_allocation, required_ship_by FROM orders WHERE id = $1
+	`, id.String()).Scan(&allowPartialShipment, &promiseDate, &promiseCptId, &promiseBasisRaw, &releaseOnAllocation, &requiredShipBy)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -182,7 +183,15 @@ func (r *OrderRepo) FindByID(ctx context.Context, id shared.OrderId) (*order.Ord
 		return nil, err
 	}
 
-	return order.RehydrateHeld(id, lines, allowPartialShipment, promiseDate, promiseCptId, promiseBasis, promiseGroups, releaseOnAllocation), nil
+	o := order.RehydrateHeld(id, lines, allowPartialShipment, promiseDate, promiseCptId, promiseBasis, promiseGroups, releaseOnAllocation)
+	// Set after rehydration rather than as a fourth Rehydrate parameter:
+	// the deadline is optional and most orders have none, so widening the
+	// constructor chain again would cost every call site an argument it
+	// does not care about.
+	if requiredShipBy != nil {
+		o.SetRequiredShipBy(*requiredShipBy)
+	}
+	return o, nil
 }
 
 // NextID mints an order id. The `ord-<uuid>` shape mirrors the

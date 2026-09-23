@@ -525,6 +525,30 @@ components:
           description: The requested lines. An order must have at least one.
           items:
             $ref: "#/components/schemas/ReceiveOrderLineRequest"
+        requiredShipBy:
+          type: string
+          format: date-time
+          description: >
+            OPTIONAL. An externally-dictated deadline (RFC 3339) — the
+            instant this order must ship by, set by someone other than this
+            service (a retail network's required ship-by, for example).
+
+
+            When present the promise is CONSTRAINED to a CPT window at or
+            before it, rather than being the earliest window this service
+            can manage; specifically, the LATEST window that still meets the
+            deadline is chosen, leaving the floor maximum slack (ADR 0020
+            §2). When the deadline cannot be met the order is still created
+            and allocated, but comes back with NO `promiseDate` at all —
+            an absent promise is the honest signal that we cannot commit,
+            and is exactly what a caller holding a fill-or-kill obligation
+            needs to see before acknowledging it downstream.
+
+
+            Unlike the ordinary promise path, this one has NO lead-time
+            fallback: missing schedule or capability data yields no promise
+            rather than an estimate, because a guess dressed as a
+            commitment is worse than an admission of ignorance.
         releaseOnAllocation:
           type: boolean
           default: true
@@ -659,6 +683,15 @@ components:
           type: boolean
           description: False means ship-complete (BR3), the default.
           example: false
+        requiredShipBy:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            The externally-dictated deadline this order was received with,
+            or absent when it has none (the overwhelming majority). See the
+            same field on ReceiveOrderRequest.
+          example: "2026-09-25T08:00:00Z"
         releaseOnAllocation:
           type: boolean
           description: >
