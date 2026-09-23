@@ -111,6 +111,8 @@ func problemFor(err error) problemInfo {
 		return problemInfo{"no-backordered-lines", "Order has no backordered lines to retry"}
 	case errors.Is(err, usecases.ErrPromiseDateNotSet):
 		return problemInfo{"promise-date-not-set", "Order has no promise date; allocate it first"}
+	case errors.Is(err, usecases.ErrOrderNotHeld):
+		return problemInfo{"order-not-held", "Order was not held at intake and has nothing to release on demand"}
 
 	case errors.Is(err, ports.ErrDownstreamNotConfigured):
 		return problemInfo{"downstream-not-configured", "A downstream service is running in permissive (no-op) mode"}
