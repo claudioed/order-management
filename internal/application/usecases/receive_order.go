@@ -123,6 +123,19 @@ type ReceiveOrder struct {
 }
 
 func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowPartialShipment bool) (*order.Order, error) {
+	return uc.ExecuteHeld(ctx, lines, allowPartialShipment, true)
+}
+
+// ExecuteHeld is Execute plus ADR 0020 §1's releaseOnAllocation intent.
+// Execute delegates here with true, so every existing caller and test is
+// unchanged.
+func (uc *ReceiveOrder) ExecuteHeld(ctx context.Context, lines []NewLine, allowPartialShipment, releaseOnAllocation bool) (*order.Order, error) {
+	// ADR 0020 §4: reject the contradictory combination BEFORE minting an
+	// id or persisting anything — a rejected intake must leave no trace.
+	if err := order.ValidateIntakeIntent(allowPartialShipment, releaseOnAllocation); err != nil {
+		uc.recordRejected(ctx)
+		return nil, err
+	}
 	domainLines := make([]*order.OrderLine, 0, len(lines))
 	for i, l := range lines {
 		pathID := l.PathID
@@ -164,6 +177,9 @@ func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowParti
 		uc.recordRejected(ctx)
 		return nil, err
 	}
+	if !releaseOnAllocation {
+		o.Hold()
+	}
 
 	if err := uc.Orders.Save(ctx, o); err != nil {
 		return nil, err
@@ -184,7 +200,7 @@ func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowParti
 	// genuine progress was made before the failure, so this is never a
 	// silent swallow — just never surfaced as a ReceiveOrder failure.
 	deps := allocationDeps{Orders: uc.Orders, Inventory: uc.Inventory, Events: uc.Events, Clock: uc.Clock, Promise: uc.Promise}
-	if _, err := allocateAndRelease(ctx, deps, o, o.LinesWithStatus(order.LinePending), false); err != nil {
+	if _, err := allocateAndRelease(ctx, deps, o, o.LinesWithStatus(order.LinePending), false, releaseOnAllocation); err != nil {
 		// allocateAndRelease may have mutated o in memory (e.g. marked a
 		// line Backordered) without persisting that mutation — it only
 		// saves when at least one line was genuinely allocated before the

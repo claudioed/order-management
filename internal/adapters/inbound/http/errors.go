@@ -25,7 +25,8 @@ func statusFor(err error) int {
 		return http.StatusBadRequest
 
 	case errors.Is(err, shared.ErrNonPositiveQuantity),
-		errors.Is(err, shared.ErrLineIneligibleForResolvedPath):
+		errors.Is(err, shared.ErrLineIneligibleForResolvedPath),
+		errors.Is(err, order.ErrHeldOrderMustBeShipComplete):
 		return http.StatusUnprocessableEntity
 
 	case errors.Is(err, order.ErrOrderAlreadyReleased),
@@ -36,7 +37,8 @@ func statusFor(err error) int {
 		errors.Is(err, order.ErrLineNotAllocated),
 		errors.Is(err, usecases.ErrNoAllocatedLines),
 		errors.Is(err, usecases.ErrNoBackorderedLines),
-		errors.Is(err, usecases.ErrPromiseDateNotSet):
+		errors.Is(err, usecases.ErrPromiseDateNotSet),
+		errors.Is(err, usecases.ErrOrderNotHeld):
 		return http.StatusConflict
 
 	// The downstream Suppliers are not wired up (permissive mode), or an

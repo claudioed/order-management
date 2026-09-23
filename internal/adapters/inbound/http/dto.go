@@ -13,6 +13,12 @@ type receiveOrderRequest struct {
 	Lines []receiveOrderLineRequest `json:"lines"`
 	// AllowPartialShipment defaults to false — ship-complete (BR3).
 	AllowPartialShipment bool `json:"allowPartialShipment,omitempty"`
+	// ReleaseOnAllocation is a POINTER so an absent field is
+	// distinguishable from an explicit false. ADR 0020 §1 makes the
+	// default true, which is the opposite of Go's zero value: a plain
+	// bool would silently HOLD every order from every existing caller
+	// that never sends the field. nil means true.
+	ReleaseOnAllocation *bool `json:"releaseOnAllocation,omitempty"`
 }
 
 type orderLineResponse struct {
@@ -37,6 +43,7 @@ type orderResponse struct {
 	ID                   string              `json:"id"`
 	Status               string              `json:"status"`
 	AllowPartialShipment bool                `json:"allowPartialShipment"`
+	ReleaseOnAllocation  bool                `json:"releaseOnAllocation"`
 	PromiseDate          *string             `json:"promiseDate,omitempty"`
 	Lines                []orderLineResponse `json:"lines"`
 }
