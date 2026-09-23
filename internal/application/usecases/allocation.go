@@ -204,9 +204,52 @@ type allocationDeps struct {
 // which would need to keep being manually kept in sync with the other)
 // is the smaller, more obviously-correct change against this call site.
 func (deps allocationDeps) setPromiseDate(o *order.Order) {
+	// ADR 0020 §2: an order carrying an externally-dictated deadline is
+	// promised by FeasibleBy, not by PromiseGroups. This is the routing
+	// that makes FeasibleBy reachable at all — without it the method
+	// exists but nothing in the service ever calls it, which was true
+	// between phase 2 and this change.
+	//
+	// The two differ in KIND, not just in inputs. PromiseGroups asks
+	// "what is the earliest we can manage?" and always answers with
+	// something, falling back to lead-time when capability data is
+	// missing. FeasibleBy asks "is there a window at or before a date
+	// somebody else set?" and answers false rather than guessing,
+	// because its true is a fill-or-kill commitment an external party
+	// measures us on.
+	//
+	// An infeasible order is therefore left with NO promise, deliberately.
+	// The alternative — writing an optimistic promise we already know
+	// breaks the deadline — would tell the caller we can do something we
+	// cannot, and the caller's whole reason for sending a deadline is to
+	// find out before committing.
+	if deadline := o.RequiredShipBy(); deadline != nil {
+		if p, ok := deps.Promise.FeasibleBy(deps.Clock.Now(), o, *deadline); ok {
+			o.SetPromiseGroups([]order.PromiseGroup{{
+				LineNos: allocatedLineNos(o),
+				Promise: p,
+			}})
+		}
+		return
+	}
+
 	if groups, ok := deps.Promise.PromiseGroups(deps.Clock.Now(), o); ok {
 		o.SetPromiseGroups(groups)
 	}
+}
+
+// allocatedLineNos lists the line numbers FeasibleBy actually reasoned
+// about. FeasibleBy is all-or-nothing across the allocated set — network
+// demand is ship-complete (ADR 0020 §4), so there is exactly one group
+// and it covers every allocated line.
+func allocatedLineNos(o *order.Order) []int {
+	var out []int
+	for _, l := range o.Lines() {
+		if l.Status() == order.LineAllocated {
+			out = append(out, l.LineNo())
+		}
+	}
+	return out
 }
 
 // promiseGroupByLine indexes o.PromiseGroups() (ADR 0014 §3 / ADR 0017)
@@ -253,12 +296,22 @@ func promiseGroupByLine(o *order.Order) map[int]order.PromiseGroup {
 //  5. publishOrderAllocationOutcome exactly once, carrying the lines
 //     released in this pass (or nil when release did not run/had nothing
 //     to release).
+//
+// releaseOnAllocation (ADR 0020 §1) gates step 3's release leg. Callers
+// pass o.ReleaseOnAllocation(), so the intent is read from the aggregate
+// rather than from ambient call-site knowledge — this is what makes a
+// LATER RetryAllocation on a held order safe: it re-reads the order from
+// the repository and sees the hold, instead of releasing work onto the
+// floor for an order nobody committed to. It stays an explicit parameter
+// rather than being read from o in here so the release decision is
+// visible at every call site.
 func allocateAndRelease(
 	ctx context.Context,
 	deps allocationDeps,
 	o *order.Order,
 	lines []*order.OrderLine,
 	retry bool,
+	releaseOnAllocation bool,
 ) (allocationOutcome, error) {
 	outcome, allocErr := allocateLines(ctx, deps.Inventory, deps.Events, deps.Clock, o, lines, retry)
 	if allocErr != nil {
@@ -284,6 +337,26 @@ func allocateAndRelease(
 	}
 
 	deps.setPromiseDate(o)
+
+	// ADR 0020 §1: when the caller held the order at intake, stop after
+	// allocation. Lines stay Allocated, inventory reservations genuinely
+	// exist, and the promise above is computed and attached exactly as
+	// for any other order — so a holder can read the promise and decide.
+	// Nothing is released, so wes-work-planning sees no work and no task
+	// reaches the floor.
+	//
+	// OrderAllocated/OrderPartiallyAllocated is still published below:
+	// the allocation genuinely happened, and suppressing the event would
+	// hide a real state change from every other context.
+	if !releaseOnAllocation {
+		if err := deps.Orders.Save(ctx, o); err != nil {
+			return outcome, err
+		}
+		if err := publishOrderAllocationOutcome(ctx, deps.Events, deps.Clock, o, outcome, nil); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
+	}
 
 	// BR3-gated release: EnsureReleasable enforces that a ship-complete
 	// order releases nothing while any line is still unallocated. When it

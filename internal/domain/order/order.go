@@ -44,6 +44,13 @@ var (
 	// AllowPartialShipment=false may not release any line until every
 	// line is allocated.
 	ErrShipCompleteBlocked = errors.New("ship-complete order cannot be released while any line is unallocated")
+
+	// ErrHeldOrderMustBeShipComplete enforces ADR 0020 §4 at intake: an
+	// order held before release (releaseOnAllocation=false) may not also
+	// allow partial shipment. A caller that holds an order is making one
+	// whole-order commit/reject decision; per-group promising (ADR 0017)
+	// would give it several cutoffs for a single answer.
+	ErrHeldOrderMustBeShipComplete = errors.New("a held order (releaseOnAllocation=false) must be ship-complete")
 )
 
 // Order is the aggregate root: the unit of consistency for intake,
@@ -64,6 +71,27 @@ type Order struct {
 	promiseCptId         *string
 	promiseBasis         *PromiseBasis
 	promiseGroups        []PromiseGroup
+	// heldAtIntake records ADR 0020 §1's releaseOnAllocation=false as
+	// its INVERSE, deliberately. The zero value of a bool is false, and
+	// every existing constructor, test literal and Rehydrate call site
+	// leaves this field unset — so the zero value must mean "an ordinary
+	// order that releases on allocation". Storing releaseOnAllocation
+	// directly would make every one of those sites silently produce a
+	// HELD order, which fails closed in the worst possible direction:
+	// work that never reaches the floor, on orders nobody asked to hold.
+	heldAtIntake bool
+
+	// requiredShipBy is an externally-dictated deadline attached at
+	// intake (ADR 0020 §2). When set, the promise is not CHOSEN by this
+	// service — it is constrained to a window at or before this instant,
+	// and an order that cannot make it gets no promise at all rather
+	// than an optimistic one.
+	//
+	// A pointer, not a zero time.Time: "no deadline" is the overwhelming
+	// majority of orders and must be distinguishable from "a deadline
+	// that happens to be the zero instant", which would otherwise make
+	// every ordinary order look infeasible.
+	requiredShipBy *time.Time
 }
 
 // New constructs an Order in Received status. lines must be non-empty;
@@ -106,15 +134,56 @@ func Rehydrate(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool,
 // returns an empty slice, and the legacy summary fields are exactly what
 // was passed in, untouched.
 func RehydrateWithGroups(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool, promiseDate *time.Time, promiseCptId *string, promiseBasis *PromiseBasis, promiseGroups []PromiseGroup) *Order {
+	return RehydrateHeld(id, lines, allowPartialShipment, promiseDate, promiseCptId, promiseBasis, promiseGroups, true)
+}
+
+// RehydrateHeld is RehydrateWithGroups plus ADR 0020 §1's
+// releaseOnAllocation intent. Only a repository adapter that actually
+// persists the orders.release_on_allocation column should call it; every
+// other construction path goes through Rehydrate/RehydrateWithGroups,
+// which pass releaseOnAllocation=true and therefore keep today's
+// behaviour exactly.
+//
+// A row written before migration 0005 reads back as TRUE (the column's
+// DEFAULT), so pre-ADR orders rehydrate as ordinary un-held orders —
+// which is what they are.
+func RehydrateHeld(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool, promiseDate *time.Time, promiseCptId *string, promiseBasis *PromiseBasis, promiseGroups []PromiseGroup, releaseOnAllocation bool) *Order {
 	return &Order{
 		id: id, lines: lines, allowPartialShipment: allowPartialShipment,
 		promiseDate: promiseDate, promiseCptId: promiseCptId, promiseBasis: promiseBasis,
 		promiseGroups: promiseGroups,
+		heldAtIntake:  !releaseOnAllocation,
 	}
 }
 
 func (o *Order) ID() shared.OrderId         { return o.id }
 func (o *Order) AllowPartialShipment() bool { return o.allowPartialShipment }
+
+// ReleaseOnAllocation reports whether this order releases its lines as
+// soon as they are allocated (ADR 0020 §1). True for every order not
+// explicitly held at intake, including every order persisted before
+// migration 0005.
+func (o *Order) ReleaseOnAllocation() bool { return !o.heldAtIntake }
+
+// Hold marks the order as held at intake: allocate, but do not release
+// until ReleaseHeldOrder says so. It is called only by the intake use
+// case, on a freshly-constructed order, before any allocation — there is
+// deliberately no way to hold an order that has already released work,
+// because the floor cannot un-see a task it has been given.
+func (o *Order) Hold() { o.heldAtIntake = true }
+
+// RequiredShipBy returns the externally-dictated deadline, or nil when
+// this order has none (the overwhelming majority).
+func (o *Order) RequiredShipBy() *time.Time { return o.requiredShipBy }
+
+// SetRequiredShipBy attaches an external deadline (ADR 0020 §2).
+//
+// A mutator rather than a fourth Rehydrate parameter: the constructor
+// chain is already Rehydrate / RehydrateWithGroups / RehydrateHeld, and
+// widening it again would force every existing call site to grow an
+// argument it does not care about. Repositories call this after
+// rehydrating, the same way intake calls Hold().
+func (o *Order) SetRequiredShipBy(t time.Time) { o.requiredShipBy = &t }
 
 // Lines returns the order's lines. The slice is a copy, but the
 // *OrderLine values are the aggregate's own entities: they are read-only
