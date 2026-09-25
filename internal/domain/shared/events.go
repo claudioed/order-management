@@ -73,16 +73,32 @@ func NewOrderLineBackordered(occurredAt time.Time, orderID OrderId, lineNo int, 
 
 // ReleasedLine is one line released as part of the same allocation pass
 // that produced an OrderAllocated or OrderPartiallyAllocated fact. Its
-// fields are part of the frozen wes-work-planning Kafka integration
-// contract (see the Kafka integration section of CLAUDE.md): field names
-// and shapes here are mirrored byte-for-byte by wes-work-planning's
-// consumer and must not be changed casually.
+// core fields (LineNo, SKU, PathID, GiftWrap, FulfillmentClass) are part
+// of the frozen wes-work-planning Kafka integration contract (see the
+// Kafka integration section of CLAUDE.md): field names and shapes here
+// are mirrored byte-for-byte by wes-work-planning's consumer and must
+// not be changed casually.
+//
+// PromiseCptId/PromiseBasis/PromiseCutoffAt are ADR 0017's additive
+// per-line promise fields (ADR 0014 §3's per-shipment-group promising):
+// which group this specific line belongs to, carried alongside the
+// order-level PromiseDate/PromiseCptId/PromiseBasis summary on
+// OrderAllocated/OrderPartiallyAllocated. All three are pointers —
+// nil/omitted for an order whose promise was set via the legacy
+// SetPromise path (no group breakdown to attribute a line to) — mirroring
+// this repo's existing pointer-field convention for "may not apply"
+// (see OrderLine.ReservationID). wes-work-planning's current consumer
+// does not read these fields; this is a future phase's work, not this
+// one's — see ADR 0017.
 type ReleasedLine struct {
 	LineNo           int
 	SKU              SKU
 	PathID           PathId
 	GiftWrap         bool
 	FulfillmentClass string
+	PromiseCptId     *string
+	PromiseBasis     *string
+	PromiseCutoffAt  *time.Time
 }
 
 // OrderAllocated: every line on the order is allocated — and, per the
@@ -95,15 +111,36 @@ type ReleasedLine struct {
 // the field is never nil-vs-empty-ambiguous either way). This event is
 // also forwarded to Kafka as an integration event — see the Kafka
 // integration section of CLAUDE.md.
+//
+// PromiseCptId and PromiseBasis are ADR 0014's additive fields: the CPT
+// identity the promise targets (empty for a LeadTime-basis promise, which
+// has no departure identity) and which policy produced PromiseDate
+// (Capability or LeadTime). PromiseDate itself is unchanged — it is the
+// promise's CutoffAt either way, kept on the wire for backward
+// compatibility.
 type OrderAllocated struct {
 	base
-	OrderID     OrderId
-	PromiseDate time.Time
-	Lines       []ReleasedLine
+	OrderID      OrderId
+	PromiseDate  time.Time
+	PromiseCptId string
+	PromiseBasis string
+	Lines        []ReleasedLine
 }
 
 func NewOrderAllocated(occurredAt time.Time, orderID OrderId, promiseDate time.Time, lines []ReleasedLine) OrderAllocated {
 	return OrderAllocated{base: newBase("OrderAllocated", occurredAt), OrderID: orderID, PromiseDate: promiseDate, Lines: lines}
+}
+
+// NewOrderAllocatedWithPromise is NewOrderAllocated plus ADR 0014's
+// promiseCptId/promiseBasis. Kept as a separate constructor rather than
+// widening NewOrderAllocated's signature so every existing call site
+// (and every existing test asserting on that signature) keeps compiling
+// unchanged; new call sites (allocateAndRelease) use this one.
+func NewOrderAllocatedWithPromise(occurredAt time.Time, orderID OrderId, promiseDate time.Time, promiseCptId, promiseBasis string, lines []ReleasedLine) OrderAllocated {
+	return OrderAllocated{
+		base: newBase("OrderAllocated", occurredAt), OrderID: orderID, PromiseDate: promiseDate,
+		PromiseCptId: promiseCptId, PromiseBasis: promiseBasis, Lines: lines,
+	}
 }
 
 // OrderPartiallyAllocated: some lines allocated, some backordered, on an
@@ -113,12 +150,17 @@ func NewOrderAllocated(occurredAt time.Time, orderID OrderId, promiseDate time.T
 // an earlier pass, and never the still-Backordered lines. This event is
 // also forwarded to Kafka as an integration event — see the Kafka
 // integration section of CLAUDE.md.
+//
+// PromiseCptId/PromiseBasis are ADR 0014's additive fields — see
+// OrderAllocated's doc comment.
 type OrderPartiallyAllocated struct {
 	base
 	OrderID          OrderId
 	AllocatedLines   int
 	BackorderedLines int
 	PromiseDate      time.Time
+	PromiseCptId     string
+	PromiseBasis     string
 	Lines            []ReleasedLine
 }
 
@@ -126,6 +168,18 @@ func NewOrderPartiallyAllocated(occurredAt time.Time, orderID OrderId, allocated
 	return OrderPartiallyAllocated{
 		base:    newBase("OrderPartiallyAllocated", occurredAt),
 		OrderID: orderID, AllocatedLines: allocated, BackorderedLines: backordered, PromiseDate: promiseDate, Lines: lines,
+	}
+}
+
+// NewOrderPartiallyAllocatedWithPromise is NewOrderPartiallyAllocated
+// plus ADR 0014's promiseCptId/promiseBasis — see
+// NewOrderAllocatedWithPromise's doc comment for why this is a separate
+// constructor rather than a widened signature.
+func NewOrderPartiallyAllocatedWithPromise(occurredAt time.Time, orderID OrderId, allocated, backordered int, promiseDate time.Time, promiseCptId, promiseBasis string, lines []ReleasedLine) OrderPartiallyAllocated {
+	return OrderPartiallyAllocated{
+		base:    newBase("OrderPartiallyAllocated", occurredAt),
+		OrderID: orderID, AllocatedLines: allocated, BackorderedLines: backordered, PromiseDate: promiseDate,
+		PromiseCptId: promiseCptId, PromiseBasis: promiseBasis, Lines: lines,
 	}
 }
 
@@ -193,5 +247,37 @@ func NewOrderAllocationPartiallyFailed(occurredAt time.Time, orderID OrderId, al
 	return OrderAllocationPartiallyFailed{
 		base:    newBase("OrderAllocationPartiallyFailed", occurredAt),
 		OrderID: orderID, AllocatedLines: allocatedLines, RemainingLines: remainingLines, Cause: cause,
+	}
+}
+
+// OrderRepromised: the promise for this order moved, discovered by
+// reacting to a downstream fulfillment-execution fact (a task still open
+// past its CPT, or a SLAM pass) — ADR 0014 §5's feedback loop, closed by
+// ADR 0018's RepromiseOrder use case. This is the fleet's "your delivery
+// is delayed" trigger; nothing here contacts a customer, it is the
+// trigger, not the notification.
+//
+// CptIdOld/CptIdNew are the CPT identity (e.g. "sp1-1800") the affected
+// PromiseGroup targeted before and after the recompute. Either — or both
+// — may be empty: a LeadTime-basis promise has no CPT departure
+// identity, only a computed cutoff instant (see order.Promise's doc
+// comment), so an empty string here means "that basis had no CPT
+// identity", never "no promise existed". Reason names the
+// fulfillment-execution event_type that triggered the recompute —
+// "TaskCPTMissed" or "PackageManifested", verbatim — so a downstream
+// reader can tell which kind of signal moved the promise without a
+// second lookup.
+type OrderRepromised struct {
+	base
+	OrderID  OrderId
+	CptIdOld string
+	CptIdNew string
+	Reason   string
+}
+
+func NewOrderRepromised(occurredAt time.Time, orderID OrderId, cptIdOld, cptIdNew, reason string) OrderRepromised {
+	return OrderRepromised{
+		base:    newBase("OrderRepromised", occurredAt),
+		OrderID: orderID, CptIdOld: cptIdOld, CptIdNew: cptIdNew, Reason: reason,
 	}
 }

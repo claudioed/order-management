@@ -2,11 +2,11 @@
 // warehouse-systems Kafka broker. It implements ports.EventPublisher, so it
 // drops in wherever the log or Postgres outbox publisher is used today.
 //
-// Only OrderAllocated and OrderPartiallyAllocated are part of the
-// published integration contract (see CLAUDE.md's Kafka integration
-// section); every other domain event is a local concern and is not
-// forwarded here — mirroring inventory-storage's own precedent of
-// forwarding only two of its several domain events.
+// OrderAllocated, OrderPartiallyAllocated, and — since ADR 0014 §5 / ADR
+// 0018 — OrderRepromised are the published integration contract (see
+// CLAUDE.md's Kafka integration section); every other domain event is a
+// local concern and is not forwarded here — mirroring inventory-storage's
+// own precedent of forwarding only a subset of its several domain events.
 package kafka
 
 import (
@@ -65,21 +65,49 @@ type envelope struct {
 // line released in one pass since it classifies the whole order, not the
 // individual line. Consumers that predate this field can safely ignore
 // it — see ADR-0008.
+//
+// promise_cpt_id/promise_basis/promise_cutoff_at are ADR-0017's additive
+// per-line promise fields (ADR 0014 §3's per-shipment-group promising):
+// which group THIS line belongs to. omitempty for an order whose promise
+// has no group breakdown to attribute a line to (the legacy SetPromise
+// path). wes-work-planning's current consumer does not read these
+// fields — see the top-level allocationData doc comment.
 type releasedLineData struct {
 	LineNo           int    `json:"line_no"`
 	SKU              string `json:"sku"`
 	PathID           string `json:"path_id"`
 	GiftWrap         bool   `json:"gift_wrap"`
 	FulfillmentClass string `json:"fulfillment_class"`
+	PromiseCptId     string `json:"promise_cpt_id,omitempty"`
+	PromiseBasis     string `json:"promise_basis,omitempty"`
+	PromiseCutoffAt  string `json:"promise_cutoff_at,omitempty"`
 }
 
 // allocationData is the `data` payload shape for both OrderAllocated and
-// OrderPartiallyAllocated, per CLAUDE.md. Frozen: field names and shape
-// must match wes-work-planning's consumer expectations exactly.
+// OrderPartiallyAllocated, per CLAUDE.md. promise_date is frozen: field
+// name and shape must match wes-work-planning's consumer expectations
+// exactly. promise_cpt_id/promise_basis are ADR 0014's additive fields —
+// omitempty so a LeadTime-basis promise's empty CptId does not add noise
+// to the wire, and so wes-work-planning's existing consumer (which does
+// not read these fields yet) is unaffected either way.
 type allocationData struct {
-	OrderID     string             `json:"order_id"`
-	PromiseDate string             `json:"promise_date"`
-	Lines       []releasedLineData `json:"lines"`
+	OrderID      string             `json:"order_id"`
+	PromiseDate  string             `json:"promise_date"`
+	PromiseCptId string             `json:"promise_cpt_id,omitempty"`
+	PromiseBasis string             `json:"promise_basis,omitempty"`
+	Lines        []releasedLineData `json:"lines"`
+}
+
+// repromisedData is the `data` payload shape for OrderRepromised (ADR
+// 0014 §5 / ADR 0018): the fleet's "your delivery is delayed" trigger.
+// cpt_id_old/cpt_id_new are omitempty for the same reason
+// allocationData's promise_cpt_id is — a LeadTime-basis promise (either
+// side) has no CPT departure identity, only a computed cutoff instant.
+type repromisedData struct {
+	OrderID  string `json:"order_id"`
+	CptIdOld string `json:"cpt_id_old,omitempty"`
+	CptIdNew string `json:"cpt_id_new,omitempty"`
+	Reason   string `json:"reason"`
 }
 
 // Publisher publishes OrderAllocated and OrderPartiallyAllocated domain
@@ -115,29 +143,50 @@ func NewWriterForTopic(topic string, brokers ...string) *kafkago.Writer {
 func toReleasedLineData(lines []shared.ReleasedLine) []releasedLineData {
 	out := make([]releasedLineData, 0, len(lines))
 	for _, l := range lines {
-		out = append(out, releasedLineData{
+		rl := releasedLineData{
 			LineNo: l.LineNo, SKU: l.SKU.String(), PathID: l.PathID.String(), GiftWrap: l.GiftWrap,
 			FulfillmentClass: l.FulfillmentClass,
-		})
+		}
+		if l.PromiseCptId != nil {
+			rl.PromiseCptId = *l.PromiseCptId
+		}
+		if l.PromiseBasis != nil {
+			rl.PromiseBasis = *l.PromiseBasis
+		}
+		if l.PromiseCutoffAt != nil {
+			rl.PromiseCutoffAt = l.PromiseCutoffAt.UTC().Format(time.RFC3339)
+		}
+		out = append(out, rl)
 	}
 	return out
 }
 
 func (p *Publisher) Publish(ctx context.Context, event shared.DomainEvent) error {
-	var data allocationData
+	var data any
 
 	switch e := event.(type) {
 	case shared.OrderAllocated:
 		data = allocationData{
-			OrderID:     e.OrderID.String(),
-			PromiseDate: e.PromiseDate.UTC().Format(time.RFC3339),
-			Lines:       toReleasedLineData(e.Lines),
+			OrderID:      e.OrderID.String(),
+			PromiseDate:  e.PromiseDate.UTC().Format(time.RFC3339),
+			PromiseCptId: e.PromiseCptId,
+			PromiseBasis: e.PromiseBasis,
+			Lines:        toReleasedLineData(e.Lines),
 		}
 	case shared.OrderPartiallyAllocated:
 		data = allocationData{
-			OrderID:     e.OrderID.String(),
-			PromiseDate: e.PromiseDate.UTC().Format(time.RFC3339),
-			Lines:       toReleasedLineData(e.Lines),
+			OrderID:      e.OrderID.String(),
+			PromiseDate:  e.PromiseDate.UTC().Format(time.RFC3339),
+			PromiseCptId: e.PromiseCptId,
+			PromiseBasis: e.PromiseBasis,
+			Lines:        toReleasedLineData(e.Lines),
+		}
+	case shared.OrderRepromised:
+		data = repromisedData{
+			OrderID:  e.OrderID.String(),
+			CptIdOld: e.CptIdOld,
+			CptIdNew: e.CptIdNew,
+			Reason:   e.Reason,
 		}
 	default:
 		return nil

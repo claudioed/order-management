@@ -35,7 +35,7 @@ type RetryAllocation struct {
 	Inventory ports.InventoryReservationClient
 	Events    ports.EventPublisher
 	Clock     ports.Clock
-	Promise   order.LeadTimePolicy
+	Promise   order.PromisePolicy
 }
 
 func (uc *RetryAllocation) Execute(ctx context.Context, id shared.OrderId) (*order.Order, error) {
@@ -53,7 +53,7 @@ func (uc *RetryAllocation) Execute(ctx context.Context, id shared.OrderId) (*ord
 	}
 
 	deps := allocationDeps{Orders: uc.Orders, Inventory: uc.Inventory, Events: uc.Events, Clock: uc.Clock, Promise: uc.Promise}
-	if _, err := allocateAndRelease(ctx, deps, o, backordered, true); err != nil {
+	if _, err := allocateAndRelease(ctx, deps, o, backordered, true, o.ReleaseOnAllocation()); err != nil {
 		return nil, err
 	}
 	return o, nil

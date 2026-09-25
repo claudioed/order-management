@@ -37,12 +37,21 @@ func (r *OrderRepo) Save(ctx context.Context, o *order.Order) error {
 	if d := o.PromiseDate(); d != nil {
 		promiseDate = d
 	}
+	promiseCptId := o.PromiseCptId()
+	var promiseBasis *string
+	if b := o.PromiseBasis(); b != nil {
+		s := b.String()
+		promiseBasis = &s
+	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO orders (id, allow_partial_shipment, promise_date)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (id) DO UPDATE SET promise_date = EXCLUDED.promise_date
-	`, o.ID().String(), o.AllowPartialShipment(), promiseDate); err != nil {
+		INSERT INTO orders (id, allow_partial_shipment, promise_date, promise_cpt_id, promise_basis, release_on_allocation, required_ship_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (id) DO UPDATE SET
+			promise_date = EXCLUDED.promise_date,
+			promise_cpt_id = EXCLUDED.promise_cpt_id,
+			promise_basis = EXCLUDED.promise_basis
+	`, o.ID().String(), o.AllowPartialShipment(), promiseDate, promiseCptId, promiseBasis, o.ReleaseOnAllocation(), o.RequiredShipBy()); err != nil {
 		return err
 	}
 
@@ -58,6 +67,28 @@ func (r *OrderRepo) Save(ctx context.Context, o *order.Order) error {
 		}
 	}
 
+	// order_promise_groups (ADR 0014 §3 / ADR 0017): delete-then-reinsert
+	// this order's full group set on every save, rather than diff/upsert
+	// a breakdown whose shape (how many groups, which lines are in each)
+	// can change entirely between allocation passes as more lines
+	// allocate or a saturated path pushes a line to a different cutoff.
+	if _, err := tx.Exec(ctx, `DELETE FROM order_promise_groups WHERE order_id = $1`, o.ID().String()); err != nil {
+		return err
+	}
+	for i, g := range o.PromiseGroups() {
+		var cptId *string
+		if g.Promise.CptId != "" {
+			id := g.Promise.CptId
+			cptId = &id
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO order_promise_groups (order_id, group_no, line_nos, cpt_id, cutoff_at, basis)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, o.ID().String(), i+1, g.LineNos, cptId, g.Promise.CutoffAt, g.Promise.Basis.String()); err != nil {
+			return err
+		}
+	}
+
 	return tx.Commit(ctx)
 }
 
@@ -66,10 +97,14 @@ func (r *OrderRepo) Save(ctx context.Context, o *order.Order) error {
 func (r *OrderRepo) FindByID(ctx context.Context, id shared.OrderId) (*order.Order, error) {
 	var allowPartialShipment bool
 	var promiseDate *time.Time
+	var promiseCptId *string
+	var promiseBasisRaw *string
+	var releaseOnAllocation bool
+	var requiredShipBy *time.Time
 
 	err := r.pool.QueryRow(ctx, `
-		SELECT allow_partial_shipment, promise_date FROM orders WHERE id = $1
-	`, id.String()).Scan(&allowPartialShipment, &promiseDate)
+		SELECT allow_partial_shipment, promise_date, promise_cpt_id, promise_basis, release_on_allocation, required_ship_by FROM orders WHERE id = $1
+	`, id.String()).Scan(&allowPartialShipment, &promiseDate, &promiseCptId, &promiseBasisRaw, &releaseOnAllocation, &requiredShipBy)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -109,7 +144,54 @@ func (r *OrderRepo) FindByID(ctx context.Context, id shared.OrderId) (*order.Ord
 		return nil, err
 	}
 
-	return order.Rehydrate(id, lines, allowPartialShipment, promiseDate), nil
+	var promiseBasis *order.PromiseBasis
+	if promiseBasisRaw != nil {
+		b := order.PromiseBasis(*promiseBasisRaw)
+		promiseBasis = &b
+	}
+
+	groupRows, err := r.pool.Query(ctx, `
+		SELECT line_nos, cpt_id, cutoff_at, basis
+		FROM order_promise_groups WHERE order_id = $1 ORDER BY group_no
+	`, id.String())
+	if err != nil {
+		return nil, err
+	}
+	defer groupRows.Close()
+
+	var promiseGroups []order.PromiseGroup
+	for groupRows.Next() {
+		var (
+			lineNos  []int
+			cptId    *string
+			cutoffAt time.Time
+			basisRaw string
+		)
+		if err := groupRows.Scan(&lineNos, &cptId, &cutoffAt, &basisRaw); err != nil {
+			return nil, err
+		}
+		var cptIdStr string
+		if cptId != nil {
+			cptIdStr = *cptId
+		}
+		promiseGroups = append(promiseGroups, order.PromiseGroup{
+			LineNos: lineNos,
+			Promise: order.Promise{CptId: cptIdStr, CutoffAt: cutoffAt, Basis: order.PromiseBasis(basisRaw)},
+		})
+	}
+	if err := groupRows.Err(); err != nil {
+		return nil, err
+	}
+
+	o := order.RehydrateHeld(id, lines, allowPartialShipment, promiseDate, promiseCptId, promiseBasis, promiseGroups, releaseOnAllocation)
+	// Set after rehydration rather than as a fourth Rehydrate parameter:
+	// the deadline is optional and most orders have none, so widening the
+	// constructor chain again would cost every call site an argument it
+	// does not care about.
+	if requiredShipBy != nil {
+		o.SetRequiredShipBy(*requiredShipBy)
+	}
+	return o, nil
 }
 
 // NextID mints an order id. The `ord-<uuid>` shape mirrors the

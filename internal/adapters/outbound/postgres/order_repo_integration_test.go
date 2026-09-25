@@ -74,7 +74,7 @@ func TestOrderRepo_SaveAndFindByID_RoundTrip(t *testing.T) {
 	if err := o.Allocate(2, "res-int-2"); err != nil {
 		t.Fatalf("Allocate line 2: %v", err)
 	}
-	o.SetPromiseDate(occurredAt.Add(48 * time.Hour))
+	o.SetPromise(order.Promise{CptId: "sp1-1800", CutoffAt: occurredAt.Add(48 * time.Hour), Basis: order.BasisCapability})
 	if err := repo.Save(ctx, o); err != nil {
 		t.Fatalf("Save (allocated): %v", err)
 	}
@@ -85,6 +85,12 @@ func TestOrderRepo_SaveAndFindByID_RoundTrip(t *testing.T) {
 		}
 		if d := reloaded.PromiseDate(); d == nil || !d.Equal(occurredAt.Add(48*time.Hour)) {
 			t.Errorf("promiseDate = %v, want %v", d, occurredAt.Add(48*time.Hour))
+		}
+		if cptId := reloaded.PromiseCptId(); cptId == nil || *cptId != "sp1-1800" {
+			t.Errorf("promiseCptId = %v, want sp1-1800", cptId)
+		}
+		if basis := reloaded.PromiseBasis(); basis == nil || *basis != order.BasisCapability {
+			t.Errorf("promiseBasis = %v, want Capability", basis)
 		}
 		if r := reloaded.Lines()[0].ReservationID(); r == nil || *r != "res-int-1" {
 			t.Errorf("line 1 reservationId = %v, want res-int-1", r)
@@ -192,6 +198,138 @@ func TestOrderRepo_NextID_Unique(t *testing.T) {
 		}
 		seen[id] = struct{}{}
 	}
+}
+
+// TestOrderRepo_PromiseGroups_RoundTrip covers ADR 0014 §3 / ADR 0017:
+// a partial-shipment order whose promise is set as MULTIPLE groups round-
+// trips its full breakdown (correct group count, correct line_nos per
+// group, correct CptId/CutoffAt/Basis per group) through a real
+// Postgres, via the widened Rehydrate/RehydrateWithGroups path — not
+// just the legacy single-valued summary fields, which the older
+// TestOrderRepo_SaveAndFindByID_RoundTrip test above already covers.
+func TestOrderRepo_PromiseGroups_RoundTrip(t *testing.T) {
+	pool := newPool(t)
+	repo := postgres.NewOrderRepo(pool)
+	ctx := context.Background()
+
+	id := shared.OrderId("ord-int-groups-" + time.Now().Format("150405.000000000"))
+	l1, err := order.NewOrderLine(1, shared.SKU("SKU-INT-G1"), 2, "pick", false)
+	if err != nil {
+		t.Fatalf("NewOrderLine 1: %v", err)
+	}
+	l2, err := order.NewOrderLine(2, shared.SKU("SKU-INT-G2"), 1, "singles", false)
+	if err != nil {
+		t.Fatalf("NewOrderLine 2: %v", err)
+	}
+	l3, err := order.NewOrderLine(3, shared.SKU("SKU-INT-G3"), 1, "multis", false)
+	if err != nil {
+		t.Fatalf("NewOrderLine 3: %v", err)
+	}
+	o, err := order.New(id, []*order.OrderLine{l1, l2, l3}, true) // AllowPartialShipment=true
+	if err != nil {
+		t.Fatalf("order.New: %v", err)
+	}
+	if err := repo.Save(ctx, o); err != nil {
+		t.Fatalf("Save (received): %v", err)
+	}
+
+	for i, res := range []string{"res-int-g1", "res-int-g2", "res-int-g3"} {
+		if err := o.Allocate(i+1, res); err != nil {
+			t.Fatalf("Allocate line %d: %v", i+1, err)
+		}
+	}
+
+	baseTime := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	// Three groups: lines 1+2 share one real CPT cutoff (Capability
+	// basis); line 3 falls back to a distinct, later LeadTime instant.
+	groups := []order.PromiseGroup{
+		{LineNos: []int{1, 2}, Promise: order.Promise{CptId: "sp1-1200", CutoffAt: baseTime.Add(2 * time.Hour), Basis: order.BasisCapability}},
+		{LineNos: []int{3}, Promise: order.Promise{CutoffAt: baseTime.Add(48 * time.Hour), Basis: order.BasisLeadTime}},
+	}
+	o.SetPromiseGroups(groups)
+	if err := repo.Save(ctx, o); err != nil {
+		t.Fatalf("Save (allocated, grouped promise): %v", err)
+	}
+
+	assertRoundTrip(t, repo, id, func(reloaded *order.Order) {
+		got := reloaded.PromiseGroups()
+		if len(got) != 2 {
+			t.Fatalf("PromiseGroups() = %d groups, want 2: %+v", len(got), got)
+		}
+
+		byFirstLine := make(map[int]order.PromiseGroup, len(got))
+		for _, g := range got {
+			if len(g.LineNos) == 0 {
+				t.Fatalf("group has empty LineNos: %+v", g)
+			}
+			byFirstLine[g.LineNos[0]] = g
+		}
+
+		sharedGroup, ok := byFirstLine[1]
+		if !ok {
+			t.Fatalf("no group starting with line 1: %+v", got)
+		}
+		if len(sharedGroup.LineNos) != 2 || sharedGroup.LineNos[0] != 1 || sharedGroup.LineNos[1] != 2 {
+			t.Fatalf("shared group LineNos = %v, want [1 2]", sharedGroup.LineNos)
+		}
+		if sharedGroup.Promise.CptId != "sp1-1200" {
+			t.Fatalf("shared group CptId = %q, want sp1-1200", sharedGroup.Promise.CptId)
+		}
+		if sharedGroup.Promise.Basis != order.BasisCapability {
+			t.Fatalf("shared group Basis = %q, want Capability", sharedGroup.Promise.Basis)
+		}
+		if !sharedGroup.Promise.CutoffAt.Equal(baseTime.Add(2 * time.Hour)) {
+			t.Fatalf("shared group CutoffAt = %v, want %v", sharedGroup.Promise.CutoffAt, baseTime.Add(2*time.Hour))
+		}
+
+		soloGroup, ok := byFirstLine[3]
+		if !ok {
+			t.Fatalf("no group starting with line 3: %+v", got)
+		}
+		if len(soloGroup.LineNos) != 1 {
+			t.Fatalf("solo group LineNos = %v, want [3]", soloGroup.LineNos)
+		}
+		if soloGroup.Promise.CptId != "" {
+			t.Fatalf("solo group CptId = %q, want empty (LeadTime basis has no CPT identity)", soloGroup.Promise.CptId)
+		}
+		if soloGroup.Promise.Basis != order.BasisLeadTime {
+			t.Fatalf("solo group Basis = %q, want LeadTime", soloGroup.Promise.Basis)
+		}
+		if !soloGroup.Promise.CutoffAt.Equal(baseTime.Add(48 * time.Hour)) {
+			t.Fatalf("solo group CutoffAt = %v, want %v", soloGroup.Promise.CutoffAt, baseTime.Add(48*time.Hour))
+		}
+
+		// The legacy summary fields must still project the LATEST
+		// cutoff (ADR 0014 §3 / ADR 0017's documented projection rule)
+		// even after a real round trip through Postgres, not just in
+		// memory.
+		want := baseTime.Add(48 * time.Hour)
+		if d := reloaded.PromiseDate(); d == nil || !d.Equal(want) {
+			t.Fatalf("PromiseDate() = %v, want %v (the latest group's cutoff)", d, want)
+		}
+		if b := reloaded.PromiseBasis(); b == nil || *b != order.BasisLeadTime {
+			t.Fatalf("PromiseBasis() = %v, want LeadTime (from the latest group)", b)
+		}
+	})
+
+	// Overwriting with a NEW, differently-shaped breakdown (a single
+	// group now) must fully replace the old rows — delete-then-reinsert,
+	// not accumulate stale groups from the previous save.
+	o.SetPromiseGroups([]order.PromiseGroup{
+		{LineNos: []int{1, 2, 3}, Promise: order.Promise{CptId: "sp1-1800", CutoffAt: baseTime.Add(6 * time.Hour), Basis: order.BasisCapability}},
+	})
+	if err := repo.Save(ctx, o); err != nil {
+		t.Fatalf("Save (re-grouped): %v", err)
+	}
+	assertRoundTrip(t, repo, id, func(reloaded *order.Order) {
+		got := reloaded.PromiseGroups()
+		if len(got) != 1 {
+			t.Fatalf("after re-grouping, PromiseGroups() = %d groups, want exactly 1 (stale groups must be gone): %+v", len(got), got)
+		}
+		if len(got[0].LineNos) != 3 {
+			t.Fatalf("LineNos = %v, want all 3 lines in the one group", got[0].LineNos)
+		}
+	})
 }
 
 // TestEventPublisher_AppendsToEventsTable covers the Postgres EventPublisher:

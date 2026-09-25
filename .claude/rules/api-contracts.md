@@ -66,13 +66,26 @@ Fleet envelope, NOT CloudEvents. Two envelope variants:
 - **Analytics envelope** on `warehouse.order-management.analytics`: adds
   `schema_version: 1`, keyed by `OrderId`.
 
-### Channel: `warehouse.order-management.events` (integration, frozen)
+### Channel: `warehouse.order-management.events` (integration)
 
 - `subscribe` operationId `consumeOrderManagementEvents`.
-- Only `OrderAllocated` / `OrderPartiallyAllocated` messages. `data.lines[]`
-  entry shape is shared verbatim with `wes-work-planning`'s consumer and
-  MUST NOT change without coordinating both sides.
-  `fulfillment_class` is additive (ADR-0008).
+- `OrderAllocated` / `OrderPartiallyAllocated` messages (frozen —
+  `data.lines[]` entry shape is shared verbatim with
+  `wes-work-planning`'s consumer and MUST NOT change without
+  coordinating both sides; `fulfillment_class` is additive, ADR-0008)
+  plus — since ADR-0018 — `OrderRepromised`, the fleet's "your delivery
+  is delayed" trigger, raised by the new `RepromiseOrder` use case.
+
+### Channel: `warehouse.fulfillment.events` (inbound, ADR-0018)
+
+- `subscribe` operationId `consumeFulfillmentEvents`. fulfillment-
+  execution's shared/fan-out topic (the SAME one `labor-performance`
+  already consumes for `TaskCompleted`); this context reacts ONLY to
+  `TaskCPTMissed` and `PackageManifested`, decoding its own independent
+  copy of that service's real wire shape — never a Go import.
+  `data.order_ref` on both is a `WorkUnitId`-shaped reference
+  (`{orderId}-line-{lineNo}`), NOT a bare `OrderId` — parsed back via
+  `usecases.ParseWorkUnitID`, the reverse of `WorkUnitID` below.
 
 ### Channel: `warehouse.order-management.analytics`
 
@@ -92,14 +105,23 @@ consumer independently reconstructs the SAME formula from
 byte-for-byte or idempotent redelivery breaks. Nothing catches a drift
 except manual review and cross-repo test discipline.
 
-## MCP server (`cmd/mcp`, ADR-0010) — read-only, one tool
+## MCP server (`cmd/mcp`, ADR-0010) — read-only, two tools
 
-- `internal/adapters/inbound/mcp/` — second driving adapter over the
-  **existing** `GetOrder` use case, calling the same use case struct the
-  HTTP handler calls (never a parallel code path).
-- Exactly **one tool, `get_order`**, no resource, no prompt, **no write
-  tool** — every write use case here (`ReceiveOrder`, `CancelOrder`,
-  `RetryAllocation`) enforces a real domain invariant an MCP-calling agent
-  should not trigger directly.
+- `internal/adapters/inbound/mcp/` — driving adapters over the
+  **existing** `GetOrder` use case (`get_order`) and, since ADR-0019, the
+  analytics `report.ReportStore` (`get_promise_health`) — never a
+  parallel code path for `get_order`.
+- **`get_order`**: one order's current state by id.
+- **`get_promise_health`** (ADR-0019, closing ADR 0014 §6's
+  order-management half): promise basis distribution, re-promise rate,
+  split-shipment rate, and promise-to-cutoff gap for a `from`/`to`/
+  optional `pathId` window — the same query shape `GET /reports/funnel`
+  accepts. Declares its own `PromiseHealthStore` port (never imports
+  `internal/analytics/report` directly, per the MCP adapter's own
+  arch-test dependency rule); `cmd/mcp` adapts the real
+  `report.ReportStore` into it.
+- **No write tool** — every write use case here (`ReceiveOrder`,
+  `CancelOrder`, `RetryAllocation`) enforces a real domain invariant an
+  MCP-calling agent should not trigger directly.
 - No auth (ADR-0012 rolled back the bearer-key layer this adapter
   originally had per ADR-0011).

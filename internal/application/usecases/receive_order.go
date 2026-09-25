@@ -2,6 +2,7 @@ package usecases
 
 import (
 	"context"
+	"time"
 
 	"github.com/claudioed/order-management/internal/application/ports"
 	"github.com/claudioed/order-management/internal/domain/order"
@@ -76,7 +77,46 @@ type ReceiveOrder struct {
 	Events    ports.EventPublisher
 	Clock     ports.Clock
 	Inventory ports.InventoryReservationClient
-	Promise   order.LeadTimePolicy
+	// Promise is order.PromisePolicy (ADR 0014): computes a
+	// capability-derived CPT-window promise when the underlying
+	// Schedule/Capability/Capacity inputs are wired, falling back to
+	// its own embedded LeadTimePolicy otherwise. A zero value always
+	// falls back to LeadTimePolicy's own zero-value behaviour, so
+	// existing wiring/tests need no changes to keep compiling.
+	Promise order.PromisePolicy
+	// PathPolicy resolves a line's process path when the caller (or an
+	// internal test) doesn't already supply one. Zero value is usable —
+	// PathSelectionPolicy has no state — so leaving this field unset in
+	// existing wiring changes nothing.
+	PathPolicy order.PathSelectionPolicy
+	// Catalogue validates a resolved path against
+	// process-path-management's live set of active paths before the
+	// order is ever persisted. A nil Catalogue means "not configured":
+	// validation is skipped, matching this fleet's convention of an
+	// optional outbound port defaulting to permissive rather than
+	// panicking on a missing wire-up (see ports.InventoryReservationClient's
+	// permissive-mode sibling, though that one fails loud on write —
+	// Catalogue's nil case is a read-only membership check with no
+	// mutation to protect, so failing OPEN here just means "not yet
+	// wired", not "silently fabricating a result"). See ADR-0013.
+	//
+	// ADR-0016 (ADR-0014 step B) widens this SAME field's use: it is now
+	// also consulted for shared.DefaultPathId's declared Eligibility, via
+	// order.PathSelectionPolicy.Select's EligibilitySource parameter —
+	// ports.ProcessPathCatalogue already satisfies that narrower
+	// interface by structural typing, so this field needed no shape
+	// change, only a new caller.
+	Catalogue ports.ProcessPathCatalogue
+	// Classification looks up a line's derived product attributes
+	// (hazmat/fragile/etc.) from inventory-storage, ONCE per line at
+	// intake, so PathPolicy can evaluate them against the resolved
+	// path's Eligibility (ADR-0016). A nil Classification means "not
+	// wired": every line is evaluated with no derived attributes beyond
+	// its own GiftWrap flag, exactly PermissiveLookup's own always-
+	// Known=false behaviour — see
+	// internal/adapters/outbound/productclassification's package doc
+	// comment for why this fails open rather than blocking intake.
+	Classification ports.ProductClassificationLookup
 	// Metrics records the business-fact outcome of order intake (accepted
 	// vs. rejected). Optional — a nil Metrics means "not instrumented",
 	// same convention as every other optional port on this use case.
@@ -84,12 +124,58 @@ type ReceiveOrder struct {
 }
 
 func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowPartialShipment bool) (*order.Order, error) {
+	return uc.ExecuteHeld(ctx, lines, allowPartialShipment, true)
+}
+
+// ExecuteHeld is Execute plus ADR 0020 §1's releaseOnAllocation intent.
+// Execute delegates here with true, so every existing caller and test is
+// unchanged.
+func (uc *ReceiveOrder) ExecuteHeld(ctx context.Context, lines []NewLine, allowPartialShipment, releaseOnAllocation bool) (*order.Order, error) {
+	return uc.ExecuteWithDeadline(ctx, lines, allowPartialShipment, releaseOnAllocation, nil)
+}
+
+// ExecuteWithDeadline is ExecuteHeld plus ADR 0020 §2's externally
+// dictated deadline. A nil requiredShipBy is the ordinary case and
+// behaves exactly as before: the promise is CHOSEN by this service.
+//
+// With a deadline the promise is instead CONSTRAINED to it, via
+// PromisePolicy.FeasibleBy — and an order that cannot make it comes back
+// with no promise at all rather than an optimistic one, which is the
+// signal a caller holding a fill-or-kill commitment needs.
+func (uc *ReceiveOrder) ExecuteWithDeadline(ctx context.Context, lines []NewLine, allowPartialShipment, releaseOnAllocation bool, requiredShipBy *time.Time) (*order.Order, error) {
+	// ADR 0020 §4: reject the contradictory combination BEFORE minting an
+	// id or persisting anything — a rejected intake must leave no trace.
+	if err := order.ValidateIntakeIntent(allowPartialShipment, releaseOnAllocation); err != nil {
+		uc.recordRejected(ctx)
+		return nil, err
+	}
 	domainLines := make([]*order.OrderLine, 0, len(lines))
 	for i, l := range lines {
-		line, err := order.NewOrderLine(i+1, l.SKU, l.Quantity, l.PathID, l.GiftWrap)
+		pathID := l.PathID
+		if pathID == "" {
+			resolved, ok := uc.PathPolicy.Select(l.SKU, l.Quantity, l.GiftWrap, uc.productAttributes(ctx, l.SKU), uc.Catalogue)
+			if !ok {
+				uc.recordRejected(ctx)
+				return nil, shared.ErrLineIneligibleForResolvedPath
+			}
+			pathID = resolved
+		}
+		line, err := order.NewOrderLine(i+1, l.SKU, l.Quantity, pathID, l.GiftWrap)
 		if err != nil {
 			uc.recordRejected(ctx)
 			return nil, err
+		}
+		// The catalogue check runs only once the line itself is
+		// well-formed (SKU/quantity errors above take priority — an
+		// invalid line is rejected for being invalid, not for having
+		// an unreachable path). A resolved path that isn't currently
+		// active in process-path-management's real catalogue is a
+		// caller-facing input error, not a downstream infra failure:
+		// reject it here, before Save/OrderReceived, rather than
+		// letting wes-work-planning discover it one saga step later.
+		if uc.Catalogue != nil && !uc.Catalogue.IsActive(line.PathID()) {
+			uc.recordRejected(ctx)
+			return nil, shared.ErrUnknownProcessPath
 		}
 		domainLines = append(domainLines, line)
 	}
@@ -103,6 +189,12 @@ func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowParti
 	if err != nil {
 		uc.recordRejected(ctx)
 		return nil, err
+	}
+	if !releaseOnAllocation {
+		o.Hold()
+	}
+	if requiredShipBy != nil {
+		o.SetRequiredShipBy(*requiredShipBy)
 	}
 
 	if err := uc.Orders.Save(ctx, o); err != nil {
@@ -124,7 +216,7 @@ func (uc *ReceiveOrder) Execute(ctx context.Context, lines []NewLine, allowParti
 	// genuine progress was made before the failure, so this is never a
 	// silent swallow — just never surfaced as a ReceiveOrder failure.
 	deps := allocationDeps{Orders: uc.Orders, Inventory: uc.Inventory, Events: uc.Events, Clock: uc.Clock, Promise: uc.Promise}
-	if _, err := allocateAndRelease(ctx, deps, o, o.LinesWithStatus(order.LinePending), false); err != nil {
+	if _, err := allocateAndRelease(ctx, deps, o, o.LinesWithStatus(order.LinePending), false, releaseOnAllocation); err != nil {
 		// allocateAndRelease may have mutated o in memory (e.g. marked a
 		// line Backordered) without persisting that mutation — it only
 		// saves when at least one line was genuinely allocated before the
@@ -161,4 +253,24 @@ func (uc *ReceiveOrder) recordRejected(ctx context.Context) {
 	if uc.Metrics != nil {
 		uc.Metrics.OrderRejected(ctx)
 	}
+}
+
+// productAttributes looks up sku's derived product-classification
+// handling tags (e.g. "Hazmat", "Fragile") ONCE, so
+// order.PathSelectionPolicy can evaluate them against a candidate path's
+// declared Eligibility (ADR-0016). A nil Classification port, an
+// unknown/unclassified SKU, or a lookup error are all treated
+// identically — no attributes — matching
+// ports.ProductClassificationLookup's own fail-open contract; this
+// method never returns an error because a classification-lookup problem
+// must never block order intake.
+func (uc *ReceiveOrder) productAttributes(ctx context.Context, sku shared.SKU) []string {
+	if uc.Classification == nil {
+		return nil
+	}
+	view, err := uc.Classification.GetClassification(ctx, sku.String())
+	if err != nil || !view.Known {
+		return nil
+	}
+	return view.HandlingTags
 }

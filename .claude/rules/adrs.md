@@ -1,4 +1,4 @@
-# Architecture Decision Records (12 total, `docs/docs/adr/`)
+# Architecture Decision Records (20 total, `docs/docs/adr/`)
 
 1. **0001 — Hexagonal (ports & adapters) architecture.** The dependency
    rule this whole repo enforces (`internal/architecture/` fitness test).
@@ -45,6 +45,153 @@
     route reachable with no `Authorization` header. Re-adopting auth later
     means adopting the fleet's NEXT iteration of that decision, not
     resurrecting this deleted package verbatim.
+13. **0013 — Process-path selection as a real domain policy, validated
+    against a live catalogue.** `order.PathSelectionPolicy` (v1: one rule,
+    `PICK`) plus `ports.ProcessPathCatalogue.IsActive` backed by a Kafka-fed
+    `kafkacatalog` cache (`PATH_CATALOGUE_SOURCE=none|kafka`); unknown path
+    -> synchronous 400 before anything persists.
+14. **0014 — ACCEPTED: the promise is a CPT window derived from fulfillment
+    capability.** Replaces `now + PROMISE_PATH_LEAD_TIMES` with a
+    `PromisePolicy` over process-path-management's capability contract
+    (their ADR 0010: `cycleTimeP95`, `eligibility`, site `CPTSchedule`)
+    and wes-work-planning capacity; `LeadTimePolicy` stays as the tagged
+    fallback (`basis=LeadTime`); per-shipment-group promising when
+    `AllowPartialShipment`; `OrderRepromised` closes the loop. Not
+    implemented yet — read it before touching `promise.go` or
+    `path_selection.go`.
+15. **0015 — ACCEPTED: wes-work-planning's PathCapacityChanged wired as
+    the real PathCapacity adapter.** Closes ADR-0014 step 3:
+    `kafkapathcapacity.Consumer`, a third Kafka consumer (own
+    per-process-unique group) on a NEW topic
+    (`warehouse.work-planning.events`), replaces `UnknownPathCapacity`
+    as the `PATH_CATALOGUE_SOURCE=kafka` default. `ports.PathCapacity`/
+    `order.CapacitySource.Remaining` widened to accept `cutoffAt
+    time.Time` alongside `cptId` — the caller (`PromisePolicy.
+    linesFitWindow`) already has it in scope, so the cache is keyed on
+    `(PathId, CutoffAt)` with an exact match, not `cptId` string
+    matching. `UnknownPathCapacity` stays available for
+    `PATH_CATALOGUE_SOURCE=none`/dev mode. Read it before touching
+    `ports.PathCapacity`, `promise_policy.go`, or adding a fourth Kafka
+    consumer.
+16. **0016 — ACCEPTED: eligibility-driven process-path selection (ADR
+    0014 step B, ROUTING ONLY).** `order.PathSelectionPolicy.Select`
+    widened to `(sku, quantity, giftWrap, productAttributes,
+    EligibilitySource) (PathId, bool)` and now actually evaluates
+    `shared.DefaultPathId`'s declared `Eligibility` against the line
+    (`MaxUnitsPerLine`, required/excluded product attributes, gift wrap
+    folded in as the attribute string `"giftWrap"`). New
+    `ports.ProductClassificationLookup` port +
+    `internal/adapters/outbound/productclassification` (HTTP client +
+    fail-open `PermissiveLookup`, `PRODUCT_CLASSIFICATION_MODE=http|
+    permissive`) mirror wes-work-planning's own ADR-0009 pattern exactly
+    — independently written, no cross-service Go import. An ineligible
+    line is rejected with a new `shared.ErrLineIneligibleForResolvedPath`
+    (422) before anything persists. Per-shipment-group promising — ADR
+    0014's OTHER half of "step B" — is explicitly OUT OF SCOPE here and
+    deferred to a future ADR/PR: this phase never touches `Order`'s
+    promise fields, `PromisePolicy`'s single-`Promise`-per-order
+    contract, or `SetPromise`. Honest v1 limitation, documented in the
+    ADR: `ports.ProcessPathCatalogue` has no "list active paths" method,
+    so this policy can only evaluate `shared.DefaultPathId` itself, not
+    choose among multiple real paths — read the ADR before extending
+    `path_selection.go` to a real multi-path decision.
+17. **0017 — ACCEPTED: per-shipment-group promising (ADR 0014 step B,
+    the second half).** `order.PromisePolicy` gains `PromiseGroups(now,
+    o) ([]PromiseGroup, bool)`: for `AllowPartialShipment=false`, exactly
+    one group covering every allocated line, computed via the UNCHANGED
+    `Promise(now, o)` — byte-identical to pre-ADR-0017 behaviour. For
+    `AllowPartialShipment=true`, each allocated line is evaluated
+    independently and lines with an identical resulting `Promise`
+    (same `Basis`/`CptId`/`CutoffAt`) are grouped together.
+    `Order.SetPromiseGroups` stores the full `[]PromiseGroup` breakdown
+    AND re-derives the legacy single-valued `promiseDate`/`promiseCptId`/
+    `promiseBasis` as a "latest cutoff" projection (ADR 0014 §3's stated
+    rule, extended here to cover CptId/Basis too — documented in the
+    ADR). New additive Postgres table `order_promise_groups`
+    (delete-then-reinsert on every save; `orders`' existing columns
+    untouched); new additive `shared.ReleasedLine` pointer fields
+    (`PromiseCptId`/`PromiseBasis`/`PromiseCutoffAt`) carrying per-line
+    group attribution on the Kafka wire, `omitempty`. wes-work-planning
+    needs zero changes (verified against its real consumer decode
+    struct) — read the ADR before extending `promise_policy.go`,
+    `order.go`'s promise fields, or the Postgres/Kafka promise wiring.
+18. **0018 — ACCEPTED: RepromiseOrder consumer and OrderRepromised —
+    closing ADR 0014's feedback loop.** The final piece of ADR 0014's
+    entire rollout. New inbound Kafka consumer
+    (`internal/adapters/inbound/kafka/repromise_consumer.go`) on
+    fulfillment-execution's real `warehouse.fulfillment.events` topic
+    (its own ADR 0025), reacting to `TaskCPTMissed`/`PackageManifested`
+    only, under a STABLE shared consumer group
+    (`order-management-repromise` — NOT per-process-unique, a different
+    correctness shape than `kafkacatalog`/`kafkacptschedule`/
+    `kafkapathcapacity`'s full-replay pattern). New
+    `usecases.ParseWorkUnitID` reverses this repo's own frozen
+    `WorkUnitID` formula to recover `(OrderId, LineNo)` from the wire's
+    `order_ref`. New use case `RepromiseOrder` finds the line's current
+    `PromiseGroup`, calls the EXISTING `PromisePolicy.PromiseGroups`
+    again fresh, and — if the group's promise moved — saves the new
+    breakdown and publishes the new `shared.OrderRepromised` event on
+    `warehouse.order-management.events`. Idempotent on the Kafka
+    message's `event_id` alone via a NEW OLTP-side port
+    `ports.RepromiseProcessedEvents` (Postgres migration
+    `0004_repromise_processed_events`) — a deliberate, documented
+    simplification of ADR 0014 §5's stated `(orderId, sourceEventId)`
+    key. No new promise-computation logic anywhere — read the ADR before
+    touching `repromise_order.go`, `repromise_consumer.go`, or
+    `ParseWorkUnitID`.
+19. **0019 — ACCEPTED: promise KPIs on the Order Funnel data product,
+    closing ADR 0014 §6 (order-management half).** Widens ADR 0006's
+    report.Row with `PromiseBasisCapability`/`PromiseBasisLeadTime`
+    (basis distribution), `OrdersRepromised` (NEW `repromise_rollup`
+    table, hour-only grain — deliberately not path-dimensioned, since
+    `OrderRepromised` carries no path), `OrdersSplitShipment`
+    (`len(o.PromiseGroups()) > 1` at allocation time), and
+    `PromiseToCutoffGapSeconds`/`PromiseToCutoffGapSamples` (sum+count
+    mean, fulfillment-execution's `throughput_rollup` pattern).
+    `ApplyOrderAllocated`/`ApplyOrderPartiallyAllocated` widened IN
+    PLACE (new `basis`/`cutoffAt`/`splitShipment` params) rather than a
+    second Apply* method, so the promise facts share the SAME eventId
+    claim as the funnel counter. `AnalyticsPublisher.marshalData` gains
+    the previously-missing `OrderRepromised` case plus
+    `promise_basis`/`promise_cutoff_at`/`split_shipment` enrichment on
+    `OrderAllocated`/`OrderPartiallyAllocated`. New MCP tool
+    `get_promise_health` (`internal/adapters/inbound/mcp/
+    promise_health.go`) — declares its OWN `PromiseHealthStore` port
+    (never imports `internal/analytics/report` directly, per
+    `TestMCPAdapterDependencyRule`/ADR-0008); `cmd/mcp` adapts the real
+    `report.ReportStore` into it. On-time-to-CPT is explicitly OUT OF
+    SCOPE here — fulfillment-execution's own companion analytics, a
+    separate repo/PR. Read the ADR before touching `funnel.go`,
+    `ports.go`, `postgres_projection.go`, the analytics Kafka
+    consumer/publisher, or `promise_health.go`.
+
+20. **0020 — network-originated demand — release-on-allocation,
+    deadline feasibility, and the `Network` promise basis.** Companion to
+    `network-fulfillment` ADR 0001 (the bounded context that speaks
+    Amazon's Selling Partner API and owns the 24h acknowledgement clock);
+    neither is meaningful alone. Three additive capabilities here: (a) an
+    optional `releaseOnAllocation` intake flag, DEFAULT `true` so every
+    existing caller is byte-identical — `false` stops the ADR-0005 folded
+    saga after allocation (lines reach `Allocated`, `OrderAllocated` still
+    publishes, nothing is released), plus a `ReleaseHeldOrder` use case
+    reusing `allocation.go`'s release leg; (b)
+    `PromisePolicy.FeasibleBy(now, o, deadline)`, the dual of `Promise` —
+    same three ADR-0014 §2 conditions, returns the LATEST qualifying
+    window at-or-before the deadline, and **never falls back to
+    `LeadTimePolicy`** (cold cache/unknown cycle time ⇒ `false`, because
+    "could not determine" and "can meet it" must not be the same answer);
+    (c) `BasisNetwork`, a third `PromiseBasis` for a promise DICTATED by
+    an external deadline, keeping ADR 0019's KPIs separable. Plus a 422
+    invariant: `releaseOnAllocation=false` + `allowPartialShipment=true`
+    is contradictory (ADR 0017 group promising gives several answers where
+    a whole-order accept/reject can send one). Hold state is deliberately
+    "allocated, not released" — NOT a new `Held` status — so ADR 0004's
+    cancellation boundary stays intact and rejection cancels cleanly.
+    Amazon/PO/ASIN/acknowledgement vocabulary and customer PII are
+    explicitly OUT: they live in `network-fulfillment`, and `arch-go`
+    cannot catch a vocabulary leak — that check is human. Known gap
+    recorded: nothing here sweeps an orphaned hold, which sits on real
+    inventory reservations.
 
 Other ADR-adjacent facts worth knowing without opening every file:
 

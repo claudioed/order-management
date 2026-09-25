@@ -4,6 +4,8 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+  schedule:
+    - cron: "0 6 * * 1"   # weekly, Monday 6am UTC, for the mutation job only
   workflow_dispatch: {}
 
 permissions:
@@ -17,9 +19,15 @@ defaults:
   run:
     shell: bash
 
-# v1 ran only `lint` and `test`. `helm-lint`, `docker-publish`, and `release`
-# are now onboarded (see CLAUDE.md's v1 scope note and the
-# docker-helm-release PR) — `mutation` and `bdd` remain deliberately deferred.
+# Restored to fleet parity 2026-09-13 (see .claude/rules/ci-quality-gates.md):
+# bdd, mutation-fast, vuln, mutation, api-lint, arch-test and docs-api-drift
+# were added in PR #34 (fleet-parity quality sensors) but were dropped as
+# collateral damage in PR #35 ("harden order management security and QA"),
+# which only documented mutation/bdd as deliberately deferred — arch-test,
+# vuln, api-lint and docs-api-drift had no such rationale and their backing
+# files (.gremlins.yaml, features/*.feature, internal/architecture/) were
+# never deleted, so this restores the same jobs PR #34 shipped, re-verified
+# against current code (mutation baseline re-measured, see .gremlins.yaml).
 jobs:
   # ============================================================
   # CLASSIFICATION: LINTERS & STATIC ANALYSIS
@@ -33,7 +41,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false          # golangci-lint-action manages its own cache
-      - uses: golangci/golangci-lint-action@db9de0fc1a667e1a49d2291a1a042dff081d78f6 # v9
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           version: v2.13.1
           args: --timeout=5m
@@ -92,6 +100,20 @@ jobs:
           path: coverage.out
 
   # ============================================================
+  # CLASSIFICATION: BEHAVIOR TESTING (BDD / Gherkin)
+  # ============================================================
+  bdd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Run BDD (godog/Gherkin) acceptance tests
+        run: go test ./... -run TestFeatures -v
+
+  # ============================================================
   # CLASSIFICATION: INTEGRATION TESTING (isolated Testcontainers Kafka)
   # ============================================================
   integration:
@@ -102,13 +124,193 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - name: Build, vet, and test Kafka adapter against Testcontainers
+      - name: Build, vet, and test Kafka adapters against Testcontainers
         run: |
           set -euo pipefail
           go build -tags=integration ./...
           go vet -tags=integration ./...
           go test -tags=integration ./internal/adapters/outbound/kafka
+          go test -tags=integration ./internal/adapters/outbound/kafkacatalog
+          go test -tags=integration ./internal/adapters/outbound/kafkacptschedule
+          go test -tags=integration ./internal/adapters/outbound/kafkapathcapacity
+          go test -tags=integration ./internal/adapters/inbound/kafka
 
+
+  # ============================================================
+  # CLASSIFICATION: TEST-QUALITY SENSOR (mutation testing, fast subset)
+  # Fast, BLOCKING test-quality sensor: runs on every push/PR. Subset:
+  # the order aggregate only, so it stays fast enough to gate the build.
+  # ============================================================
+  mutation-fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Install gremlins
+        run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
+      - name: Mutation testing (fast subset — order aggregate)
+        run: gremlins unleash ./internal/domain/order
+
+  # ============================================================
+  # CLASSIFICATION: SECURITY SCANNER (dependency / stdlib CVEs)
+  # ============================================================
+  vuln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  # Exhaustive, deep mutation run over the whole domain. Slow, so it stays on
+  # the weekly schedule / manual dispatch; mutation-fast is the blocking one.
+  # ============================================================
+  # CLASSIFICATION: TEST-QUALITY SENSOR (mutation testing, full domain)
+  # ============================================================
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Install gremlins
+        run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
+      - name: Mutation testing (domain layer)
+        run: gremlins unleash ./internal/domain --workers 1 --timeout-coefficient 30
+
+  # ============================================================
+  # CLASSIFICATION: CONTINUOUS DRIFT (advisory, weekly — never blocks a PR)
+  # ============================================================
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    defaults:
+      run:
+        working-directory: order-management
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: order-management
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: claudioed/warehouse-ui-kit
+          ref: develop
+          path: warehouse-ui-kit
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: order-management/go.mod
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "20"
+      - name: Dead code (go tool deadcode, -test so test-only helpers don't false-positive)
+        run: |
+          go install golang.org/x/tools/cmd/deadcode@v0.35.0
+          echo "### deadcode" >> "$GITHUB_STEP_SUMMARY"
+          deadcode -test ./... | tee -a "$GITHUB_STEP_SUMMARY" || true
+      - name: Unused/stale go.mod entries (go mod tidy -diff)
+        run: |
+          echo "### go mod tidy -diff" >> "$GITHUB_STEP_SUMMARY"
+          go mod tidy -diff | tee -a "$GITHUB_STEP_SUMMARY" || true
+      - name: Build warehouse-ui-kit (order_mgmt_mfe's file dependency)
+        run: npm ci && npm run build
+        working-directory: warehouse-ui-kit
+      - name: Unused frontend exports/files/deps (knip)
+        working-directory: order-management/web
+        run: |
+          npm ci
+          echo "### knip (web/)" >> "$GITHUB_STEP_SUMMARY"
+          npx knip --no-exit-code | tee -a "$GITHUB_STEP_SUMMARY" || true
+      - name: Coverage quality — high-coverage functions with a surviving mutant
+        run: |
+          go test ./internal/domain/... -coverprofile=/tmp/cov.out -covermode=atomic
+          go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
+          gremlins unleash ./internal/domain --workers 1 --timeout-coefficient 30 > /tmp/gremlins.log 2>&1 || true
+          echo "### coverage-quality" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/coverage-quality.py /tmp/cov.out /tmp/gremlins.log | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # CLASSIFICATION: LINTERS & STATIC ANALYSIS (API contracts)
+  # ============================================================
+  api-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "20"
+      - name: Install Spectral
+        # `npm ci` against a pinned local package-lock.json (apis/tooling/)
+        # instead of an unpinned global `npm install -g` -- installs the
+        # CLI into that directory's node_modules and PATH-prefixes it.
+        run: |
+          npm ci --prefix apis/tooling
+          echo "$PWD/apis/tooling/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Lint OpenAPI spec
+        run: spectral lint apis/openapi.yaml --ruleset .spectral.yaml --fail-severity=warn
+      - name: Lint AsyncAPI spec
+        run: spectral lint apis/asyncapi.yaml --ruleset .spectral.asyncapi.yaml --fail-severity=warn
+
+  # ============================================================
+  # CLASSIFICATION: LINTERS & STATIC ANALYSIS (architecture fitness)
+  # ============================================================
+  arch-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Architecture fitness tests
+        run: go test ./internal/architecture/... -v
+
+  # Guards against the generated "API Reference" docs
+  # (docs/docs/api-reference/rest/, produced by docusaurus-plugin-openapi-docs
+  # from apis/openapi.yaml) drifting out of sync with the spec they're
+  # supposed to mirror. Regenerates them exactly as `gen-api-docs` would and
+  # fails the PR if that produces any diff — i.e. someone changed
+  # apis/openapi.yaml (or hand-edited the generated files) without running
+  # `npm run gen-api-docs order` and committing the result.
+  # ============================================================
+  # CLASSIFICATION: DOCS/API DRIFT
+  # ============================================================
+  docs-api-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - run: npm ci
+      - name: Regenerate REST API docs from apis/openapi.yaml
+        run: npm run clean-api-docs order && npm run gen-api-docs order
+      - name: Fail if generated docs differ from what's committed
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- docs/docs/api-reference/rest; then
+            echo "::error::docs/docs/api-reference/rest is out of sync with apis/openapi.yaml." \
+                 "Run 'npm run gen-api-docs order' inside docs/ and commit the result."
+            exit 1
+          fi
 
   # ============================================================
   # CLASSIFICATION: PACKAGING VALIDATION (Helm chart)
@@ -123,7 +325,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: azure/setup-helm@59b1c81c6280f5abebb1fb1bc585696daa7dfb42 # v5
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
@@ -144,6 +346,32 @@ jobs:
   # Runs ONLY for a pull_request targeting main -- validated pre-merge,
   # never on develop pushes/PRs or on push-to-main (already validated).
   # ============================================================
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: order-management/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: order-management
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: claudioed/warehouse-ui-kit
+          ref: develop
+          path: warehouse-ui-kit
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22"
+      - run: npm ci && npm run build
+        working-directory: warehouse-ui-kit
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc -b
+      - run: npm test
+      - run: npm run build
+
   trivy-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -153,9 +381,9 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Build image (local only, not pushed)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           platforms: linux/amd64
@@ -165,7 +393,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: "Trivy scan (SARIF, always uploaded)"
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         if: always()
         with:
           image-ref: 'order-management:scan'
@@ -174,12 +402,12 @@ jobs:
           severity: 'CRITICAL,HIGH,MEDIUM'
           ignore-unfixed: true
       - name: Upload Trivy SARIF to Security tab
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
       - name: "Trivy scan (blocking gate: CRITICAL/HIGH with a fix available)"
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: 'order-management:scan'
           format: 'table'
@@ -204,7 +432,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set image tag (short SHA)
         run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
@@ -213,7 +441,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           platforms: linux/amd64
@@ -224,13 +452,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Install cosign
-        uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9 # v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Sign the published image (keyless, GitHub OIDC identity)
         run: |
           cosign sign --yes \
             ghcr.io/claudioed/order-management@${{ steps.build.outputs.digest }}
       - name: Generate SBOM (SPDX) for the published image
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ghcr.io/claudioed/order-management@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -283,7 +511,7 @@ jobs:
           echo "version=$new" >> "$GITHUB_OUTPUT"
       - name: Set image tag (short SHA)
         run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
@@ -295,7 +523,7 @@ jobs:
           docker buildx imagetools create \
             -t ghcr.io/claudioed/order-management:${{ steps.version.outputs.version }} \
             ghcr.io/claudioed/order-management:${{ env.SHORT_SHA }}
-      - uses: azure/setup-helm@59b1c81c6280f5abebb1fb1bc585696daa7dfb42 # v5
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
       - name: Package and publish the Helm chart for this release
@@ -319,7 +547,7 @@ jobs:
           git tag ${{ steps.version.outputs.version }}
           git push origin ${{ steps.version.outputs.version }}
       - name: Create GitHub release
-        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ steps.version.outputs.version }}
           generate_release_notes: true

@@ -4,10 +4,11 @@ package shared
 // enqueued onto at release time.
 type PathId string
 
-// DefaultPathId is the process path used when a caller does not supply one.
-// A documented v1 simplification: Order Management does not (yet) model
-// path selection as a domain policy, in the same spirit as
-// fulfillment-execution's documented path_id-prefix convention.
+// DefaultPathId is the process path used when a caller does not supply one,
+// or when order.PathSelectionPolicy's current rule set resolves to no
+// more specific path (see ADR-0013 — path selection is now a real domain
+// policy, validated against process-path-management's live catalogue at
+// intake time, not a hardcoded adapter-layer default).
 const DefaultPathId PathId = "pick"
 
 // NewPathId validates and constructs a PathId. Use NewPathIdOrDefault when

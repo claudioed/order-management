@@ -101,3 +101,180 @@ type InventoryReservationClient interface {
 	Reserve(ctx context.Context, req ReservationRequest) (ReservationResult, error)
 	RevokeReservation(ctx context.Context, reservationID string) error
 }
+
+// ProcessPathCatalogue is the read-only outbound port for
+// process-path-management's live catalogue of currently active process
+// paths. ADR-0013 originally kept this port to ONLY the membership
+// question ReceiveOrder needs at intake — "is this path active right
+// now" — deliberately deferring the catalogue's fuller shape (cycle
+// time, eligibility) until a real consumer needed it.
+//
+// ADR-0014 step A is that consumer: PromisePolicy needs a path's
+// CycleTimeP95 and Eligibility to decide whether an allocated line can
+// make a given CPT window. This is a NON-BREAKING additive widening
+// (two new methods), not a boundary violation — ADR-0014 explicitly asks
+// for it. See internal/adapters/outbound/kafkacatalog's package doc
+// comment for the adapter that implements this against a live Kafka
+// feed, mirroring the same port already proven in wes-work-planning /
+// fulfillment-execution / workforce-management.
+type ProcessPathCatalogue interface {
+	// IsActive reports whether pathId currently names an active,
+	// declared process path. Matching semantics (exact id, or a
+	// declared MatchPrefix + "-" family) are the adapter's concern, not
+	// the port's — ReceiveOrder only needs the yes/no answer.
+	IsActive(pathId shared.PathId) bool
+
+	// CycleTimeP95 returns the path's 95th-percentile cycle time —
+	// how long it takes a unit to move through this path once picked
+	// up — and whether that value is currently known. known=false
+	// covers both "path is unknown/inactive" and "path is active but
+	// the wire event never carried a parseable cycle_time_p95" (see
+	// kafkacatalog's decoder): PromisePolicy treats both the same way,
+	// as "cannot compute a capability-basis promise for this line".
+	CycleTimeP95(pathId shared.PathId) (cycleTime time.Duration, known bool)
+
+	// Eligibility returns the path's declared eligibility rule and
+	// whether it is currently known (false for an unknown/inactive
+	// path). Nothing in step A consumes this for a routing decision —
+	// it is made available now so step B (eligibility-driven
+	// PathSelectionPolicy) does not need another catalogue widening.
+	Eligibility(pathId shared.PathId) (shared.Eligibility, bool)
+}
+
+// CPTScheduleCache is the read-only outbound port for
+// process-path-management's per-site CPT schedule (PPM ADR 0010's
+// CPTScheduleChanged event). It is backed by a Kafka-fed local cache
+// (internal/adapters/outbound/kafkacptschedule), mirroring
+// ProcessPathCatalogue's own Kafka-cache pattern exactly — including its
+// per-process-unique consumer group and readiness-gate design — but as
+// a SEPARATE consumer instance on the SAME topic, since CPTScheduleChanged
+// and ProcessPathCreated/Updated/Deactivated are independent event types
+// this service reacts to independently.
+//
+// NextCutoffs returns order.CPTWindow (a domain type) rather than a
+// ports-owned type: PromisePolicy is pure domain logic per ADR 0014 and
+// declares its own minimal order.ScheduleSource interface with this
+// exact signature, so this port's adapter (kafkacptschedule.Consumer)
+// satisfies both this port AND order.ScheduleSource without any
+// translation glue.
+type CPTScheduleCache interface {
+	// NextCutoffs returns up to n upcoming concrete cutoff instants for
+	// siteId, computed from the schedule's recurring (localTime,
+	// daysOfWeek, timezone) rule, from time `from` onward, each paired
+	// with the cptId and eligiblePathIds that applied. Returns
+	// known=false if no schedule exists yet for siteId (e.g. the Kafka
+	// cache has not yet observed a CPTScheduleChanged event for it).
+	NextCutoffs(siteId string, from time.Time, n int) (cutoffs []order.CPTWindow, known bool)
+}
+
+// ProductClassification is this context's own minimal view of a SKU's
+// product classification, as looked up from inventory-storage's
+// GET /products/{sku}/classification (see ProductClassificationLookup).
+// It carries only what order.PathSelectionPolicy's eligibility evaluation
+// needs -- the raw handling tags as free-form strings from the fleet's
+// existing product-classification vocabulary (e.g. "Hazmat", "Fragile",
+// "TemperatureSensitive") -- not inventory-storage's fuller
+// ProductClassification resource (temperatureClass, dotHazardClass are
+// omitted; narrow port, ADR-0013's own stated philosophy). Known
+// distinguishes "SKU has no registered classification, or the lookup is
+// unavailable" (Known=false, both treated identically -- permissive/
+// fail-open, mirroring wes-work-planning's ADR-0009) from "classification
+// confirmed" (Known=true).
+type ProductClassification struct {
+	SKU          string
+	HandlingTags []string
+	Known        bool
+}
+
+// HasTag reports whether tag (e.g. "Hazmat", "Fragile") is present among
+// HandlingTags.
+func (c ProductClassification) HasTag(tag string) bool {
+	for _, t := range c.HandlingTags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// ProductClassificationLookup is the outbound port for the synchronous
+// cross-context read from inventory-storage's product-classification
+// endpoint (GET /products/{sku}/classification), used at intake time so
+// order.PathSelectionPolicy can evaluate a line's derived product
+// attributes (hazmat/fragile/etc.) against a candidate path's declared
+// Eligibility -- see ADR-0016 (ADR-0014 step B). This mirrors
+// wes-work-planning's own ports.ProductClassificationLookup (its
+// ADR-0009) exactly in shape and intent; order-management never imports
+// that service's Go packages (see .claude/rules/bounded-context-boundary.md)
+// -- this is an independently-owned copy of the same pattern, calling the
+// same real inventory-storage endpoint.
+//
+// GetClassification MUST fail open on anything short of a real
+// classification: a 404 (unclassified SKU), a transport error, or any
+// non-2xx/404 status are all Known=false, never an error returned to the
+// caller -- see PermissiveLookup and Client in
+// internal/adapters/outbound/productclassification for the two
+// implementations. This is a soft routing/enrichment input, not a stock
+// reservation, so it follows this fleet's "fail loud for anything that
+// mutates real state, fail quiet/open for a soft enrichment input" rule
+// -- the opposite of InventoryReservationClient above.
+type ProductClassificationLookup interface {
+	GetClassification(ctx context.Context, sku string) (ProductClassification, error)
+}
+
+// PathCapacity is the read-only outbound port for remaining capacity per
+// (path, CPT) bucket. Two implementations exist: UnknownPathCapacity
+// (always known=false, the pre-ADR-0015 default and the dev-mode/
+// fallback option today) and kafkapathcapacity.Consumer (ADR-0015), a
+// Kafka-fed cache of wes-work-planning's PathCapacityChanged event.
+// PromisePolicy treats known=false as "capacity is not a constraint"
+// per ADR-0014's explicit condition (c) — this is unchanged by ADR-0015;
+// what changes is that a real figure is now available whenever
+// wes-work-planning has reported one for the exact path+cutoff asked
+// about.
+//
+// Remaining's signature carries cutoffAt (ADR-0015), not just cptId: the
+// wire event wes-work-planning actually publishes carries its own native
+// CutoffAt instant (a time.Time), never process-path-management's cptId
+// string. The one caller of this port, order.PromisePolicy.linesFitWindow,
+// already has both cptId and cutoffAt in scope from the CPTWindow it is
+// evaluating (see kafkacptschedule's NextCutoffs), so passing cutoffAt
+// costs the caller nothing and lets a Kafka-fed adapter answer without
+// inventing its own cptId<->cutoffAt resolution. See ADR-0015 for the
+// full reasoning and the alternative considered.
+type PathCapacity interface {
+	// Remaining reports how many units remain available for pathId at
+	// the CPT identified by cptId (kept for logging/observability —
+	// implementations correlate on cutoffAt, not cptId) and cutoffAt,
+	// and whether that figure is currently known.
+	Remaining(pathId shared.PathId, cptId string, cutoffAt time.Time) (units int, known bool)
+}
+
+// RepromiseProcessedEvents is RepromiseOrder's idempotency gate (ADR
+// 0014 §5 / ADR 0018): it records which Kafka event_ids have already
+// been evaluated, so fulfillment-execution's TaskCPTMissed sweep —
+// which re-fires on EVERY sweep pass for as long as a task stays
+// overdue, by that service's own ADR 0025 design — never re-evaluates
+// the same message twice. This is a NEW, OLTP-side port: the only
+// existing ProcessedEvents-shaped interface in this repo
+// (adapters/inbound/kafka.ProcessedEvents) is declared local to the
+// analytics consumer specifically so the analytics side owns its own
+// port and the OLTP application layer stays untouched — see that
+// file's doc comment. RepromiseOrder is OLTP-side (it mutates the real
+// Order aggregate and publishes a real integration event), so it gets
+// its own, distinctly-named port rather than reusing that one.
+//
+// The idempotency key is the Kafka message's event_id alone, not a
+// composite (orderId, event_id) key. ADR 0014 §5 states the requirement
+// as "idempotent on (orderId, sourceEventId)", but event_id is already
+// globally unique per message (every publisher in this fleet mints it
+// with uuid.NewString()), so scoping the check by orderId too is
+// redundant — two different orders can never coincidentally share the
+// same event_id, and the SAME event_id always refers to the SAME
+// order. This simplification is documented explicitly, not silently
+// substituted — see the RepromiseOrder ADR.
+type RepromiseProcessedEvents interface {
+	// MarkProcessed records eventId if absent, returning true iff this
+	// call newly recorded it.
+	MarkProcessed(ctx context.Context, eventId string) (bool, error)
+}

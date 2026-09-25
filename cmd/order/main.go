@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,19 +16,33 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	inboundhttp "github.com/claudioed/order-management/internal/adapters/inbound/http"
+	inboundkafka "github.com/claudioed/order-management/internal/adapters/inbound/kafka"
 	"github.com/claudioed/order-management/internal/adapters/outbound/events"
 	"github.com/claudioed/order-management/internal/adapters/outbound/inventorystorage"
 	kafkaadapter "github.com/claudioed/order-management/internal/adapters/outbound/kafka"
+	"github.com/claudioed/order-management/internal/adapters/outbound/kafkacatalog"
+	"github.com/claudioed/order-management/internal/adapters/outbound/kafkacptschedule"
+	"github.com/claudioed/order-management/internal/adapters/outbound/kafkapathcapacity"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
+	"github.com/claudioed/order-management/internal/adapters/outbound/pathcapacity"
 	"github.com/claudioed/order-management/internal/adapters/outbound/postgres"
+	"github.com/claudioed/order-management/internal/adapters/outbound/productclassification"
 	"github.com/claudioed/order-management/internal/adapters/outbound/telemetry"
 	"github.com/claudioed/order-management/internal/application/ports"
 	"github.com/claudioed/order-management/internal/application/usecases"
 	"github.com/claudioed/order-management/internal/domain/order"
 	"github.com/claudioed/order-management/internal/domain/shared"
 )
+
+// DefaultSiteId is used when DEFAULT_SITE_ID is unset. ADR 0014 step A
+// does not yet model which site an order ships from (a known
+// simplification for this phase — see order.PromisePolicy's doc
+// comment); every promise in this phase is computed against one
+// configured site.
+const DefaultSiteId = "site-1"
 
 func main() {
 	if err := run(); err != nil {
@@ -76,25 +91,194 @@ func run() error {
 	databaseURL := os.Getenv("DATABASE_URL")
 	migrationsPath := getenv("MIGRATIONS_PATH", "migrations")
 
-	orders, publisher, closeAdapters, err := buildRepoAdapters(databaseURL, migrationsPath, getenv("EVENT_PUBLISHER", "log"), logger)
+	orders, publisher, dbPool, closeAdapters, err := buildRepoAdapters(databaseURL, migrationsPath, getenv("EVENT_PUBLISHER", "log"), logger)
 	if err != nil {
 		return err
 	}
 	defer closeAdapters()
 
+	repromiseProcessed := buildRepromiseProcessedEvents(dbPool, logger)
+
 	inventory := buildInventoryClient(getenv("INVENTORY_STORAGE_MODE", "permissive"), os.Getenv("INVENTORY_STORAGE_BASE_URL"), logger)
 
-	promise := order.NewLeadTimePolicy(
+	// The product-classification lookup (ADR-0016 / ADR-0014 step B)
+	// shares INVENTORY_STORAGE_BASE_URL with the inventory reservation
+	// client above -- both call the SAME downstream service, so there is
+	// deliberately no second base-URL knob for it, only its own
+	// independent PRODUCT_CLASSIFICATION_MODE switch, mirroring
+	// wes-work-planning's exact convention.
+	classification := buildClassificationLookup(getenv("PRODUCT_CLASSIFICATION_MODE", "permissive"), os.Getenv("INVENTORY_STORAGE_BASE_URL"), logger)
+
+	// The process-path catalogue's SOURCE is selectable, defaulting to
+	// "none" (validation skipped -- a nil ports.ProcessPathCatalogue is
+	// this fleet's established "not yet wired" convention, see
+	// ReceiveOrder's doc comment). Set PATH_CATALOGUE_SOURCE=kafka for a
+	// real deployment, mirroring wes-work-planning/fulfillment-execution/
+	// workforce-management's identical PATH_CATALOGUE_SOURCE convention.
+	// Unlike those three services, order-management never had a
+	// file-based catalogue to begin with (see ADR-0013's scope decision),
+	// so there is no "file" mode here -- only "none" (skip) and "kafka"
+	// (real validation).
+	//
+	// ADR-0014 step A extends this SAME switch: the CPT schedule cache
+	// (kafkacptschedule) is a SEPARATE consumer instance on the SAME
+	// topic/broker as the catalogue, so it is gated identically -- it
+	// only runs when the catalogue does, since both need KAFKA_BROKERS.
+	//
+	// ADR-0015 extends it a THIRD time: the path capacity cache
+	// (kafkapathcapacity) is yet another separate consumer instance, on
+	// a DIFFERENT topic (wes-work-planning's warehouse.work-planning.
+	// events, not process-path-management's), but the SAME broker and
+	// the SAME PATH_CATALOGUE_SOURCE switch -- there is no new env knob
+	// for an operator to learn. When the switch is "none" (or unset),
+	// ports.PathCapacity stays wired to UnknownPathCapacity, exactly
+	// today's behaviour.
+	catalogueSource := getenv("PATH_CATALOGUE_SOURCE", "none")
+	var catalogue ports.ProcessPathCatalogue
+	var cptSchedule ports.CPTScheduleCache
+	var capacity ports.PathCapacity = pathcapacity.NewUnknown()
+	// catalogueConsumerCtx/cancelCatalogueConsumer are declared here
+	// (rather than inline in the switch below) because the Kafka
+	// catalogue source needs its own Run goroutine started BEFORE
+	// WaitReady is called -- otherwise nothing would ever be consuming
+	// messages while this process waits, guaranteeing a deadlock until
+	// WaitReadyTimeout.
+	catalogueConsumerCtx, cancelCatalogueConsumer := context.WithCancel(context.Background())
+	defer cancelCatalogueConsumer()
+
+	switch catalogueSource {
+	case "kafka":
+		kafkaBrokers := os.Getenv("KAFKA_BROKERS")
+		if kafkaBrokers == "" {
+			return fmt.Errorf("PATH_CATALOGUE_SOURCE=kafka requires KAFKA_BROKERS to be set")
+		}
+		brokerList := strings.Split(kafkaBrokers, ",")
+
+		kafkaCatalogue, err := kafkacatalog.NewConsumer(context.Background(), brokerList, logger)
+		if err != nil {
+			return fmt.Errorf("failed to start the Kafka-sourced process-path catalogue: %w", err)
+		}
+		catalogue = kafkaCatalogue
+		logger.Info("process-path catalogue source configured", "source", "kafka", "topic", kafkacatalog.Topic)
+		go func() {
+			logger.Info("process-path catalogue consumer running", "topic", kafkacatalog.Topic)
+			if err := kafkaCatalogue.Run(catalogueConsumerCtx); err != nil {
+				logger.Error("process-path catalogue consumer stopped", "error", err)
+			}
+		}()
+
+		// A SEPARATE consumer instance, own per-process-unique consumer
+		// group, on the SAME topic -- see kafkacptschedule's package
+		// doc comment for why this is safe (independent event-type
+		// filters, independent groups).
+		cptScheduleConsumer, err := kafkacptschedule.NewConsumer(context.Background(), brokerList, logger)
+		if err != nil {
+			return fmt.Errorf("failed to start the Kafka-sourced CPT schedule cache: %w", err)
+		}
+		cptSchedule = cptScheduleConsumer
+		logger.Info("CPT schedule cache source configured", "source", "kafka", "topic", kafkacptschedule.Topic)
+		go func() {
+			logger.Info("CPT schedule consumer running", "topic", kafkacptschedule.Topic)
+			if err := cptScheduleConsumer.Run(catalogueConsumerCtx); err != nil {
+				logger.Error("CPT schedule consumer stopped", "error", err)
+			}
+		}()
+
+		// A THIRD independent consumer instance, own per-process-unique
+		// consumer group, on wes-work-planning's OWN topic -- see
+		// kafkapathcapacity's package doc comment (ADR-0015).
+		pathCapacityConsumer, err := kafkapathcapacity.NewConsumer(context.Background(), brokerList, logger)
+		if err != nil {
+			return fmt.Errorf("failed to start the Kafka-sourced path capacity cache: %w", err)
+		}
+		capacity = pathCapacityConsumer
+		logger.Info("path capacity cache source configured", "source", "kafka", "topic", kafkapathcapacity.Topic)
+		go func() {
+			logger.Info("path capacity consumer running", "topic", kafkapathcapacity.Topic)
+			if err := pathCapacityConsumer.Run(catalogueConsumerCtx); err != nil {
+				logger.Error("path capacity consumer stopped", "error", err)
+			}
+		}()
+
+		logger.Info("waiting for the process-path catalogue to replay its initial history before accepting traffic")
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), kafkacatalog.WaitReadyTimeout)
+		err = kafkaCatalogue.WaitReady(waitCtx)
+		waitCancel()
+		if err != nil {
+			return fmt.Errorf("process-path catalogue did not become ready within %s: %w", kafkacatalog.WaitReadyTimeout, err)
+		}
+
+		logger.Info("waiting for the CPT schedule cache to replay its initial history before accepting traffic")
+		scheduleWaitCtx, scheduleWaitCancel := context.WithTimeout(context.Background(), kafkacptschedule.WaitReadyTimeout)
+		err = cptScheduleConsumer.WaitReady(scheduleWaitCtx)
+		scheduleWaitCancel()
+		if err != nil {
+			return fmt.Errorf("CPT schedule cache did not become ready within %s: %w", kafkacptschedule.WaitReadyTimeout, err)
+		}
+
+		logger.Info("waiting for the path capacity cache to replay its initial history before accepting traffic")
+		capacityWaitCtx, capacityWaitCancel := context.WithTimeout(context.Background(), kafkapathcapacity.WaitReadyTimeout)
+		err = pathCapacityConsumer.WaitReady(capacityWaitCtx)
+		capacityWaitCancel()
+		if err != nil {
+			return fmt.Errorf("path capacity cache did not become ready within %s: %w", kafkapathcapacity.WaitReadyTimeout, err)
+		}
+	default:
+		logger.Warn("process-path catalogue source not configured; ReceiveOrder will skip path validation, and path capacity will remain unknown (UnknownPathCapacity)",
+			"hint", "set PATH_CATALOGUE_SOURCE=kafka for a real deployment")
+	}
+
+	leadTime := order.NewLeadTimePolicy(
 		durationEnv("PROMISE_DEFAULT_LEAD_TIME", order.DefaultLeadTime, logger),
 		perPathLeadTimes(os.Getenv("PROMISE_PATH_LEAD_TIMES"), logger),
 	)
 
+	// PromisePolicy (ADR 0014) is the primary policy; leadTime is its
+	// fallback, unchanged in its own logic. Capability/Schedule are nil
+	// when the Kafka catalogue source is not configured, in which case
+	// PromisePolicy always falls back to leadTime -- exactly this
+	// service's pre-ADR-0014 behaviour.
+	promise := order.PromisePolicy{
+		Schedule:   cptSchedule,
+		Capability: catalogue,
+		Capacity:   capacity,
+		Fallback:   leadTime,
+		SiteId:     getenv("DEFAULT_SITE_ID", DefaultSiteId),
+	}
+
 	clock := memory.SystemClock{}
 	server := &inboundhttp.Server{
-		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise, Metrics: orderMetrics},
+		ReceiveOrder:    &usecases.ReceiveOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise, Catalogue: catalogue, Classification: classification, Metrics: orderMetrics},
+		ReleaseHeld:     &usecases.ReleaseHeldOrder{Orders: orders, Events: publisher, Clock: clock, Inventory: inventory, Promise: promise},
 		RetryAllocation: &usecases.RetryAllocation{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock, Promise: promise},
 		CancelOrder:     &usecases.CancelOrder{Orders: orders, Inventory: inventory, Events: publisher, Clock: clock},
 		GetOrder:        &usecases.GetOrder{Orders: orders},
+	}
+
+	// RepromiseOrder consumer (ADR 0014 §5 / ADR 0018) — the final
+	// piece of ADR 0014's rollout. It is wired independently of
+	// PATH_CATALOGUE_SOURCE/EVENT_PUBLISHER: it needs its own inbound
+	// Kafka consumer on fulfillment-execution's warehouse.fulfillment.events
+	// topic, gated on KAFKA_BROKERS alone, mirroring this repo's other
+	// KAFKA_BROKERS-gated conditional constructions. A STABLE, shared
+	// consumer group (kafka.RepromiseConsumerGroup) is used — this is a
+	// normal at-least-once "process and commit" consumer, not a
+	// full-replay local-cache one, so it must NOT use a
+	// per-process-unique group (see that package's doc comment).
+	repromiseOrder := &usecases.RepromiseOrder{
+		Orders: orders, Promise: promise, Events: publisher, Clock: clock,
+		Processed: repromiseProcessed, Logger: logger,
+	}
+	repromiseConsumerCtx, cancelRepromiseConsumer := context.WithCancel(context.Background())
+	defer cancelRepromiseConsumer()
+	var repromiseConsumer *inboundkafka.RepromiseConsumer
+	if kafkaBrokers := os.Getenv("KAFKA_BROKERS"); kafkaBrokers != "" {
+		repromiseConsumer = inboundkafka.NewRepromiseConsumer(strings.Split(kafkaBrokers, ","), repromiseOrder, logger)
+		logger.Info("repromise consumer configured",
+			"topic", inboundkafka.FulfillmentEventsTopic, "group_id", inboundkafka.RepromiseConsumerGroup)
+	} else {
+		logger.Warn("KAFKA_BROKERS not configured; RepromiseOrder consumer will not run, OrderRepromised will never fire",
+			"hint", "set KAFKA_BROKERS for a real deployment")
 	}
 
 	httpServer := &http.Server{
@@ -103,13 +287,26 @@ func run() error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		logger.Info("http server listening", "addr", httpAddr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
 	}()
+	if repromiseConsumer != nil {
+		defer func() {
+			if err := repromiseConsumer.Close(); err != nil {
+				logger.Error("error closing repromise consumer", "error", err)
+			}
+		}()
+		go func() {
+			logger.Info("repromise consumer running", "topic", inboundkafka.FulfillmentEventsTopic)
+			if err := repromiseConsumer.Run(repromiseConsumerCtx); err != nil {
+				errCh <- err
+			}
+		}()
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -120,6 +317,7 @@ func run() error {
 	case <-ctx.Done():
 	}
 
+	cancelRepromiseConsumer()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return httpServer.Shutdown(shutdownCtx)
@@ -149,15 +347,18 @@ func newLogger(level string) *slog.Logger {
 // choice ("log"), or can be switched to the Kafka integration-events
 // publisher via eventPublisher="kafka" (EVENT_PUBLISHER env), independent
 // of which repos are in use — mirroring inventory-storage's
-// EVENT_PUBLISHER=kafka|log pattern exactly.
+// EVENT_PUBLISHER=kafka|log pattern exactly. The returned *pgxpool.Pool is
+// nil for the in-memory case; buildRepromiseProcessedEvents reuses it
+// rather than opening a second pool against the same database.
 func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logger *slog.Logger) (
-	ports.OrderRepo, ports.EventPublisher, func(), error,
+	ports.OrderRepo, ports.EventPublisher, *pgxpool.Pool, func(), error,
 ) {
 	noop := func() {}
 
 	var (
 		orders     ports.OrderRepo
 		defaultPub ports.EventPublisher
+		pool       *pgxpool.Pool
 		closeRepos = noop
 	)
 
@@ -167,11 +368,12 @@ func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logge
 		defaultPub = events.NewLogPublisher(logger)
 	} else {
 		if err := postgres.RunMigrations(databaseURL, migrationsPath); err != nil {
-			return nil, nil, noop, err
+			return nil, nil, nil, noop, err
 		}
-		pool, err := postgres.NewPool(context.Background(), databaseURL)
+		var err error
+		pool, err = postgres.NewPool(context.Background(), databaseURL)
 		if err != nil {
-			return nil, nil, noop, err
+			return nil, nil, nil, noop, err
 		}
 		orders = postgres.NewOrderRepo(pool)
 		defaultPub = postgres.NewEventPublisher(pool)
@@ -179,13 +381,14 @@ func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logge
 	}
 
 	if !strings.EqualFold(eventPublisher, "kafka") {
-		return orders, defaultPub, closeRepos, nil
+		return orders, defaultPub, pool, closeRepos, nil
 	}
 
 	brokers := strings.Split(getenv("KAFKA_BROKERS", "localhost:9092"), ",")
 
-	// Integration publisher: forwards OrderAllocated/OrderPartiallyAllocated
-	// onto warehouse.order-management.events. Left exactly as-is.
+	// Integration publisher: forwards OrderAllocated/OrderPartiallyAllocated/
+	// OrderRepromised onto warehouse.order-management.events. Left
+	// exactly as-is.
 	writer := kafkaadapter.NewWriter(brokers...)
 	integration := kafkaadapter.NewPublisher(writer)
 
@@ -210,7 +413,21 @@ func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logge
 		closeRepos()
 	}
 
-	return orders, fanOut, closeAll, nil
+	return orders, fanOut, pool, closeAll, nil
+}
+
+// buildRepromiseProcessedEvents selects RepromiseOrder's idempotency-gate
+// adapter (ADR 0014 §5 / ADR 0018): Postgres-backed when pool is non-nil
+// (the same pool buildRepoAdapters already opened against DATABASE_URL —
+// migration 0004 already ran as part of that same RunMigrations call), or
+// in-memory for local development with no DATABASE_URL, mirroring every
+// other repo adapter's memory/Postgres selection in this composition root.
+func buildRepromiseProcessedEvents(pool *pgxpool.Pool, logger *slog.Logger) ports.RepromiseProcessedEvents {
+	if pool == nil {
+		logger.Info("database url not configured; using in-memory repromise idempotency gate")
+		return memory.NewRepromiseProcessedEventsRepo()
+	}
+	return postgres.NewRepromiseProcessedEventsRepo(pool)
 }
 
 // buildInventoryClient selects the outbound InventoryReservationClient via
@@ -225,6 +442,26 @@ func buildInventoryClient(mode, baseURL string, logger *slog.Logger) ports.Inven
 	}
 	logger.Info("inventory-storage client configured", "mode", "http", "base_url", baseURL)
 	return inventorystorage.NewClient(baseURL, nil)
+}
+
+// buildClassificationLookup selects the outbound
+// ports.ProductClassificationLookup adapter via PRODUCT_CLASSIFICATION_MODE
+// (http|permissive), defaulting to "permissive" so existing tests, CI and
+// deployments that do not set the env var are unaffected -- mirroring
+// wes-work-planning's own buildClassificationLookup convention exactly
+// (see ADR-0016 / ADR-0014 step B). Unlike buildInventoryClient's
+// permissive mode (which fails LOUD because reserving real stock must
+// never appear to succeed against a no-op), this permissive mode fails
+// OPEN: a classification lookup is a soft routing/enrichment input, not a
+// mutation of real state.
+func buildClassificationLookup(mode, inventoryStorageBaseURL string, logger *slog.Logger) ports.ProductClassificationLookup {
+	if !strings.EqualFold(mode, "http") {
+		logger.Warn("product classification lookup in permissive (fail-open) mode; path eligibility routing will see no derived product attributes",
+			"hint", "set PRODUCT_CLASSIFICATION_MODE=http and INVENTORY_STORAGE_BASE_URL for a real deployment")
+		return productclassification.NewPermissiveLookup()
+	}
+	logger.Info("product classification lookup configured", "mode", "http", "inventory_storage_base_url", inventoryStorageBaseURL)
+	return productclassification.NewClient(inventoryStorageBaseURL, nil)
 }
 
 // durationEnv reads a Go duration (e.g. "48h", "90m") from key, falling

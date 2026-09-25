@@ -13,6 +13,13 @@ var (
 	// nothing in Allocated state to release.
 	ErrNoAllocatedLines = errors.New("order has no allocated lines to release")
 
+	// ErrOrderNotHeld is returned by ReleaseHeldOrder when the order was
+	// received with releaseOnAllocation=true (ADR 0020 §1). Such an
+	// order releases its lines at allocation and has nothing to release
+	// on demand; the call means the caller has the wrong order or the
+	// wrong expectation, and silently succeeding would hide that.
+	ErrOrderNotHeld = errors.New("order was not held at intake")
+
 	// ErrNoBackorderedLines is returned by RetryAllocation when the order
 	// has no Backordered line to retry — retrying an order that is not
 	// backordered is a caller mistake, not a no-op.

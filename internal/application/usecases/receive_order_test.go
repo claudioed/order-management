@@ -268,6 +268,200 @@ func TestReceiveOrder(t *testing.T) {
 		}
 	})
 
+	// PathSelectionPolicy + ports.ProcessPathCatalogue: order-management
+	// ADR-0013. A caller never supplies pathId on public intake, so these
+	// tests exercise NewLine.PathID left empty (the HTTP adapter's real
+	// behavior) to prove the use case's PathPolicy actually resolves it,
+	// and that an inactive/unknown resolved path is rejected BEFORE the
+	// order is ever persisted — the whole point of this ADR.
+	t.Run("an empty PathID is resolved by PathPolicy, not left blank", func(t *testing.T) {
+		f := newFixture()
+
+		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if o.Lines()[0].PathID() != shared.DefaultPathId {
+			t.Fatalf("line PathID = %q, want %q (PathPolicy's v1 default)", o.Lines()[0].PathID(), shared.DefaultPathId)
+		}
+	})
+
+	t.Run("a resolved path that is not active in the catalogue is rejected before persisting", func(t *testing.T) {
+		f := newFixture()
+		f.catalogue.inactive[shared.DefaultPathId] = true
+
+		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if !errors.Is(err, shared.ErrUnknownProcessPath) {
+			t.Fatalf("err = %v, want %v", err, shared.ErrUnknownProcessPath)
+		}
+		assertEventNames(t, f.events) // OrderReceived must NOT have fired
+		if len(f.inventory.reserveCalls) != 0 {
+			t.Fatalf("an order rejected for an unknown path must never reach inventory-storage, calls = %d", len(f.inventory.reserveCalls))
+		}
+	})
+
+	t.Run("a nil Catalogue skips validation entirely (not-yet-wired default)", func(t *testing.T) {
+		f := newFixture()
+		uc := f.receiveOrder()
+		uc.Catalogue = nil
+
+		o, err := uc.Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if o.Lines()[0].PathID() != shared.DefaultPathId {
+			t.Fatalf("line PathID = %q, want %q", o.Lines()[0].PathID(), shared.DefaultPathId)
+		}
+	})
+
+	t.Run("an explicitly supplied PathID still goes through catalogue validation", func(t *testing.T) {
+		f := newFixture()
+		f.catalogue.inactive["singles"] = true
+
+		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			line("SKU-1", 1, "singles"),
+		}, false)
+		if !errors.Is(err, shared.ErrUnknownProcessPath) {
+			t.Fatalf("err = %v, want %v", err, shared.ErrUnknownProcessPath)
+		}
+	})
+
+	// ADR-0016 (ADR-0014 step B): PathPolicy.Select now actually
+	// evaluates the default path's declared Eligibility against the
+	// line, rather than ignoring every input. These tests exercise that
+	// through ReceiveOrder end to end -- the resolved PathId, the
+	// classification lookup, and the eligibility rejection.
+	t.Run("a line's quantity within MaxUnitsPerLine resolves normally", func(t *testing.T) {
+		f := newFixture()
+		maxOne := 1
+		f.catalogue.eligibility[shared.DefaultPathId] = shared.NewEligibility(&maxOne, nil, nil, false)
+
+		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if o.Lines()[0].PathID() != shared.DefaultPathId {
+			t.Fatalf("line PathID = %q, want %q", o.Lines()[0].PathID(), shared.DefaultPathId)
+		}
+	})
+
+	t.Run("a quantity exceeding MaxUnitsPerLine is rejected before persisting", func(t *testing.T) {
+		f := newFixture()
+		maxOne := 1
+		f.catalogue.eligibility[shared.DefaultPathId] = shared.NewEligibility(&maxOne, nil, nil, false)
+
+		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 5},
+		}, false)
+		if !errors.Is(err, shared.ErrLineIneligibleForResolvedPath) {
+			t.Fatalf("err = %v, want %v", err, shared.ErrLineIneligibleForResolvedPath)
+		}
+		assertEventNames(t, f.events) // OrderReceived must NOT have fired
+		if len(f.inventory.reserveCalls) != 0 {
+			t.Fatalf("an order rejected for ineligibility must never reach inventory-storage, calls = %d", len(f.inventory.reserveCalls))
+		}
+	})
+
+	t.Run("a line missing a required product attribute is rejected", func(t *testing.T) {
+		f := newFixture()
+		f.catalogue.eligibility[shared.DefaultPathId] = shared.NewEligibility(nil, []string{"hazmat"}, nil, false)
+
+		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if !errors.Is(err, shared.ErrLineIneligibleForResolvedPath) {
+			t.Fatalf("err = %v, want %v", err, shared.ErrLineIneligibleForResolvedPath)
+		}
+	})
+
+	t.Run("a classification lookup supplying the required attribute makes the line eligible", func(t *testing.T) {
+		f := newFixture()
+		f.catalogue.eligibility[shared.DefaultPathId] = shared.NewEligibility(nil, []string{"Hazmat"}, nil, false)
+		f.classification.tags["SKU-1"] = []string{"Hazmat"}
+
+		o, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if o.Lines()[0].PathID() != shared.DefaultPathId {
+			t.Fatalf("line PathID = %q, want %q", o.Lines()[0].PathID(), shared.DefaultPathId)
+		}
+	})
+
+	t.Run("an excluded product attribute rejects the line even when the path is active", func(t *testing.T) {
+		f := newFixture()
+		f.catalogue.eligibility[shared.DefaultPathId] = shared.NewEligibility(nil, nil, []string{"Hazmat"}, false)
+		f.classification.tags["SKU-1"] = []string{"Hazmat"}
+
+		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if !errors.Is(err, shared.ErrLineIneligibleForResolvedPath) {
+			t.Fatalf("err = %v, want %v", err, shared.ErrLineIneligibleForResolvedPath)
+		}
+	})
+
+	t.Run("gift wrap is folded into the evaluated attributes and can be excluded", func(t *testing.T) {
+		f := newFixture()
+		f.catalogue.eligibility[shared.DefaultPathId] = shared.NewEligibility(nil, nil, []string{"giftWrap"}, false)
+
+		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1, GiftWrap: true},
+		}, false)
+		if !errors.Is(err, shared.ErrLineIneligibleForResolvedPath) {
+			t.Fatalf("err = %v, want %v", err, shared.ErrLineIneligibleForResolvedPath)
+		}
+	})
+
+	t.Run("a classification lookup failure fails open — the line is still routed", func(t *testing.T) {
+		f := newFixture()
+		f.catalogue.eligibility[shared.DefaultPathId] = shared.NewEligibility(nil, []string{"hazmat"}, nil, false)
+		f.classification.err = errBoom
+
+		// Classification is unreachable, so no attribute is derived —
+		// the required "hazmat" attribute is therefore missing and the
+		// line IS still rejected. This test's point is that the
+		// rejection comes from the eligibility rule, not from
+		// propagating the lookup's own transport error (which must
+		// never surface to ReceiveOrder's caller as errBoom).
+		_, err := f.receiveOrder().Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if !errors.Is(err, shared.ErrLineIneligibleForResolvedPath) {
+			t.Fatalf("err = %v, want %v (never the raw lookup failure)", err, shared.ErrLineIneligibleForResolvedPath)
+		}
+		if errors.Is(err, errBoom) {
+			t.Fatalf("a classification lookup failure must never surface as errBoom, got %v", err)
+		}
+	})
+
+	t.Run("a nil Classification is treated exactly like an unclassified SKU", func(t *testing.T) {
+		f := newFixture()
+		f.catalogue.eligibility[shared.DefaultPathId] = shared.NewEligibility(nil, nil, nil, false)
+		uc := f.receiveOrder()
+		uc.Classification = nil
+
+		o, err := uc.Execute(context.Background(), []usecases.NewLine{
+			{SKU: "SKU-1", Quantity: 1},
+		}, false)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		if o.Lines()[0].PathID() != shared.DefaultPathId {
+			t.Fatalf("line PathID = %q, want %q", o.Lines()[0].PathID(), shared.DefaultPathId)
+		}
+	})
+
 	// A publisher failure LATER in the implicit allocation-then-release
 	// pass (e.g. on the final OrderAllocated event, after OrderReceived
 	// and OrderLineAllocated already succeeded) is a hard failure of

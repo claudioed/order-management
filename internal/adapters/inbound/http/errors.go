@@ -19,11 +19,14 @@ func statusFor(err error) int {
 	case errors.Is(err, shared.ErrEmptyOrderID),
 		errors.Is(err, shared.ErrEmptySKU),
 		errors.Is(err, shared.ErrEmptyPathID),
+		errors.Is(err, shared.ErrUnknownProcessPath),
 		errors.Is(err, order.ErrNoLines),
 		errors.Is(err, order.ErrLineNotFound):
 		return http.StatusBadRequest
 
-	case errors.Is(err, shared.ErrNonPositiveQuantity):
+	case errors.Is(err, shared.ErrNonPositiveQuantity),
+		errors.Is(err, shared.ErrLineIneligibleForResolvedPath),
+		errors.Is(err, order.ErrHeldOrderMustBeShipComplete):
 		return http.StatusUnprocessableEntity
 
 	case errors.Is(err, order.ErrOrderAlreadyReleased),
@@ -34,7 +37,8 @@ func statusFor(err error) int {
 		errors.Is(err, order.ErrLineNotAllocated),
 		errors.Is(err, usecases.ErrNoAllocatedLines),
 		errors.Is(err, usecases.ErrNoBackorderedLines),
-		errors.Is(err, usecases.ErrPromiseDateNotSet):
+		errors.Is(err, usecases.ErrPromiseDateNotSet),
+		errors.Is(err, usecases.ErrOrderNotHeld):
 		return http.StatusConflict
 
 	// The downstream Suppliers are not wired up (permissive mode), or an
@@ -77,6 +81,10 @@ func problemFor(err error) problemInfo {
 		return problemInfo{"empty-sku", "SKU must not be empty"}
 	case errors.Is(err, shared.ErrEmptyPathID):
 		return problemInfo{"empty-path-id", "Path id must not be empty"}
+	case errors.Is(err, shared.ErrUnknownProcessPath):
+		return problemInfo{"unknown-process-path", "Resolved process path is not active in the process-path catalogue"}
+	case errors.Is(err, shared.ErrLineIneligibleForResolvedPath):
+		return problemInfo{"line-ineligible-for-resolved-path", "Line's attributes are not eligible for its resolved process path"}
 	case errors.Is(err, order.ErrNoLines):
 		return problemInfo{"order-without-lines", "An order must have at least one line"}
 	case errors.Is(err, order.ErrLineNotFound):
@@ -103,6 +111,8 @@ func problemFor(err error) problemInfo {
 		return problemInfo{"no-backordered-lines", "Order has no backordered lines to retry"}
 	case errors.Is(err, usecases.ErrPromiseDateNotSet):
 		return problemInfo{"promise-date-not-set", "Order has no promise date; allocate it first"}
+	case errors.Is(err, usecases.ErrOrderNotHeld):
+		return problemInfo{"order-not-held", "Order was not held at intake and has nothing to release on demand"}
 
 	case errors.Is(err, ports.ErrDownstreamNotConfigured):
 		return problemInfo{"downstream-not-configured", "A downstream service is running in permissive (no-op) mode"}

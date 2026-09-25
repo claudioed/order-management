@@ -97,11 +97,6 @@ inventoryStorage:
   mode: "permissive"
   baseUrl: ""
 
-# NOTE: order-management does not yet wire OpenTelemetry — cmd/order/main.go
-# has no OTEL_EXPORTER_OTLP_ENDPOINT support as of this chart version. No
-# otel block is defined here rather than inventing env vars the binary
-# doesn't read; add one once the binary actually supports OTLP export.
-
 extraEnv: []
 
 livenessProbe:
@@ -123,20 +118,19 @@ tolerations: []
 affinity: {}
 
 # Deployment environment, exported as the deployment.environment.name OTel
-# resource attribute where consumed. Only the analytics projector/reports
-# containers below reference this today (see the otel block note).
+# resource attribute (see the otel block below; now consumed by every
+# deployed container in this chart, not just the analytics processes).
 environment: "local"
 
-# OpenTelemetry. NOTE: unlike wes-work-planning, order-management's own
-# cmd/order, cmd/order-projector, and cmd/order-reports binaries do not
-# currently read OTEL_EXPORTER_OTLP_ENDPOINT (verified against the Go
-# source; see CLAUDE.md's analytics section). This block exists solely so
-# the analytics projector/reports templates below (copied verbatim from
-# wes-work-planning, which DOES support OTLP) have a value to guard on. It
-# stays disabled by default and renders no OTEL env vars unless flipped on;
-# flipping it on today would set env vars the binaries simply ignore.
+# OpenTelemetry. ADR-0009 (standard-metrics-convention) added
+# telemetry.Setup + otelchi HTTP RED instrumentation to cmd/order, so the
+# OLTP deployment now reads these env vars exactly like the analytics
+# projector/reports/mcp deployments below already did. Enabled by default
+# like every other fleet chart (inventory-storage, wes-work-planning,
+# etc.) now that this service actually has OTel wiring, replacing the
+# previous order-management-only false default that predated it.
 otel:
-  enabled: false
+  enabled: true
   endpoint: "http://otel-collector.observability.svc.cluster.local:4317"
   serviceName: "order-management"
 
@@ -184,3 +178,66 @@ analytics:
       requests:
         cpu: 100m
         memory: 128Mi
+
+# --- frontend (order_mgmt_mfe Module Federation remote) ---
+# The operator SPA remote, built from web/ and served by its own
+# nginx-unprivileged pod. In the kind cluster it is reached through
+# warehouse-infra's Nginx web gateway at http://localhost/mfes/order-management/
+# -- never through Kong, which serves APIs only and must never handle HTML,
+# JavaScript, CSS, fonts or images.
+#
+# Deliberately NO ingress/httproute/gatewayApi block here: frontend path
+# routing is owned entirely by the Nginx web gateway, and the Service stays
+# ClusterIP so this is not a second host-facing entrypoint.
+#
+# Disabled by default so existing releases are unaffected; warehouse-infra
+# sets frontend.enabled=true and supplies the locally built image tag.
+frontend:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: warehouse/order-management-frontend
+    pullPolicy: IfNotPresent
+    tag: ""
+  service:
+    port: 80
+    targetPort: 8080
+  # nginx-unprivileged runs as uid/gid 101.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    fsGroup: 101
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+# --- MCP server (ADR-0010) ---
+# The Model Context Protocol server (cmd/mcp): a second deployable running
+# the same GetOrder read use case over the same OLTP database as the HTTP
+# service, served over Streamable HTTP. Disabled by default so existing
+# releases are unaffected; set mcp.enabled=true to deploy it.
+mcp:
+  enabled: false
+  replicaCount: 1
+  httpAddr: ":8090"
+  service:
+    type: ClusterIP
+    port: 8090
+    targetPort: 8090
+  extraEnv: []
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi

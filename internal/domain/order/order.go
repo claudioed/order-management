@@ -44,16 +44,54 @@ var (
 	// AllowPartialShipment=false may not release any line until every
 	// line is allocated.
 	ErrShipCompleteBlocked = errors.New("ship-complete order cannot be released while any line is unallocated")
+
+	// ErrHeldOrderMustBeShipComplete enforces ADR 0020 §4 at intake: an
+	// order held before release (releaseOnAllocation=false) may not also
+	// allow partial shipment. A caller that holds an order is making one
+	// whole-order commit/reject decision; per-group promising (ADR 0017)
+	// would give it several cutoffs for a single answer.
+	ErrHeldOrderMustBeShipComplete = errors.New("a held order (releaseOnAllocation=false) must be ship-complete")
 )
 
 // Order is the aggregate root: the unit of consistency for intake,
 // allocation, release and cancellation. Every line mutation goes through
 // an Order method, so the invariants below cannot be bypassed.
+//
+// promiseGroups (ADR 0014 §3 / ADR 0017) is the full-fidelity promise
+// breakdown: one PromiseGroup per set of lines sharing a cutoff. It lives
+// ALONGSIDE, not instead of, the legacy single-valued promiseDate/
+// promiseCptId/promiseBasis fields — those three remain a derived,
+// backward-compatible SUMMARY of promiseGroups (see SetPromiseGroups),
+// never a second source of truth that could drift from it.
 type Order struct {
 	id                   shared.OrderId
 	lines                []*OrderLine
 	allowPartialShipment bool
 	promiseDate          *time.Time
+	promiseCptId         *string
+	promiseBasis         *PromiseBasis
+	promiseGroups        []PromiseGroup
+	// heldAtIntake records ADR 0020 §1's releaseOnAllocation=false as
+	// its INVERSE, deliberately. The zero value of a bool is false, and
+	// every existing constructor, test literal and Rehydrate call site
+	// leaves this field unset — so the zero value must mean "an ordinary
+	// order that releases on allocation". Storing releaseOnAllocation
+	// directly would make every one of those sites silently produce a
+	// HELD order, which fails closed in the worst possible direction:
+	// work that never reaches the floor, on orders nobody asked to hold.
+	heldAtIntake bool
+
+	// requiredShipBy is an externally-dictated deadline attached at
+	// intake (ADR 0020 §2). When set, the promise is not CHOSEN by this
+	// service — it is constrained to a window at or before this instant,
+	// and an order that cannot make it gets no promise at all rather
+	// than an optimistic one.
+	//
+	// A pointer, not a zero time.Time: "no deadline" is the overwhelming
+	// majority of orders and must be distinguishable from "a deadline
+	// that happens to be the zero instant", which would otherwise make
+	// every ordinary order look infeasible.
+	requiredShipBy *time.Time
 }
 
 // New constructs an Order in Received status. lines must be non-empty;
@@ -75,12 +113,77 @@ func New(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool) (*Ord
 
 // Rehydrate rebuilds an Order from persisted state without re-running
 // construction invariants. Only outbound repository adapters call this.
-func Rehydrate(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool, promiseDate *time.Time) *Order {
-	return &Order{id: id, lines: lines, allowPartialShipment: allowPartialShipment, promiseDate: promiseDate}
+// promiseCptId/promiseBasis are nil for orders persisted before ADR 0014
+// or for a promise never given a CPT identity (a LeadTime-basis promise
+// leaves promiseCptId nil; promiseBasis is still recorded).
+//
+// Kept with its original 6-argument signature (no promiseGroups
+// parameter) so every existing call site and every existing test that
+// constructs an Order this way keeps compiling and behaving unchanged —
+// see RehydrateWithGroups for the ADR 0014 §3 / ADR 0017 widened
+// constructor a repository adapter that also persists the per-group
+// breakdown should call instead.
+func Rehydrate(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool, promiseDate *time.Time, promiseCptId *string, promiseBasis *PromiseBasis) *Order {
+	return RehydrateWithGroups(id, lines, allowPartialShipment, promiseDate, promiseCptId, promiseBasis, nil)
+}
+
+// RehydrateWithGroups is Rehydrate plus the full PromiseGroup breakdown
+// (ADR 0014 §3 / ADR 0017). promiseGroups may be nil (an order persisted
+// before this ADR, or one whose promiseDate/promiseCptId/promiseBasis
+// were set via the legacy SetPromise path) — PromiseGroups() then simply
+// returns an empty slice, and the legacy summary fields are exactly what
+// was passed in, untouched.
+func RehydrateWithGroups(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool, promiseDate *time.Time, promiseCptId *string, promiseBasis *PromiseBasis, promiseGroups []PromiseGroup) *Order {
+	return RehydrateHeld(id, lines, allowPartialShipment, promiseDate, promiseCptId, promiseBasis, promiseGroups, true)
+}
+
+// RehydrateHeld is RehydrateWithGroups plus ADR 0020 §1's
+// releaseOnAllocation intent. Only a repository adapter that actually
+// persists the orders.release_on_allocation column should call it; every
+// other construction path goes through Rehydrate/RehydrateWithGroups,
+// which pass releaseOnAllocation=true and therefore keep today's
+// behaviour exactly.
+//
+// A row written before migration 0005 reads back as TRUE (the column's
+// DEFAULT), so pre-ADR orders rehydrate as ordinary un-held orders —
+// which is what they are.
+func RehydrateHeld(id shared.OrderId, lines []*OrderLine, allowPartialShipment bool, promiseDate *time.Time, promiseCptId *string, promiseBasis *PromiseBasis, promiseGroups []PromiseGroup, releaseOnAllocation bool) *Order {
+	return &Order{
+		id: id, lines: lines, allowPartialShipment: allowPartialShipment,
+		promiseDate: promiseDate, promiseCptId: promiseCptId, promiseBasis: promiseBasis,
+		promiseGroups: promiseGroups,
+		heldAtIntake:  !releaseOnAllocation,
+	}
 }
 
 func (o *Order) ID() shared.OrderId         { return o.id }
 func (o *Order) AllowPartialShipment() bool { return o.allowPartialShipment }
+
+// ReleaseOnAllocation reports whether this order releases its lines as
+// soon as they are allocated (ADR 0020 §1). True for every order not
+// explicitly held at intake, including every order persisted before
+// migration 0005.
+func (o *Order) ReleaseOnAllocation() bool { return !o.heldAtIntake }
+
+// Hold marks the order as held at intake: allocate, but do not release
+// until ReleaseHeldOrder says so. It is called only by the intake use
+// case, on a freshly-constructed order, before any allocation — there is
+// deliberately no way to hold an order that has already released work,
+// because the floor cannot un-see a task it has been given.
+func (o *Order) Hold() { o.heldAtIntake = true }
+
+// RequiredShipBy returns the externally-dictated deadline, or nil when
+// this order has none (the overwhelming majority).
+func (o *Order) RequiredShipBy() *time.Time { return o.requiredShipBy }
+
+// SetRequiredShipBy attaches an external deadline (ADR 0020 §2).
+//
+// A mutator rather than a fourth Rehydrate parameter: the constructor
+// chain is already Rehydrate / RehydrateWithGroups / RehydrateHeld, and
+// widening it again would force every existing call site to grow an
+// argument it does not care about. Repositories call this after
+// rehydrating, the same way intake calls Hold().
+func (o *Order) SetRequiredShipBy(t time.Time) { o.requiredShipBy = &t }
 
 // Lines returns the order's lines. The slice is a copy, but the
 // *OrderLine values are the aggregate's own entities: they are read-only
@@ -91,9 +194,12 @@ func (o *Order) Lines() []*OrderLine {
 	return out
 }
 
-// PromiseDate is the date this order is promised for, computed at
-// allocation time by the LeadTimePolicy. Nil until at least one line is
-// allocated.
+// PromiseDate is the date this order is promised for — the CPT's
+// CutoffAt when the promise has a Capability basis, or the computed
+// instant from LeadTimePolicy otherwise. Nil until at least one line is
+// allocated. Kept as a bare time.Time on the wire and in the database for
+// backward compatibility (ADR 0014 §1); see PromiseCptId/PromiseBasis
+// for the rest of the Promise value.
 func (o *Order) PromiseDate() *time.Time {
 	if o.promiseDate == nil {
 		return nil
@@ -102,9 +208,125 @@ func (o *Order) PromiseDate() *time.Time {
 	return &d
 }
 
-// SetPromiseDate records the promise date computed by the domain's
-// LeadTimePolicy at allocation time.
+// PromiseCptId is the CPT identity (e.g. "sp1-1800") the promise
+// targets, when the promise has a Capability basis. Nil for a
+// LeadTime-basis promise, which has no departure identity, or before any
+// promise has been computed.
+func (o *Order) PromiseCptId() *string {
+	if o.promiseCptId == nil {
+		return nil
+	}
+	id := *o.promiseCptId
+	return &id
+}
+
+// PromiseBasis reports which policy produced the current promise
+// (Capability or LeadTime). Nil before any promise has been computed.
+func (o *Order) PromiseBasis() *PromiseBasis {
+	if o.promiseBasis == nil {
+		return nil
+	}
+	b := *o.promiseBasis
+	return &b
+}
+
+// SetPromiseDate records a bare promise date without a CPT identity or
+// basis. Kept for any caller that only has a computed instant (e.g.
+// tests exercising LeadTimePolicy directly) — production allocation code
+// should prefer SetPromise, which also records CptId/Basis.
 func (o *Order) SetPromiseDate(d time.Time) { o.promiseDate = &d }
+
+// SetPromise records the full Promise value ADR 0014 introduces: the
+// cutoff instant (kept on promiseDate for backward compatibility), the
+// CPT identity (nil for a LeadTime-basis promise), and which policy
+// produced it.
+//
+// This method's body is deliberately left untouched by ADR 0017 (it
+// predates per-group promising and every existing test exercises it
+// directly): it sets ONLY the legacy summary fields, never
+// promiseGroups. A caller that wants the full per-group breakdown
+// recorded too should call SetPromiseGroups instead, which is real,
+// additional method surface — not a replacement for this one.
+func (o *Order) SetPromise(p Promise) {
+	d := p.CutoffAt
+	o.promiseDate = &d
+	basis := p.Basis
+	o.promiseBasis = &basis
+	if p.CptId == "" {
+		o.promiseCptId = nil
+		return
+	}
+	cptId := p.CptId
+	o.promiseCptId = &cptId
+}
+
+// PromiseGroups returns the full per-shipment-group promise breakdown
+// ADR 0014 §3 / ADR 0017 introduces — the real, full-fidelity source of
+// truth. A ship-complete order (or any order whose promise was set via
+// SetPromiseGroups with a single group, which is what PromisePolicy.
+// PromiseGroups always produces for AllowPartialShipment=false) has
+// exactly one entry. Empty (nil) until SetPromiseGroups has been called
+// at least once, or for an order rehydrated without a persisted group
+// breakdown (a pre-ADR-0017 row, or one whose promise was set via the
+// legacy SetPromise). The slice and its PromiseGroup values are copies:
+// mutating the returned slice cannot corrupt the aggregate.
+func (o *Order) PromiseGroups() []PromiseGroup {
+	out := make([]PromiseGroup, len(o.promiseGroups))
+	for i, g := range o.promiseGroups {
+		lineNos := make([]int, len(g.LineNos))
+		copy(lineNos, g.LineNos)
+		out[i] = PromiseGroup{LineNos: lineNos, Promise: g.Promise}
+	}
+	return out
+}
+
+// SetPromiseGroups records the full per-shipment-group promise breakdown
+// (ADR 0014 §3 / ADR 0017): groups is stored verbatim as the new,
+// full-fidelity PromiseGroups() source of truth, AND the existing
+// single-valued promiseDate/promiseCptId/promiseBasis fields are
+// re-derived from it as a backward-compatible projection, so every
+// existing reader of those three fields (the Postgres repo's write path,
+// the wire event publisher, PromiseDate()/PromiseCptId()/PromiseBasis()
+// themselves) keeps working unchanged.
+//
+// The projection rule, per ADR 0014 §3 ("the order's PromiseDate()
+// becomes the latest of them"): PromiseDate() is set to the LATEST
+// CutoffAt among all groups — so no existing reader ever sees an earlier
+// date than the single-promise behaviour would have produced. ADR 0014
+// does not specify an aggregation rule for CptId/Basis (a single string
+// cannot represent N different departures), so this method makes the
+// same honest choice ADR 0017 documents: PromiseCptId()/PromiseBasis()
+// are projected from the SAME group whose CutoffAt is that latest one —
+// i.e. all three legacy fields describe "the group with the latest
+// cutoff", consistently, rather than three independently-chosen groups.
+//
+// Calling this with a single group covering every allocated line (what
+// PromisePolicy.PromiseGroups always returns for
+// AllowPartialShipment=false) reproduces SetPromise's own single-field
+// assignment exactly, byte for byte — this is what makes the ship-
+// complete path's behaviour provably unchanged rather than merely
+// "should be the same".
+func (o *Order) SetPromiseGroups(groups []PromiseGroup) {
+	stored := make([]PromiseGroup, len(groups))
+	for i, g := range groups {
+		lineNos := make([]int, len(g.LineNos))
+		copy(lineNos, g.LineNos)
+		stored[i] = PromiseGroup{LineNos: lineNos, Promise: g.Promise}
+	}
+	o.promiseGroups = stored
+
+	if len(groups) == 0 {
+		return
+	}
+
+	latest := groups[0]
+	for _, g := range groups[1:] {
+		if g.Promise.CutoffAt.After(latest.Promise.CutoffAt) {
+			latest = g
+		}
+	}
+	o.SetPromise(latest.Promise)
+}
 
 // Status derives the order-level status from the line statuses. There is
 // deliberately no stored Status field: a derived status cannot drift out

@@ -1,19 +1,23 @@
 ---
 title: Domain Events
 sidebar_label: Domain Events
-description: The past-tense domain events this context raises, and which two are forwarded to Kafka as integration events.
+description: The past-tense domain events this context raises, and which three are forwarded to Kafka as integration events.
 ---
 
 # Domain Events
 
-Eight past-tense events, raised by the `Order` aggregate. Every event is
+Nine past-tense events, raised by the `Order` aggregate (plus
+`RepromiseOrder`, a use case that reacts to an inbound event rather than
+an order lifecycle transition). Every event is
 published through `ports.EventPublisher`, which — since
 [ADR 0005](/docs/adr/0005-choreographed-release-via-kafka) — has TWO real
 implementations selected by the `EVENT_PUBLISHER` env var:
 
 - **`log`** (default): every event is logged as JSON, in-process only.
 - **`kafka`**: the SAME events are logged/persisted locally as before, but
-  `OrderAllocated` and `OrderPartiallyAllocated` are ADDITIONALLY
+  `OrderAllocated`, `OrderPartiallyAllocated`, and — since
+  [ADR 0018](/docs/adr/0018-repromise-order-consumer-and-order-repromised)
+  — `OrderRepromised` are ADDITIONALLY
   forwarded to the shared Kafka broker, topic
   `warehouse.order-management.events`, for `wes-work-planning` (or any
   other subscriber) to consume.
@@ -38,25 +42,32 @@ type DomainEvent interface {
 | `OrderLineReleased` | A line transitioned to `Released` (pure domain fact — no longer tied to a synchronous wes-work-planning call) | No — local only |
 | `OrderReleased` | Every line on the order has been released | No — local only |
 | `OrderCancelled` | `CancelOrder` succeeds, revoking every allocated line's reservation | No — local only |
+| `OrderRepromised` | `RepromiseOrder` (ADR 0018) reacts to a fulfillment-execution `TaskCPTMissed`/`PackageManifested` fact and finds the affected shipment group's promise moved | **Yes** — `{cpt_id_old, cpt_id_new, reason}` payload |
 
-Only two of the eight are integration events — mirroring
-`inventory-storage`'s own precedent of forwarding only two of its several
-domain events (`StockReserved`, `ReservationRevoked`). The other six stay
-local: `OrderReceived` through `OrderLineBackordered` are intake/allocation
-progress this service's own callers already see synchronously in the HTTP
-response; `OrderLineReleased`/`OrderReleased`/`OrderCancelled` are equally
-local concerns with no cross-context subscriber today.
+Three of the nine are integration events — mirroring
+`inventory-storage`'s own precedent of forwarding only a subset of its
+several domain events (`StockReserved`, `ReservationRevoked`). The other
+six stay local: `OrderReceived` through `OrderLineBackordered` are
+intake/allocation progress this service's own callers already see
+synchronously in the HTTP response; `OrderLineReleased`/`OrderReleased`/
+`OrderCancelled` are equally local concerns with no cross-context
+subscriber today.
 
 ## The Kafka integration contract
 
 See [ADR 0005](/docs/adr/0005-choreographed-release-via-kafka) for the
-full decision. In short:
+full allocation/release decision, and
+[ADR 0018](/docs/adr/0018-repromise-order-consumer-and-order-repromised)
+for the re-promise feedback loop. In short:
 
-- **Topic:** `warehouse.order-management.events`
+- **Outbound topic:** `warehouse.order-management.events`
+- **Inbound topic (ADR 0018 only):** `warehouse.fulfillment.events` —
+  fulfillment-execution's shared/fan-out topic, consumed ONLY for
+  `TaskCPTMissed`/`PackageManifested`.
 - **Envelope** (matches the platform-wide shape used by
   `inventory-storage`): `{event_id, event_type, occurred_at, source, data}`
-- **`data` shape** (frozen — shared verbatim with `wes-work-planning`'s
-  Kafka consumer):
+- **`data` shape** for `OrderAllocated`/`OrderPartiallyAllocated`
+  (frozen — shared verbatim with `wes-work-planning`'s Kafka consumer):
 
   ```json
   {
@@ -68,11 +79,31 @@ full decision. In short:
   }
   ```
 
+- **`data` shape** for `OrderRepromised` (ADR 0018, additive):
+
+  ```json
+  {
+    "order_id": "ord-a1b2c3d4-0000-0000-0000-000000000001",
+    "cpt_id_old": "sp1-1200",
+    "cpt_id_new": "sp1-1800",
+    "reason": "TaskCPTMissed"
+  }
+  ```
+
+  `cpt_id_old`/`cpt_id_new` are both omitted (never present-and-empty)
+  for a `LeadTime`-basis promise on that side — see `order.Promise`'s
+  doc comment for why a `LeadTime`-basis promise has no CPT departure
+  identity.
+
 - **The deterministic work-unit id.** `wes-work-planning`'s consumer
   independently reconstructs `{order_id}-line-{line_no}` from the payload
   above (see `usecases.WorkUnitID` in this repo) — this id is never
   transmitted on the wire, both sides derive it the same way, and it MUST
-  match byte-for-byte or idempotent redelivery breaks.
+  match byte-for-byte or idempotent redelivery breaks. ADR 0018's
+  `RepromiseOrder` consumer reverses the SAME formula
+  (`usecases.ParseWorkUnitID`) to recover `(OrderId, LineNo)` from
+  fulfillment-execution's `order_ref`, which is itself sourced from
+  wes-work-planning's `WorkUnitId` at task-creation time.
 - **Fire-and-forget, deliberately.** v1 has NO release-confirmation reply
   event from `wes-work-planning` back to this service — see the README's
   "Deferred (v1)" section.

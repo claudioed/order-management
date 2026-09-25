@@ -14,6 +14,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/claudioed/order-management/internal/application/ports"
@@ -144,13 +146,21 @@ func publishOrderAllocationOutcome(
 	if d := o.PromiseDate(); d != nil {
 		promiseDate = *d
 	}
+	var promiseCptId string
+	if id := o.PromiseCptId(); id != nil {
+		promiseCptId = *id
+	}
+	var promiseBasis string
+	if b := o.PromiseBasis(); b != nil {
+		promiseBasis = b.String()
+	}
 
 	switch o.Status() {
 	case order.StatusAllocated, order.StatusReleased:
-		return events.Publish(ctx, shared.NewOrderAllocated(clock.Now(), o.ID(), promiseDate, released))
+		return events.Publish(ctx, shared.NewOrderAllocatedWithPromise(clock.Now(), o.ID(), promiseDate, promiseCptId, promiseBasis, released))
 	case order.StatusPartiallyAllocated, order.StatusPartiallyReleased:
-		return events.Publish(ctx, shared.NewOrderPartiallyAllocated(
-			clock.Now(), o.ID(), outcome.allocated, outcome.backordered, promiseDate, released,
+		return events.Publish(ctx, shared.NewOrderPartiallyAllocatedWithPromise(
+			clock.Now(), o.ID(), outcome.allocated, outcome.backordered, promiseDate, promiseCptId, promiseBasis, released,
 		))
 	default:
 		return nil
@@ -160,20 +170,104 @@ func publishOrderAllocationOutcome(
 // allocationDeps bundles the outbound dependencies allocateAndRelease
 // needs. ReceiveOrder and RetryAllocation each pass their own struct
 // fields through one value rather than a long positional parameter list.
+//
+// Promise is order.PromisePolicy (ADR 0014), which computes a
+// capability-derived CPT-window promise when the underlying inputs are
+// available, falling back to its own embedded LeadTimePolicy otherwise.
+// A zero-value PromisePolicy (Schedule/Capability both nil) always falls
+// back, so existing wiring/tests that only set Fallback keep working
+// unchanged.
 type allocationDeps struct {
 	Orders    ports.OrderRepo
 	Inventory ports.InventoryReservationClient
 	Events    ports.EventPublisher
 	Clock     ports.Clock
-	Promise   order.LeadTimePolicy
+	Promise   order.PromisePolicy
 }
 
-// setPromiseDate applies deps.Promise's lead-time policy to o, exactly as
-// AllocateOrder/RetryAllocation did pre-redesign.
+// setPromiseDate applies deps.Promise (PromisePolicy, ADR 0014/ADR 0017)
+// to o, recording the full per-shipment-group promise breakdown via
+// Order.SetPromiseGroups.
+//
+// DESIGN DECISION (documented per the task brief): this always calls the
+// new PromiseGroups/SetPromiseGroups path, for BOTH ship-complete and
+// partial-shipment orders, rather than branching on
+// o.AllowPartialShipment() to keep calling the old Promise/SetPromise
+// path for ship-complete orders. This is deliberate and smaller-diff:
+// PromisePolicy.PromiseGroups degrades to exactly one group covering
+// every allocated line for AllowPartialShipment=false, computed via the
+// UNCHANGED Promise(now, o) search (see promise_policy.go's doc
+// comment), and Order.SetPromiseGroups called with that single group
+// reproduces SetPromise's own field assignment byte for byte. The
+// OUTCOME for a ship-complete order is therefore provably identical
+// either way; calling one method here (rather than two branches, one of
+// which would need to keep being manually kept in sync with the other)
+// is the smaller, more obviously-correct change against this call site.
 func (deps allocationDeps) setPromiseDate(o *order.Order) {
-	if d, ok := deps.Promise.PromiseDate(deps.Clock.Now(), o); ok {
-		o.SetPromiseDate(d)
+	// ADR 0020 §2: an order carrying an externally-dictated deadline is
+	// promised by FeasibleBy, not by PromiseGroups. This is the routing
+	// that makes FeasibleBy reachable at all — without it the method
+	// exists but nothing in the service ever calls it, which was true
+	// between phase 2 and this change.
+	//
+	// The two differ in KIND, not just in inputs. PromiseGroups asks
+	// "what is the earliest we can manage?" and always answers with
+	// something, falling back to lead-time when capability data is
+	// missing. FeasibleBy asks "is there a window at or before a date
+	// somebody else set?" and answers false rather than guessing,
+	// because its true is a fill-or-kill commitment an external party
+	// measures us on.
+	//
+	// An infeasible order is therefore left with NO promise, deliberately.
+	// The alternative — writing an optimistic promise we already know
+	// breaks the deadline — would tell the caller we can do something we
+	// cannot, and the caller's whole reason for sending a deadline is to
+	// find out before committing.
+	if deadline := o.RequiredShipBy(); deadline != nil {
+		if p, ok := deps.Promise.FeasibleBy(deps.Clock.Now(), o, *deadline); ok {
+			o.SetPromiseGroups([]order.PromiseGroup{{
+				LineNos: allocatedLineNos(o),
+				Promise: p,
+			}})
+		}
+		return
 	}
+
+	if groups, ok := deps.Promise.PromiseGroups(deps.Clock.Now(), o); ok {
+		o.SetPromiseGroups(groups)
+	}
+}
+
+// allocatedLineNos lists the line numbers FeasibleBy actually reasoned
+// about. FeasibleBy is all-or-nothing across the allocated set — network
+// demand is ship-complete (ADR 0020 §4), so there is exactly one group
+// and it covers every allocated line.
+func allocatedLineNos(o *order.Order) []int {
+	var out []int
+	for _, l := range o.Lines() {
+		if l.Status() == order.LineAllocated {
+			out = append(out, l.LineNo())
+		}
+	}
+	return out
+}
+
+// promiseGroupByLine indexes o.PromiseGroups() (ADR 0014 §3 / ADR 0017)
+// by line number, so allocateAndRelease can attribute each released line
+// to the specific PromiseGroup it belongs to when building the
+// integration event payload. Returns an empty map for an order with no
+// group breakdown yet (e.g. the promise was never computed, or was set
+// via the legacy single-Promise SetPromise path) — callers treat a
+// missing entry as "no per-line promise detail available", exactly like
+// a pre-ADR-0017 event.
+func promiseGroupByLine(o *order.Order) map[int]order.PromiseGroup {
+	out := make(map[int]order.PromiseGroup)
+	for _, g := range o.PromiseGroups() {
+		for _, lineNo := range g.LineNos {
+			out[lineNo] = g
+		}
+	}
+	return out
 }
 
 // allocateAndRelease is the ONE shared flow this redesign folds allocation
@@ -202,12 +296,22 @@ func (deps allocationDeps) setPromiseDate(o *order.Order) {
 //  5. publishOrderAllocationOutcome exactly once, carrying the lines
 //     released in this pass (or nil when release did not run/had nothing
 //     to release).
+//
+// releaseOnAllocation (ADR 0020 §1) gates step 3's release leg. Callers
+// pass o.ReleaseOnAllocation(), so the intent is read from the aggregate
+// rather than from ambient call-site knowledge — this is what makes a
+// LATER RetryAllocation on a held order safe: it re-reads the order from
+// the repository and sees the hold, instead of releasing work onto the
+// floor for an order nobody committed to. It stays an explicit parameter
+// rather than being read from o in here so the release decision is
+// visible at every call site.
 func allocateAndRelease(
 	ctx context.Context,
 	deps allocationDeps,
 	o *order.Order,
 	lines []*order.OrderLine,
 	retry bool,
+	releaseOnAllocation bool,
 ) (allocationOutcome, error) {
 	outcome, allocErr := allocateLines(ctx, deps.Inventory, deps.Events, deps.Clock, o, lines, retry)
 	if allocErr != nil {
@@ -234,11 +338,32 @@ func allocateAndRelease(
 
 	deps.setPromiseDate(o)
 
+	// ADR 0020 §1: when the caller held the order at intake, stop after
+	// allocation. Lines stay Allocated, inventory reservations genuinely
+	// exist, and the promise above is computed and attached exactly as
+	// for any other order — so a holder can read the promise and decide.
+	// Nothing is released, so wes-work-planning sees no work and no task
+	// reaches the floor.
+	//
+	// OrderAllocated/OrderPartiallyAllocated is still published below:
+	// the allocation genuinely happened, and suppressing the event would
+	// hide a real state change from every other context.
+	if !releaseOnAllocation {
+		if err := deps.Orders.Save(ctx, o); err != nil {
+			return outcome, err
+		}
+		if err := publishOrderAllocationOutcome(ctx, deps.Events, deps.Clock, o, outcome, nil); err != nil {
+			return outcome, err
+		}
+		return outcome, nil
+	}
+
 	// BR3-gated release: EnsureReleasable enforces that a ship-complete
 	// order releases nothing while any line is still unallocated. When it
 	// passes, every line the aggregate now reports Allocated (this pass's
 	// newly-allocated lines, and any already-Allocated from an earlier
 	// pass) is eligible and is released right here, in the same flow.
+	promiseByLine := promiseGroupByLine(o)
 	var released []shared.ReleasedLine
 	if err := o.EnsureReleasable(); err == nil {
 		class := o.FulfillmentClass().String()
@@ -246,10 +371,21 @@ func allocateAndRelease(
 			if err := o.Release(line.LineNo()); err != nil {
 				return outcome, err
 			}
-			released = append(released, shared.ReleasedLine{
+			rl := shared.ReleasedLine{
 				LineNo: line.LineNo(), SKU: line.SKU(), PathID: line.PathID(), GiftWrap: line.GiftWrap(),
 				FulfillmentClass: class,
-			})
+			}
+			if g, ok := promiseByLine[line.LineNo()]; ok {
+				cutoffAt := g.Promise.CutoffAt
+				basis := g.Promise.Basis.String()
+				rl.PromiseCutoffAt = &cutoffAt
+				rl.PromiseBasis = &basis
+				if g.Promise.CptId != "" {
+					cptId := g.Promise.CptId
+					rl.PromiseCptId = &cptId
+				}
+			}
+			released = append(released, rl)
 		}
 	}
 
@@ -275,4 +411,53 @@ func allocateAndRelease(
 // sides.
 func WorkUnitID(orderID shared.OrderId, lineNo int) string {
 	return fmt.Sprintf("%s-line-%d", orderID.String(), lineNo)
+}
+
+// workUnitIDLineMarker is the literal separator WorkUnitID's format
+// string embeds between the order id and the 1-based line number. It is
+// pulled out as a named constant purely so ParseWorkUnitID's reversal
+// and WorkUnitID's construction visibly share the same literal — there
+// is still exactly one place either side of this contract could drift,
+// and this constant is it.
+const workUnitIDLineMarker = "-line-"
+
+// ParseWorkUnitID reverses WorkUnitID: given a wire value shaped like
+// "{orderID}-line-{lineNo}" (fulfillment-execution's real TaskCPTMissed/
+// PackageManifested order_ref, itself sourced from wes-work-planning's
+// WorkUnitId at task-creation time — see ADR 0018), it recovers the
+// OrderId and 1-based line number RepromiseOrder needs to find the
+// affected PromiseGroup.
+//
+// It splits on the LAST occurrence of the "-line-" marker, not the
+// first: order-management mints OrderId as "ord-" + a UUID (see
+// OrderRepo.NextID), which is hex digits and hyphens only and can never
+// itself contain the literal substring "line" — so first-vs-last split
+// is not observable against this repo's real OrderId values today.
+// Splitting on the last occurrence is still the deliberately safer
+// choice: it degrades correctly even against a hypothetical future
+// OrderId shape that legitimately contains "-line-" as a substring,
+// where a first-occurrence split would silently truncate the order id
+// and misattribute the line number.
+//
+// ok is false — never a panic — for any input that is not a lineNo
+// trailing an order id via that exact marker: no marker present, an
+// empty order-id portion, a non-numeric or non-positive line number.
+// The caller (the repromise Kafka consumer) treats ok=false as "skip
+// this event, log it", mirroring how every other consumer in this fleet
+// handles a malformed inbound message.
+func ParseWorkUnitID(workUnitID string) (orderID shared.OrderId, lineNo int, ok bool) {
+	idx := strings.LastIndex(workUnitID, workUnitIDLineMarker)
+	if idx <= 0 {
+		return "", 0, false
+	}
+	orderPart := workUnitID[:idx]
+	lineNoPart := workUnitID[idx+len(workUnitIDLineMarker):]
+	if lineNoPart == "" {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(lineNoPart)
+	if err != nil || n <= 0 {
+		return "", 0, false
+	}
+	return shared.OrderId(orderPart), n, true
 }

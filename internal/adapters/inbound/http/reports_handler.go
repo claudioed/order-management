@@ -21,18 +21,29 @@ type ReportsHandlers struct {
 
 // funnelRowDTO is the wire shape of one report row. It is a dedicated DTO so
 // the read-model struct (report.Row) never leaks onto the API.
+//
+// PromiseBasisCapability/PromiseBasisLeadTime/OrdersRepromised/
+// OrdersSplitShipment/PromiseToCutoffGapSeconds are ADR 0014 §6 / ADR
+// 0019's additive promise KPI fields. OrdersRepromised is NOT
+// pathId-dimensioned (see report.Row.OrdersRepromised's doc comment) — it
+// is only non-zero on the row whose pathId is "".
 type funnelRowDTO struct {
-	PathID                   string `json:"pathId"`
-	HourBucket               string `json:"hourBucket"`
-	OrdersReceived           int    `json:"ordersReceived"`
-	OrdersAllocated          int    `json:"ordersAllocated"`
-	OrdersPartiallyAllocated int    `json:"ordersPartiallyAllocated"`
-	OrdersAllocationFailed   int    `json:"ordersAllocationFailed"`
-	OrdersReleased           int    `json:"ordersReleased"`
-	OrdersCancelled          int    `json:"ordersCancelled"`
-	LinesAllocated           int    `json:"linesAllocated"`
-	LinesBackordered         int    `json:"linesBackordered"`
-	LinesReleased            int    `json:"linesReleased"`
+	PathID                    string  `json:"pathId"`
+	HourBucket                string  `json:"hourBucket"`
+	OrdersReceived            int     `json:"ordersReceived"`
+	OrdersAllocated           int     `json:"ordersAllocated"`
+	OrdersPartiallyAllocated  int     `json:"ordersPartiallyAllocated"`
+	OrdersAllocationFailed    int     `json:"ordersAllocationFailed"`
+	OrdersReleased            int     `json:"ordersReleased"`
+	OrdersCancelled           int     `json:"ordersCancelled"`
+	LinesAllocated            int     `json:"linesAllocated"`
+	LinesBackordered          int     `json:"linesBackordered"`
+	LinesReleased             int     `json:"linesReleased"`
+	PromiseBasisCapability    int     `json:"promiseBasisCapability"`
+	PromiseBasisLeadTime      int     `json:"promiseBasisLeadTime"`
+	OrdersRepromised          int     `json:"ordersRepromised"`
+	OrdersSplitShipment       int     `json:"ordersSplitShipment"`
+	PromiseToCutoffGapSeconds float64 `json:"promiseToCutoffGapSeconds"`
 }
 
 // funnelReportDTO is the wire shape of a funnel report response.
@@ -82,17 +93,22 @@ func (h *ReportsHandlers) GetFunnel(w http.ResponseWriter, r *http.Request) {
 	dto := funnelReportDTO{Rows: make([]funnelRowDTO, 0, len(rep.Rows))}
 	for _, row := range rep.Rows {
 		dto.Rows = append(dto.Rows, funnelRowDTO{
-			PathID:                   row.Key.PathId,
-			HourBucket:               row.Key.HourBucket.UTC().Format(time.RFC3339),
-			OrdersReceived:           row.OrdersReceived,
-			OrdersAllocated:          row.OrdersAllocated,
-			OrdersPartiallyAllocated: row.OrdersPartiallyAllocated,
-			OrdersAllocationFailed:   row.OrdersAllocationFailed,
-			OrdersReleased:           row.OrdersReleased,
-			OrdersCancelled:          row.OrdersCancelled,
-			LinesAllocated:           row.LinesAllocated,
-			LinesBackordered:         row.LinesBackordered,
-			LinesReleased:            row.LinesReleased,
+			PathID:                    row.Key.PathId,
+			HourBucket:                row.Key.HourBucket.UTC().Format(time.RFC3339),
+			OrdersReceived:            row.OrdersReceived,
+			OrdersAllocated:           row.OrdersAllocated,
+			OrdersPartiallyAllocated:  row.OrdersPartiallyAllocated,
+			OrdersAllocationFailed:    row.OrdersAllocationFailed,
+			OrdersReleased:            row.OrdersReleased,
+			OrdersCancelled:           row.OrdersCancelled,
+			LinesAllocated:            row.LinesAllocated,
+			LinesBackordered:          row.LinesBackordered,
+			LinesReleased:             row.LinesReleased,
+			PromiseBasisCapability:    row.PromiseBasisCapability,
+			PromiseBasisLeadTime:      row.PromiseBasisLeadTime,
+			OrdersRepromised:          row.OrdersRepromised,
+			OrdersSplitShipment:       row.OrdersSplitShipment,
+			PromiseToCutoffGapSeconds: row.PromiseToCutoffGapSeconds,
 		})
 	}
 	writeJSON(w, http.StatusOK, dto)
