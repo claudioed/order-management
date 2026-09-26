@@ -6,7 +6,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -23,11 +22,7 @@ import (
 	"github.com/claudioed/order-management/internal/adapters/outbound/events"
 	"github.com/claudioed/order-management/internal/adapters/outbound/inventorystorage"
 	kafkaadapter "github.com/claudioed/order-management/internal/adapters/outbound/kafka"
-	"github.com/claudioed/order-management/internal/adapters/outbound/kafkacatalog"
-	"github.com/claudioed/order-management/internal/adapters/outbound/kafkacptschedule"
-	"github.com/claudioed/order-management/internal/adapters/outbound/kafkapathcapacity"
 	"github.com/claudioed/order-management/internal/adapters/outbound/memory"
-	"github.com/claudioed/order-management/internal/adapters/outbound/pathcapacity"
 	"github.com/claudioed/order-management/internal/adapters/outbound/postgres"
 	"github.com/claudioed/order-management/internal/adapters/outbound/productclassification"
 	"github.com/claudioed/order-management/internal/adapters/outbound/telemetry"
@@ -91,7 +86,7 @@ func run() error {
 	databaseURL := os.Getenv("DATABASE_URL")
 	migrationsPath := getenv("MIGRATIONS_PATH", "migrations")
 
-	orders, publisher, dbPool, closeAdapters, err := buildRepoAdapters(databaseURL, migrationsPath, getenv("EVENT_PUBLISHER", "log"), logger)
+	orders, publisher, dbPool, closeAdapters, err := buildRepoAdapters(ctx, databaseURL, migrationsPath, getenv("EVENT_PUBLISHER", "log"), logger)
 	if err != nil {
 		return err
 	}
@@ -133,100 +128,20 @@ func run() error {
 	// for an operator to learn. When the switch is "none" (or unset),
 	// ports.PathCapacity stays wired to UnknownPathCapacity, exactly
 	// today's behaviour.
-	catalogueSource := getenv("PATH_CATALOGUE_SOURCE", "none")
-	var catalogue ports.ProcessPathCatalogue
-	var cptSchedule ports.CPTScheduleCache
-	var capacity ports.PathCapacity = pathcapacity.NewUnknown()
-	// catalogueConsumerCtx/cancelCatalogueConsumer are declared here
-	// (rather than inline in the switch below) because the Kafka
-	// catalogue source needs its own Run goroutine started BEFORE
-	// WaitReady is called -- otherwise nothing would ever be consuming
-	// messages while this process waits, guaranteeing a deadlock until
-	// WaitReadyTimeout.
-	catalogueConsumerCtx, cancelCatalogueConsumer := context.WithCancel(context.Background())
-	defer cancelCatalogueConsumer()
-
-	switch catalogueSource {
-	case "kafka":
-		kafkaBrokers := os.Getenv("KAFKA_BROKERS")
-		if kafkaBrokers == "" {
-			return fmt.Errorf("PATH_CATALOGUE_SOURCE=kafka requires KAFKA_BROKERS to be set")
-		}
-		brokerList := strings.Split(kafkaBrokers, ",")
-
-		kafkaCatalogue, err := kafkacatalog.NewConsumer(context.Background(), brokerList, logger)
-		if err != nil {
-			return fmt.Errorf("failed to start the Kafka-sourced process-path catalogue: %w", err)
-		}
-		catalogue = kafkaCatalogue
-		logger.Info("process-path catalogue source configured", "source", "kafka", "topic", kafkacatalog.Topic)
-		go func() {
-			logger.Info("process-path catalogue consumer running", "topic", kafkacatalog.Topic)
-			if err := kafkaCatalogue.Run(catalogueConsumerCtx); err != nil {
-				logger.Error("process-path catalogue consumer stopped", "error", err)
-			}
-		}()
-
-		// A SEPARATE consumer instance, own per-process-unique consumer
-		// group, on the SAME topic -- see kafkacptschedule's package
-		// doc comment for why this is safe (independent event-type
-		// filters, independent groups).
-		cptScheduleConsumer, err := kafkacptschedule.NewConsumer(context.Background(), brokerList, logger)
-		if err != nil {
-			return fmt.Errorf("failed to start the Kafka-sourced CPT schedule cache: %w", err)
-		}
-		cptSchedule = cptScheduleConsumer
-		logger.Info("CPT schedule cache source configured", "source", "kafka", "topic", kafkacptschedule.Topic)
-		go func() {
-			logger.Info("CPT schedule consumer running", "topic", kafkacptschedule.Topic)
-			if err := cptScheduleConsumer.Run(catalogueConsumerCtx); err != nil {
-				logger.Error("CPT schedule consumer stopped", "error", err)
-			}
-		}()
-
-		// A THIRD independent consumer instance, own per-process-unique
-		// consumer group, on wes-work-planning's OWN topic -- see
-		// kafkapathcapacity's package doc comment (ADR-0015).
-		pathCapacityConsumer, err := kafkapathcapacity.NewConsumer(context.Background(), brokerList, logger)
-		if err != nil {
-			return fmt.Errorf("failed to start the Kafka-sourced path capacity cache: %w", err)
-		}
-		capacity = pathCapacityConsumer
-		logger.Info("path capacity cache source configured", "source", "kafka", "topic", kafkapathcapacity.Topic)
-		go func() {
-			logger.Info("path capacity consumer running", "topic", kafkapathcapacity.Topic)
-			if err := pathCapacityConsumer.Run(catalogueConsumerCtx); err != nil {
-				logger.Error("path capacity consumer stopped", "error", err)
-			}
-		}()
-
-		logger.Info("waiting for the process-path catalogue to replay its initial history before accepting traffic")
-		waitCtx, waitCancel := context.WithTimeout(context.Background(), kafkacatalog.WaitReadyTimeout)
-		err = kafkaCatalogue.WaitReady(waitCtx)
-		waitCancel()
-		if err != nil {
-			return fmt.Errorf("process-path catalogue did not become ready within %s: %w", kafkacatalog.WaitReadyTimeout, err)
-		}
-
-		logger.Info("waiting for the CPT schedule cache to replay its initial history before accepting traffic")
-		scheduleWaitCtx, scheduleWaitCancel := context.WithTimeout(context.Background(), kafkacptschedule.WaitReadyTimeout)
-		err = cptScheduleConsumer.WaitReady(scheduleWaitCtx)
-		scheduleWaitCancel()
-		if err != nil {
-			return fmt.Errorf("CPT schedule cache did not become ready within %s: %w", kafkacptschedule.WaitReadyTimeout, err)
-		}
-
-		logger.Info("waiting for the path capacity cache to replay its initial history before accepting traffic")
-		capacityWaitCtx, capacityWaitCancel := context.WithTimeout(context.Background(), kafkapathcapacity.WaitReadyTimeout)
-		err = pathCapacityConsumer.WaitReady(capacityWaitCtx)
-		capacityWaitCancel()
-		if err != nil {
-			return fmt.Errorf("path capacity cache did not become ready within %s: %w", kafkapathcapacity.WaitReadyTimeout, err)
-		}
-	default:
-		logger.Warn("process-path catalogue source not configured; ReceiveOrder will skip path validation, and path capacity will remain unknown (UnknownPathCapacity)",
-			"hint", "set PATH_CATALOGUE_SOURCE=kafka for a real deployment")
+	// wireProcessPathCatalogue also retries every boot-time Kafka dial it
+	// makes (each NewConsumer call's newTargetOffsets dials the broker
+	// directly before the real reader exists) with exponential backoff,
+	// mirroring network-fulfillment PR #7 — this cluster resets every
+	// injected pod's first outbound dial ~10s after start (Istio native
+	// sidecars; holdApplicationUntilProxyStarts is a no-op for them), and
+	// a single attempt turns that transient condition into
+	// CrashLoopBackOff. See wiring.go's doc comment for the full detail.
+	catalogue, cptSchedule, capacity, closeCatalogue, err := wireProcessPathCatalogue(
+		ctx, getenv("PATH_CATALOGUE_SOURCE", "none"), os.Getenv("KAFKA_BROKERS"), logger)
+	if err != nil {
+		return err
 	}
+	defer closeCatalogue()
 
 	leadTime := order.NewLeadTimePolicy(
 		durationEnv("PROMISE_DEFAULT_LEAD_TIME", order.DefaultLeadTime, logger),
@@ -350,7 +265,19 @@ func newLogger(level string) *slog.Logger {
 // EVENT_PUBLISHER=kafka|log pattern exactly. The returned *pgxpool.Pool is
 // nil for the in-memory case; buildRepromiseProcessedEvents reuses it
 // rather than opening a second pool against the same database.
-func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logger *slog.Logger) (
+//
+// Both the migration run and the post-open ping are RETRIED with
+// exponential backoff (mirroring network-fulfillment PR #7): in this
+// cluster every injected pod's first outbound TCP dial is reset ~10s
+// after the app starts (Istio native sidecars run as an init container
+// with restartPolicy=Always, so holdApplicationUntilProxyStarts is a
+// no-op), and this service dials Postgres for migrations before it ever
+// starts serving. A single attempt turns that known, transient condition
+// into CrashLoopBackOff — confirmed live (129 restarts). The retry does
+// NOT weaken the fail-closed rule: after the ~31s budget is exhausted
+// this still returns the real underlying error and the caller still
+// refuses to boot.
+func buildRepoAdapters(ctx context.Context, databaseURL, migrationsPath, eventPublisher string, logger *slog.Logger) (
 	ports.OrderRepo, ports.EventPublisher, *pgxpool.Pool, func(), error,
 ) {
 	noop := func() {}
@@ -367,12 +294,25 @@ func buildRepoAdapters(databaseURL, migrationsPath, eventPublisher string, logge
 		orders = memory.NewOrderRepo()
 		defaultPub = events.NewLogPublisher(logger)
 	} else {
-		if err := postgres.RunMigrations(databaseURL, migrationsPath); err != nil {
+		if err := retry(ctx, logger, "run migrations", func() error {
+			return postgres.RunMigrations(databaseURL, migrationsPath)
+		}); err != nil {
 			return nil, nil, nil, noop, err
 		}
 		var err error
-		pool, err = postgres.NewPool(context.Background(), databaseURL)
+		pool, err = postgres.NewPool(ctx, databaseURL)
 		if err != nil {
+			return nil, nil, nil, noop, err
+		}
+		// NewPool/ParseConfig do not themselves establish a connection,
+		// so without this the first real failure would surface inside a
+		// request rather than at boot — turning a misconfigured
+		// deployment into an intermittent 500 instead of a refusal to
+		// start.
+		if err := retry(ctx, logger, "ping database", func() error {
+			return pool.Ping(ctx)
+		}); err != nil {
+			pool.Close()
 			return nil, nil, nil, noop, err
 		}
 		orders = postgres.NewOrderRepo(pool)
