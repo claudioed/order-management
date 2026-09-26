@@ -38,12 +38,22 @@ var ErrUnknownPath = errors.New("processpath: unknown or inactive process path i
 // CycleTimeKnown is false when the wire event carried no parseable
 // cycle_time_p95 for this path — PromisePolicy treats "path known, cycle
 // time unknown" the same as "path unknown": fall back to LeadTimePolicy.
+//
+// DestinationLocationRole mirrors process-path-management's own optional
+// declaration (ADR 0006 there) of which facility-layout LocationRole this
+// path's completed work is destined for (Drop | WorkCenter | Shipping),
+// or "" when no destination role was declared. Made available on this
+// read model (ADR-0014's "available but not yet acted upon" discipline,
+// matching how Direct/RequiredCapabilities are carried in WES/FE's own
+// copies of this catalogue) — nothing in this service currently makes a
+// routing decision off it.
 type PathDefinition struct {
-	Id             string
-	MatchPrefix    string
-	CycleTimeP95   time.Duration
-	CycleTimeKnown bool
-	Eligibility    shared.Eligibility
+	Id                      string
+	MatchPrefix             string
+	CycleTimeP95            time.Duration
+	CycleTimeKnown          bool
+	Eligibility             shared.Eligibility
+	DestinationLocationRole string
 }
 
 // Catalogue is the validated, in-memory set of currently active process
