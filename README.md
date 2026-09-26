@@ -5,7 +5,7 @@
 > follows real industry-standard patterns and terminology (WMS/WES/WCS,
 > chaotic storage, CloudEvents, RFC 7807, hexagonal architecture) but is
 > **not a production system** and is **not affiliated with, endorsed by, or
-> representative of Amazon or any other company**.
+> representative of any real-world company**.
 
 Order intake, allocation, promise-date calculation, and release — the
 missing upstream Open Host Service for the `warehouse-systems` fleet
