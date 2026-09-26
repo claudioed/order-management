@@ -492,6 +492,27 @@ func TestReleaseUnheldOrder_CarriesItsOwnProblemType(t *testing.T) {
 	}
 }
 
+func TestHeldOrderMustBeShipComplete_CarriesItsOwnProblemType(t *testing.T) {
+	// Regression: statusFor already mapped order.ErrHeldOrderMustBeShip-
+	// Complete to 422, but problemFor had no case for it, so the response
+	// fell through to type=internal-error / "An unexpected internal error
+	// occurred" alongside a correct 422 — a deliberate ADR 0020 §4
+	// business-rule violation presented to the caller as a server bug.
+	// This test reads the type, not just the status.
+	e := newTestEnv(t)
+
+	rec := e.do(t, http.MethodPost, "/orders",
+		`{"lines":[{"sku":"SKU-1","quantity":1}],"allowPartialShipment":true,"releaseOnAllocation":false}`)
+	body := assertProblem(t, rec, http.StatusUnprocessableEntity)
+
+	if !strings.HasSuffix(body.Type, "/held-order-must-be-ship-complete") {
+		t.Fatalf("problem.type = %q, want the held-order-must-be-ship-complete slug", body.Type)
+	}
+	if strings.Contains(body.Title, "unexpected internal error") {
+		t.Fatalf("a deliberate business rule must not be titled as an internal error: %q", body.Title)
+	}
+}
+
 func TestNo4xxProblemFallsBackToInternalError(t *testing.T) {
 	// The general form of the bug above: any error the status table maps
 	// to a 4xx MUST also have its own problem type. A per-error mapping
@@ -509,6 +530,7 @@ func TestNo4xxProblemFallsBackToInternalError(t *testing.T) {
 		{"malformed json", http.MethodPost, "/orders", "{", http.StatusBadRequest},
 		{"empty lines", http.MethodPost, "/orders", `{"lines":[]}`, http.StatusBadRequest},
 		{"non-positive quantity", http.MethodPost, "/orders", `{"lines":[{"sku":"SKU-1","quantity":0}]}`, http.StatusUnprocessableEntity},
+		{"held order must be ship-complete", http.MethodPost, "/orders", `{"lines":[{"sku":"SKU-1","quantity":1}],"allowPartialShipment":true,"releaseOnAllocation":false}`, http.StatusUnprocessableEntity},
 	}
 
 	for _, tc := range cases {
