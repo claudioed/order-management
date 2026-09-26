@@ -1,11 +1,23 @@
 # API contracts
 
-## REST API (5 endpoints — `apis/openapi.yaml`, no more `/allocate`/`/release`)
+## REST API (6 routes — `apis/openapi.yaml`; ADR-0005's `/allocate` and old `/release` verbs are gone)
 
 - `POST   /orders`                       → `receiveOrder` — intake; folds
   allocation-then-release into the same call (ADR-0005). 201 always, even
-  if the implicit allocation pass hits a hard failure.
+  if the implicit allocation pass hits a hard failure. Optional
+  `releaseOnAllocation` (default `true`; `false` = hold after allocation,
+  ADR-0020 — combining it with `allowPartialShipment: true` is rejected
+  422, `order.ErrHeldOrderMustBeShipComplete`; NOTE `problemFor` has no
+  case for that error yet, so the body's `type` is currently
+  `internal-error` — a known code gap, not the intended contract) and optional `requiredShipBy`
+  (RFC 3339 deadline; the promise is constrained to the latest CPT window
+  at or before it via `PromisePolicy.FeasibleBy`, and an infeasible
+  deadline comes back with NO `promiseDate` rather than an error).
 - `GET    /orders/{id}`                  → `getOrder`
+- `POST   /orders/{id}/release`          → `releaseHeldOrder` (ADR-0020) —
+  releases a HELD order's allocated lines through the same release leg.
+  Idempotent for a held order (200, no event, if already released); 409
+  `order-not-held` for an order that was never held.
 - `POST   /orders/{id}/retry-allocation` → `retryAllocation` — 503 on a
   genuine hard failure (this IS an explicit ask for allocation now).
 - `DELETE /orders/{id}`                  → `cancelOrder` — 409 if any line
@@ -15,7 +27,7 @@
 
 JSON DTOs live in the http adapter; never leak domain structs. Every error
 response is RFC 7807 `application/problem+json` (identical shape to the
-other five services).
+other fleet services).
 
 **No auth on any route** (ADR-0012 — the fleet-wide static-bearer rollout
 from ADR-0011 was rolled back; `apis/openapi.yaml` carries no
@@ -50,6 +62,12 @@ Base URL via env `INVENTORY_STORAGE_BASE_URL`, mode via
   line (BR2). Any other non-2xx or transport error propagates as a hard
   failure — never silently backordered.
 - `DELETE /reservations/{id}` — 204 on success. Used by `CancelOrder`.
+- `GET /products/{sku}/classification` — product-classification lookup
+  for eligibility-driven path selection (ADR-0016), same
+  `INVENTORY_STORAGE_BASE_URL`, mode via `PRODUCT_CLASSIFICATION_MODE`
+  (default `permissive`). Unlike reservations this one fails OPEN: a 404,
+  transport error or non-2xx yields "unknown classification", never an
+  intake rejection.
 
 **Permissive mode is NOT soft here.** Unlike other fleet adapters that
 fail-open on optional/soft lookups, allocating real stock is never allowed
@@ -75,6 +93,8 @@ Fleet envelope, NOT CloudEvents. Two envelope variants:
   coordinating both sides; `fulfillment_class` is additive, ADR-0008)
   plus — since ADR-0018 — `OrderRepromised`, the fleet's "your delivery
   is delayed" trigger, raised by the new `RepromiseOrder` use case.
+  Consumer today: `wes-work-planning` (`OrderAllocated`/
+  `OrderPartiallyAllocated` only).
 
 ### Channel: `warehouse.fulfillment.events` (inbound, ADR-0018)
 
@@ -86,6 +106,21 @@ Fleet envelope, NOT CloudEvents. Two envelope variants:
   `data.order_ref` on both is a `WorkUnitId`-shaped reference
   (`{orderId}-line-{lineNo}`), NOT a bare `OrderId` — parsed back via
   `usecases.ParseWorkUnitID`, the reverse of `WorkUnitID` below.
+  Stable shared consumer group `order-management-repromise`, gated on
+  `KAFKA_BROKERS` alone.
+
+### Local-cache consumers (NOT declared in `apis/asyncapi.yaml`)
+
+Enabled only by `PATH_CATALOGUE_SOURCE=kafka` (default `none`); each uses
+its own per-process-unique consumer group and a full-replay readiness gate
+before `cmd/order` serves traffic:
+
+- `kafkacatalog` — `warehouse.process-path-management.events`,
+  `ProcessPathCreated`/`ProcessPathUpdated`/`ProcessPathDeactivated`
+  (ADR-0013).
+- `kafkacptschedule` — same topic, `CPTScheduleChanged` (ADR-0014).
+- `kafkapathcapacity` — `warehouse.work-planning.events`,
+  `PathCapacityChanged` (ADR-0015).
 
 ### Channel: `warehouse.order-management.analytics`
 
@@ -93,8 +128,8 @@ Fleet envelope, NOT CloudEvents. Two envelope variants:
   producer).
 - `subscribe` operationId `projectOrderAnalytics` (`cmd/order-projector` is
   the sole consumer/writer — FirstOffset, idempotent on `event_id`).
-- Carries all 9 analytics-relevant event types (see `domain-model.md`'s
-  event table) as 9 distinct messages.
+- Carries all 10 domain event types (see `domain-model.md`'s event
+  table) as 10 distinct messages — `OrderRepromised` added by ADR-0019.
 
 ### Deterministic work-unit id (frozen, zero wire-level enforcement)
 
@@ -121,7 +156,7 @@ except manual review and cross-repo test discipline.
   arch-test dependency rule); `cmd/mcp` adapts the real
   `report.ReportStore` into it.
 - **No write tool** — every write use case here (`ReceiveOrder`,
-  `CancelOrder`, `RetryAllocation`) enforces a real domain invariant an
+  `CancelOrder`, `RetryAllocation`, `ReleaseHeldOrder`) enforces a real domain invariant an
   MCP-calling agent should not trigger directly.
 - No auth (ADR-0012 rolled back the bearer-key layer this adapter
   originally had per ADR-0011).

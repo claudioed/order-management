@@ -106,9 +106,11 @@ comment — keep it updated there if you touch the threshold.
 A `-tags=integration` test touching Kafka or Postgres MUST start its own
 container via `testcontainers-go`. Never gate on `os.Getenv("KAFKA_BROKERS")`
 + `t.Skip(...)`, and never hardcode `localhost:9092`. This repo's CI
-`integration` job (`.github/workflows/ci.yml`) provisions Postgres ONLY
-(no Kafka) — a skip-gated Kafka test silently skips in CI and proves
-nothing there, while testcontainers actually exercises the assertions on
+`integration` job (`.github/workflows/ci.yml`) provisions NO service
+containers at all (no Kafka, no Postgres) — a skip-gated test silently
+skips in CI and proves nothing there (this is exactly what happens today to
+the older `DATABASE_URL`-gated `outbound/postgres` and
+`ANALYTICS_DATABASE_URL`-gated `outbound/analyticsstore` suites), while testcontainers actually exercises the assertions on
 the runner. `internal/architecture/fitness_test.go`'s
 `TestKafkaIntegrationTestsUseTestcontainers` enforces this statically.
 See `internal/adapters/outbound/kafkacatalog/consumer_integration_test.go`

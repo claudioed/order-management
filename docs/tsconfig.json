@@ -4,7 +4,10 @@
 {
   "extends": "@docusaurus/tsconfig",
   "compilerOptions": {
-    "baseUrl": ".",
+    "baseUrl": null,
+    "paths": {
+      "@site/*": ["./*"]
+    },
     "ignoreDeprecations": "6.0",
     "strict": true
   },

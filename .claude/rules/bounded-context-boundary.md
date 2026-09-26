@@ -3,10 +3,15 @@
 This service is a **pure HTTP consumer** of `inventory-storage`'s
 already-published, already-stable REST API, and reacts to
 `wes-work-planning` only indirectly via Kafka choreography (ADR-0005 — see
-`adrs.md`). It is a **separate Go module in a separate repository**:
+`adrs.md`). Since ADR-0013..0018 it also consumes published Kafka facts from
+`process-path-management` (catalogue + CPT schedule), `wes-work-planning`
+(`PathCapacityChanged`) and `fulfillment-execution` (`TaskCPTMissed`/
+`PackageManifested`), each decoded into its own local struct; and since
+ADR-0020 `network-fulfillment` is an inbound HTTP caller. It is a
+**separate Go module in a separate repository**:
 
-- MUST NOT import any Go package from `inventory-storage` or
-  `wes-work-planning`.
+- MUST NOT import any Go package from `inventory-storage`,
+  `wes-work-planning`, or any other sibling context.
 - Gets **no write access** to either service's internal aggregates
   (`Reservation`, `WorkPool`, `WorkUnit`, etc.) — only to their published
   HTTP/Kafka contracts.

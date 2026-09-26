@@ -18,10 +18,18 @@ classDiagram
     -lines OrderLine[]
     -allowPartialShipment bool
     -promiseDate *time.Time
+    -promiseCptId *string
+    -promiseBasis *PromiseBasis
+    -promiseGroups PromiseGroup[]
+    -heldAtIntake bool
+    -requiredShipBy *time.Time
     +Status() Status
+    +FulfillmentClass() FulfillmentClass
     +Allocate(lineNo, reservationId) error
-    +Backorder(lineNo) error
-    +Release(lineNo, workUnitId) error
+    +RetryAllocate(lineNo, reservationId) error
+    +MarkBackordered(lineNo) error
+    +Release(lineNo) error
+    +Hold()
     +Cancel() error
     +EnsureReleasable() error
     +EnsureCancellable() error
@@ -42,7 +50,15 @@ classDiagram
 ## Order
 
 **The aggregate root.** Owns `OrderId`, `OrderLine[]`,
-`AllowPartialShipment bool`, `Status`, and `PromiseDate *time.Time`.
+`AllowPartialShipment bool`, `Status`, the promise (`PromiseDate`,
+`PromiseCptId`, `PromiseBasis` = `Capability` / `LeadTime` / `Network`, and
+per-shipment-group `PromiseGroups` —
+[ADR 0014](/docs/adr/0014-promise-derived-from-fulfillment-capability),
+[0017](/docs/adr/0017-per-shipment-group-promising)), and — since
+[ADR 0020](/docs/adr/0020-network-originated-demand-hold-and-deadline-feasibility)
+— the hold flag (`ReleaseOnAllocation()`, stored inversely as
+`heldAtIntake`) and optional `RequiredShipBy`. A hold is deliberately not a
+new `Status`: a held order is simply allocated and not yet released.
 
 ### Invariants
 
@@ -52,6 +68,7 @@ classDiagram
 | **Cannot release a line that isn't `Allocated`.** | `Release` rejects any other line status. |
 | **Cannot cancel once ANY line is `Released`.** | `EnsureCancellable` returns `ErrOrderAlreadyReleased`. |
 | **Order-level `Status` is always computed from line statuses, never stored redundantly.** | `Status()` derives the value on every call; there is no backing field. |
+| **A held order must be ship-complete.** | `ErrHeldOrderMustBeShipComplete` at intake when `releaseOnAllocation=false` and `allowPartialShipment=true` (ADR 0020). |
 
 ### Status derivation
 
@@ -78,7 +95,7 @@ stateDiagram-v2
 | --- | --- |
 | `SKU` | The stock keeping unit ordered. |
 | `Quantity` | Must be > 0. |
-| `PathId` | wes-work-planning process path this line's work is enqueued onto; defaults to `"pick"` if not supplied. |
+| `PathId` | Process path this line's work is enqueued onto; resolved internally by `PathSelectionPolicy` (today always `"pick"`), never supplied by the caller (ADR 0005/0013/0016). |
 | `GiftWrap` | Whether the requester asked for gift packaging. |
 | `LineStatus` | `Pending` / `Allocated` / `Backordered` / `Released` / `Cancelled`. |
 | `ReservationId` | Set once allocated; needed to cancel. |
@@ -94,7 +111,7 @@ stateDiagram-v2
 ## BR3 — ship-complete default
 
 `AllowPartialShipment=false` (the default): if ANY line ends up
-`Backordered` during `AllocateOrder`, the WHOLE order's status is
+`Backordered` during allocation, the WHOLE order's status is
 `Backordered` (no line proceeds to release) until a human/caller issues
 `RetryAllocation`. `AllowPartialShipment=true`: allocated lines are
 independently eligible for release; order status becomes

@@ -10,7 +10,7 @@
 Order intake, allocation, promise-date calculation, and release — the
 missing upstream Open Host Service for the `warehouse-systems` fleet
 (`inventory-storage`, `wes-work-planning`, `fulfillment-execution`,
-`workforce-management`, `facility-layout`).
+`process-path-management`, `network-fulfillment`, and the rest of the fleet).
 
 This context owns **Order** and **OrderLine** as first-class, validated
 aggregates — closing a gap where "an order" was previously just an
@@ -19,14 +19,19 @@ threaded independently through three other services.
 
 ## Bounded-context boundary (read this first)
 
-This service is a **pure HTTP consumer** of `inventory-storage`'s and
-`wes-work-planning`'s already-published REST APIs. It imports no Go code
-from either repository and has no write access to their internal
-aggregates (`Reservation`, `WorkPool`, etc.) — only to their published,
-versioned HTTP contracts. Order Management is the **Customer**;
-`inventory-storage` and `wes-work-planning` are the **Suppliers / Open Host
-Services**, the same directional relationship the fleet's DDD reference
-docs already use for WMS → WES.
+This service is a **pure HTTP consumer** of `inventory-storage`'s
+already-published REST API (reservations, product classification) and
+integrates with the rest of the fleet only through published Kafka events:
+it announces release to `wes-work-planning`
+([ADR 0005](docs/docs/adr/0005-choreographed-release-via-kafka.md)) and
+consumes capability, CPT-schedule, capacity and fulfillment facts from
+`process-path-management`, `wes-work-planning` and `fulfillment-execution`
+(ADR 0013–0018). `network-fulfillment` calls it over HTTP to raise held,
+deadline-constrained orders
+([ADR 0020](docs/docs/adr/0020-network-originated-demand-hold-and-deadline-feasibility.md)).
+It imports no Go code from any sibling repository and has no write access
+to their internal aggregates (`Reservation`, `WorkPool`, etc.) — only to
+their published, versioned contracts.
 
 This build is **100% additive** from those services' point of view: neither
 repository is modified at all. See
@@ -36,34 +41,48 @@ repository is modified at all. See
 
 Hexagonal (ports & adapters), with a strict inward-only dependency rule —
 **domain depends on nothing; application depends on domain; adapters depend
-on application/domain** — identical in shape to the other five services in
+on application/domain** — identical in shape to the other Go services in
 the fleet. See
 [ADR 0001](docs/docs/adr/0001-hexagonal-ports-and-adapters.md).
 
 ```
-cmd/order/                        main.go — the only composition root
+cmd/order/                        OLTP service composition root
+cmd/mcp/                          read-only MCP server (ADR 0010)
+cmd/order-projector/              analytics writer (ADR 0006)
+cmd/order-reports/                analytics read API (ADR 0006)
 internal/
   domain/
     order/                        Order aggregate, OrderLine, statuses,
-                                  invariants, LeadTimePolicy
+                                  invariants, PromisePolicy (+ LeadTimePolicy
+                                  fallback), PathSelectionPolicy
+    processpath/                  process-path definitions
     shared/                       OrderId, SKU, PathId, domain events, errors
   application/
     ports/                        OUT: OrderRepo, EventPublisher, Clock,
-                                  InventoryReservationClient
+                                  InventoryReservationClient,
+                                  ProcessPathCatalogue, CPTScheduleCache,
+                                  PathCapacity, ProductClassificationLookup,
+                                  RepromiseProcessedEvents, OrderMetrics
     usecases/                     ReceiveOrder (allocates+releases
                                   implicitly), RetryAllocation (retries+
-                                  releases), CancelOrder, GetOrder
+                                  releases), ReleaseHeldOrder, CancelOrder,
+                                  GetOrder, RepromiseOrder (Kafka-driven)
   adapters/
     inbound/http/                 chi handlers, DTOs, RFC 7807 error mapping
+    inbound/kafka/                re-promise consumer (warehouse.fulfillment.events)
+    inbound/mcp/                  MCP tools
     outbound/inventorystorage/    POST /reservations, DELETE /reservations/{id}
+    outbound/productclassification/ GET /products/{sku}/classification
+    outbound/kafkacatalog/, kafkacptschedule/, kafkapathcapacity/
+                                  capability caches (PATH_CATALOGUE_SOURCE=kafka)
     outbound/postgres/            pgxpool repo + golang-migrate runner
     outbound/memory/              in-memory repo + clocks for tests
     outbound/events/              log publisher (default, EVENT_PUBLISHER=log)
-    outbound/kafka/               Kafka integration-events publisher
-                                  (EVENT_PUBLISHER=kafka), topic
-                                  warehouse.order-management.events
-migrations/                       golang-migrate SQL files
-apis/openapi.yaml                 OpenAPI 3.0 spec for every endpoint
+    outbound/kafka/               integration + analytics publishers
+                                  (EVENT_PUBLISHER=kafka)
+    outbound/analyticsstore/      analytics projection + report queries
+migrations/                       golang-migrate SQL files (+ analytics/)
+apis/openapi.yaml, asyncapi.yaml  REST and Kafka contracts
 docker-compose.kafka.yml          Local Kafka broker (KRaft, single node)
 docs/docs/adr/                    Architecture Decision Records
 ```
@@ -78,7 +97,7 @@ summarises.
 - **BR2 — fail closed on ambiguity.** A `409` from inventory-storage's
   `POST /reservations` is the business fact "no usable stock" and backorders
   that one line. A transport failure, a 5xx, or any other non-2xx is *not* a
-  business fact: the whole `AllocateOrder` call fails and nothing is silently
+  business fact: the allocation pass fails and nothing is silently
   marked backordered.
 - **BR3 — ship-complete by default.** `allowPartialShipment` defaults to
   `false`: any backordered line holds the WHOLE order back from release until
@@ -120,11 +139,11 @@ there is no separate migrate step to remember.
 
 ### 3. Wired to the real Supplier
 
-The outbound inventory-storage client defaults to **permissive (no-op)
-mode**, so tests and CI never reach the network. Permissive here does
-*not* mean fail-open: allocating real stock must never appear to succeed
-against a no-op, so a permissive client refuses the operation with a clear
-`downstream-not-configured` problem response. Only `http` mode is suitable
+The outbound inventory-storage clients default to **permissive (no-op)
+mode**, so tests and CI never reach the network. For reservations,
+permissive does *not* mean fail-open: allocating real stock must never
+appear to succeed against a no-op, so a permissive client refuses the
+operation with a clear `downstream-not-configured` problem. Only `http` mode is suitable
 for a real integration test or deployment:
 
 ```bash
@@ -145,13 +164,17 @@ Release no longer calls any Supplier synchronously — see
 | `DATABASE_URL` | *(unset)* | Postgres DSN. Unset ⇒ in-memory adapters. |
 | `MIGRATIONS_PATH` | `migrations` | golang-migrate source directory. |
 | `INVENTORY_STORAGE_MODE` | `permissive` | `http` or `permissive`. |
-| `INVENTORY_STORAGE_BASE_URL` | *(unset)* | Required when mode is `http`. |
-| `EVENT_PUBLISHER` | `log` | `log` (default, in-memory/Postgres publisher) or `kafka` — forwards `OrderAllocated`/`OrderPartiallyAllocated` to the integration topic **and** fans the full report-input event set out to the analytics topic (ADR 0006). |
-| `KAFKA_BROKERS` | `localhost:9092` | Comma-separated broker addresses. Only read when `EVENT_PUBLISHER=kafka`. |
+| `INVENTORY_STORAGE_BASE_URL` | *(unset)* | Required when mode is `http`; also the product-classification base URL. |
+| `PRODUCT_CLASSIFICATION_MODE` | `permissive` | `http` or `permissive` — eligibility lookup for path selection (ADR 0016); fails open. |
+| `PATH_CATALOGUE_SOURCE` | `none` | `kafka` enables the process-path catalogue, CPT-schedule and path-capacity caches that drive the capability-derived promise (ADR 0013–0015); `none` ⇒ lead-time promise only. |
+| `EVENT_PUBLISHER` | `log` | `log` (default, in-memory/Postgres publisher) or `kafka` — forwards `OrderAllocated`/`OrderPartiallyAllocated`/`OrderRepromised` to the integration topic **and** fans every domain event out to the analytics topic (ADR 0006). |
+| `KAFKA_BROKERS` | `localhost:9092` | Comma-separated broker addresses, read by the Kafka publishers and caches. When set, `cmd/order` also runs the re-promise consumer (ADR 0018). |
+| `CORS_ALLOWED_ORIGINS` | *(unset)* | Console / MFE origins (ADR 0007). |
 | `ANALYTICS_DATABASE_URL` | *(unset)* | Analytical Postgres DSN. **Required** by `cmd/order-projector` (writer) and `cmd/order-reports` (read-only reader); never read by the OLTP binary. |
 | `ANALYTICS_MIGRATIONS_PATH` | `migrations/analytics` | Analytical golang-migrate source directory (writer only). |
 | `ADMIN_ADDR` | `:8091` | `cmd/order-projector` admin/health listen address. |
-| `PROMISE_DEFAULT_LEAD_TIME` | `48h` | Promise-date lead time for any unlisted path. |
+| `MCP_ADDR` | `:8090` | `cmd/mcp` listen address. |
+| `PROMISE_DEFAULT_LEAD_TIME` | `48h` | Lead-time fallback promise for any unlisted path. |
 | `PROMISE_PATH_LEAD_TIMES` | *(unset)* | Per-path overrides, e.g. `pick=24h,singles=6h`. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
 
@@ -163,13 +186,15 @@ announced as a Kafka integration event, which that service (or any other
 subscriber) consumes independently:
 
 - **Topic:** `warehouse.order-management.events`
-- **Forwarded events:** `OrderAllocated` and `OrderPartiallyAllocated`
-  only — every other domain event (`OrderReceived`, `OrderLineAllocated`,
-  `OrderLineBackordered`, `OrderLineReleased`, `OrderReleased`,
-  `OrderCancelled`, `OrderAllocationPartiallyFailed`) stays local-only,
-  mirroring `inventory-storage`'s own precedent of forwarding only two of
-  its several domain events.
-- **Payload (frozen, `data` field):**
+- **Forwarded events:** `OrderAllocated`, `OrderPartiallyAllocated` and
+  (ADR 0018) `OrderRepromised` — every other domain event
+  (`OrderReceived`, `OrderLineAllocated`, `OrderLineBackordered`,
+  `OrderLineReleased`, `OrderReleased`, `OrderCancelled`,
+  `OrderAllocationPartiallyFailed`) stays off the integration topic,
+  mirroring `inventory-storage`'s own precedent of forwarding only a subset.
+- **Payload (`data` field; the four line fields below are frozen, newer
+  fields such as `fulfillment_class` and `promise_cpt_id`/`promise_basis`/
+  `promise_cutoff_at` are additive — see `apis/asyncapi.yaml`):**
 
   ```json
   {
@@ -192,6 +217,12 @@ subscriber) consumes independently:
   a cross-repo reference).
 - **Fire-and-forget, deliberately.** There is no release-confirmation
   reply event from `wes-work-planning` in v1 — see "Deferred" below.
+- **Consumed topics:** `warehouse.process-path-management.events`
+  (`ProcessPath*`, `CPTScheduleChanged`) and `warehouse.work-planning.events`
+  (`PathCapacityChanged`) feed local caches when
+  `PATH_CATALOGUE_SOURCE=kafka`; `warehouse.fulfillment.events`
+  (`TaskCPTMissed`, `PackageManifested`) drives the re-promise consumer
+  (group `order-management-repromise`) whenever `KAFKA_BROKERS` is set.
 
 ## Analytics data product
 
@@ -246,12 +277,21 @@ EVENT_PUBLISHER=kafka go run ./cmd/order
 
 The report is **eventually consistent** by design — a projection of the event
 stream to a freshness SLA (p95 event-to-report lag < 30s), not a real-time view.
-There is **no MCP report tool** in this service: no MCP adapter exists in v1, so
-the curated tool the estate's pilot added is a deferred follow-up.
+Its promise KPIs (ADR 0019) are also exposed through the read-only MCP tool
+`get_promise_health`.
+
+## MCP server
+
+`cmd/mcp` ([ADR 0010](docs/docs/adr/0010-mcp-inbound-adapter.md)) serves
+two read-only tools over Streamable HTTP on `MCP_ADDR` (default `:8090`):
+`get_order` (the `GetOrder` use case) and `get_promise_health` (the
+analytics report store). There is no write tool and, since
+[ADR 0012](docs/docs/adr/0012-remove-rest-mcp-bearer-auth.md), no
+authentication.
 
 ## API
 
-Four endpoints plus a liveness probe. The full contract, including the RFC 7807
+Five endpoints plus a liveness probe. The full contract, including the RFC 7807
 error schema, is in [`apis/openapi.yaml`](apis/openapi.yaml).
 
 | Method | Path | Use case |
@@ -259,17 +299,22 @@ error schema, is in [`apis/openapi.yaml`](apis/openapi.yaml).
 | `POST` | `/orders` | ReceiveOrder — allocates and releases automatically |
 | `GET` | `/orders/{id}` | GetOrder |
 | `POST` | `/orders/{id}/retry-allocation` | RetryAllocation — retries and releases automatically |
+| `POST` | `/orders/{id}/release` | ReleaseHeldOrder — releases an order received with `releaseOnAllocation: false` (ADR 0020) |
 | `DELETE` | `/orders/{id}` | CancelOrder |
 | `GET` | `/healthz` | Liveness probe |
 
-`POST /orders/{id}/allocate` and `POST /orders/{id}/release` no longer
-exist — see [ADR 0005](docs/docs/adr/0005-choreographed-release-via-kafka.md).
-A caller expresses ONE intent, placing an order, and this service
-internally attempts allocation-then-release automatically, right after
-intake and again on retry.
+`POST /orders/{id}/allocate` and the old general-purpose
+`POST /orders/{id}/release` were removed by
+[ADR 0005](docs/docs/adr/0005-choreographed-release-via-kafka.md): a caller
+expresses ONE intent, placing an order, and this service internally
+attempts allocation-then-release automatically, right after intake and
+again on retry. The current `/release` route is ADR 0020's opt-in hold:
+`POST /orders` with `releaseOnAllocation: false` allocates and stops, and
+optional `requiredShipBy` constrains the promise to a window that meets
+that deadline (no `promiseDate` in the response means it cannot).
 
 Every error response is `application/problem+json` (RFC 7807), the same shape
-the other five services emit.
+the other services emit.
 
 ### Curl walkthrough
 
@@ -381,16 +426,19 @@ lefthook install
 CI mirrors the local gate and the fleet's sensor set (same shape as
 wes-work-planning's CI): **`lint`**, **`test`** (+ coverage gate), **`bdd`**
 (godog/Gherkin acceptance suite under `features/`), **`integration`**
-(`-tags=integration` suite against two `postgres:16` service containers —
-one per database this repo owns), **`mutation-fast`** (gremlins on
+(`-tags=integration` Kafka adapter suites against a Testcontainers Kafka;
+the job provisions no Postgres, so the `DATABASE_URL`-gated Postgres
+integration tests skip in CI), **`mutation-fast`** (gremlins on
 `./internal/domain/order`, thresholds pinned in `.gremlins.yaml`) with the
 exhaustive weekly **`mutation`** run on schedule, **`vuln`**
 (govulncheck), **`api-lint`** (Spectral on `apis/openapi.yaml` and
 `apis/asyncapi.yaml`), **`arch-test`** (arch-go fitness tests in
 `internal/architecture/`), and **`docs-api-drift`** (regenerates the
-Docusaurus API reference from the spec and fails on diff) — plus the
-packaging/security/publish jobs (`helm-lint`, `trivy-scan`,
-`docker-publish`, `release`).
+Docusaurus API reference from the spec; its diff step currently checks the
+wrong path and cannot fail — see `.claude/rules/ci-quality-gates.md`),
+**`web`** (MFE lint/typecheck/test/build) — plus the packaging/security/
+publish jobs (`helm-lint`, `trivy-scan`, `docker-publish`, `release`) and the
+advisory scheduled **`drift`** job.
 
 ## Operator micro-frontend (`web/`)
 
@@ -459,36 +507,38 @@ above — have been removed from it.)
   confirmation-loop pattern (e.g. this service subscribing to a
   `WorkEnqueued` reply event) is real, scoped-down future work. See
   [ADR 0005](docs/docs/adr/0005-choreographed-release-via-kafka.md).
-- **Real carrier-rate promise dates.** `LeadTimePolicy` computes the promise
-  date from a configurable per-path lead time. That is real, tested domain
-  logic — not a hardcoded field — but it is not a live carrier integration,
-  and no such service exists in this fleet to call.
+- **Real carrier-rate / transit-time promise.** The promise is a CPT window
+  derived from fulfillment capability (ADR 0014), with `LeadTimePolicy` as the
+  tagged fallback — it ends at the building's door. There is no live carrier
+  integration, and no such service exists in this fleet to call.
+- **Multi-path selection.** `PathSelectionPolicy` checks eligibility
+  (ADR 0016) but can only choose the default `pick` path.
+- **Sweeping an orphaned hold.** Nothing expires an order held with
+  `releaseOnAllocation: false` that its caller never releases or cancels
+  (ADR 0020); it keeps its inventory reservations until someone does.
 - **Clawing back released work on cancellation.** Documented in detail in
   [ADR 0004](docs/docs/adr/0004-cancellation-boundary-at-release.md).
-- **Killing the surviving promise.go boundary mutants.** The mutation gate
-  is pinned at the measured baseline (efficacy 90 / mutant-coverage 81 —
-  see `.gremlins.yaml`); hardening the lead-time fallback tests to ratchet
-  those thresholds toward the fleet's 99/99 is tracked follow-up work.
-- **Any change to `inventory-storage` or `wes-work-planning`.** This build is
-  100% additive from their point of view; neither repository is touched.
+- **Killing the surviving promise boundary mutants.** The mutation gate
+  is pinned just under the measured baseline (efficacy 89 / mutant-coverage
+  83 — see `.gremlins.yaml`); ratcheting those thresholds toward the fleet's
+  99/99 is tracked follow-up work.
 
 ### Docusaurus site
 
-**The Docusaurus site now exists**, mirroring the other five
-`warehouse-systems` repositories' exact structure (Docusaurus 3.10.2,
-`docusaurus-plugin-openapi-docs`/`docusaurus-theme-openapi-docs`, the same
-six-category sidebar minus "AI Ecosystem (MCP)", which is deferred — no MCP
-adapter exists yet). It lives under `docs/` and builds cleanly:
+The documentation site mirrors the other `warehouse-systems` repositories'
+structure (Docusaurus 3.10.2, `docusaurus-plugin-openapi-docs`/
+`docusaurus-theme-openapi-docs`). It lives under `docs/`:
 
 ```bash
 cd docs
 npm ci
-npm run gen-api-docs   # generates docs/docs/api-reference/rest/ from apis/openapi.yaml
-npm run build          # onBrokenLinks / onBrokenAnchors are both 'throw'
+npm run clean-api-docs order && npm run gen-api-docs order   # regenerate docs/docs/api-reference/rest/
+npm run typecheck
+npm run build          # onBrokenLinks is 'throw'
 ```
 
-The four ADRs under `docs/docs/adr/` are wired into the sidebar's
-"Architecture Decision Records" category alongside a new `adr/about.md`
+All ADRs under `docs/docs/adr/` are wired into the sidebar's
+"Architecture Decision Records" category alongside the `adr/about.md`
 index page. `.github/workflows/docs.yml` builds and deploys the site to
 GitHub Pages on every push to `main` that touches `docs/**`, publishing to
 **https://claudioed.github.io/order-management/**.
@@ -507,6 +557,14 @@ GitHub Pages on every push to `main` that touches `docs/**`, publishing to
 10. [0010 — MCP inbound adapter](docs/docs/adr/0010-mcp-inbound-adapter.md)
 11. [0011 — Adopt the fleet REST identity (static bearer keys, read/read-write scopes)](docs/docs/adr/0011-adopt-fleet-rest-identity.md) (superseded by 0012)
 12. [0012 — Remove the REST/MCP bearer auth layer](docs/docs/adr/0012-remove-rest-mcp-bearer-auth.md)
+13. [0013 — Process-path selection as a real domain policy, validated against a live catalogue](docs/docs/adr/0013-process-path-selection-as-a-domain-policy.md)
+14. [0014 — The delivery promise is a CPT window derived from fulfillment capability](docs/docs/adr/0014-promise-derived-from-fulfillment-capability.md)
+15. [0015 — wes-work-planning's PathCapacityChanged wired as the real PathCapacity adapter](docs/docs/adr/0015-wes-work-planning-path-capacity-changed-wired.md)
+16. [0016 — Eligibility-driven process-path selection](docs/docs/adr/0016-eligibility-driven-process-path-selection.md)
+17. [0017 — Per-shipment-group promising](docs/docs/adr/0017-per-shipment-group-promising.md)
+18. [0018 — RepromiseOrder consumer and OrderRepromised](docs/docs/adr/0018-repromise-order-consumer-and-order-repromised.md)
+19. [0019 — Promise KPIs on the Order Funnel data product](docs/docs/adr/0019-promise-kpis-on-order-funnel.md)
+20. [0020 — Network-originated demand: release-on-allocation, deadline feasibility, Network promise basis](docs/docs/adr/0020-network-originated-demand-hold-and-deadline-feasibility.md)
 
 ## License
 

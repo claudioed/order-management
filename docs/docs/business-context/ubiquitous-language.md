@@ -69,12 +69,35 @@ automatically right after a successful allocation pass inside
 
 ### Promise date
 
-Computed at allocation time by a domain policy function using a
-configurable per-path lead time (no live carrier integration exists —
-intentionally simple, but real code with real tests, never a stub or
-hardcoded field).
+Computed at allocation time by `PromisePolicy` as a CPT window (the
+cutoff the order's work must make to leave the building) derived from
+process-path capability, the site CPT schedule and wes-work-planning path
+capacity — per shipment group when partial shipment is allowed. Its
+`PromiseBasis` says which policy produced it: `Capability`, `LeadTime`
+(the configurable per-path fallback when those caches are unavailable), or
+`Network` (a window chosen to meet a caller's `requiredShipBy` deadline).
+No live carrier integration exists.
 
-*Code:* `internal/domain/order.LeadTimePolicy`
+*Code:* `internal/domain/order.PromisePolicy`, `order.LeadTimePolicy`,
+`order.PromiseBasis`
+
+### Held order
+
+An order received with `releaseOnAllocation: false`: it allocates and then
+waits for `POST /orders/{id}/release` (or a cancel). Not a status — a held
+order reads `Allocated` until released. Introduced for network-originated
+demand ([ADR 0020](/docs/adr/0020-network-originated-demand-hold-and-deadline-feasibility)).
+
+*Code:* `order.Order.ReleaseOnAllocation`, `usecases.ReleaseHeldOrder`
+
+### Re-promise
+
+Recomputing an already-released line's shipment-group promise after
+fulfillment-execution reports a missed CPT or a manifested package;
+raises `OrderRepromised` if it moved
+([ADR 0018](/docs/adr/0018-repromise-order-consumer-and-order-repromised)).
+
+*Code:* `usecases.RepromiseOrder`
 
 ### Backordered
 
@@ -133,7 +156,7 @@ the full transition diagram is on the
 | Word | Here (Order Management) | Elsewhere |
 | --- | --- | --- |
 | **Reservation** | *not modelled* — only a `ReservationId` reference is held | `inventory-storage`: the aggregate itself, a revocable binding of quantity to demand |
-| **Release** | `ReleaseOrder` — enqueuing allocated lines as work units | `wes-work-planning`: the act of accepting and scheduling a `WorkUnit` |
+| **Release** | marking allocated lines `Released` and announcing them as `OrderAllocated`/`OrderPartiallyAllocated` on Kafka (inside `allocateAndRelease`, or `ReleaseHeldOrder` for a held order) | `wes-work-planning`: the act of accepting and scheduling a `WorkUnit` |
 | **Status** | order-level, always derived from line statuses | `inventory-storage`'s `Reservation.Status` (`ACTIVE`/`CONFIRMED`/`REVOKED`/`EXPIRED`) is a completely different state machine on a completely different aggregate |
 | **Order reference string** | this context's real `OrderId` | previously: `demandRef` on inventory-storage's `Reservation`, `reference` on wes-work-planning's `WorkUnit`, `Reference` on fulfillment-execution's `Task` — three independently-reinvented strings this context now supplies as one real identity |
 
