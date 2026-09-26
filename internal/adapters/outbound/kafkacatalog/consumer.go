@@ -309,6 +309,29 @@ func (c *Consumer) Eligibility(pathID shared.PathId) (shared.Eligibility, bool) 
 	return def.Eligibility, true
 }
 
+// ListActive satisfies ports.ProcessPathCatalogue (ADR-0021): it
+// snapshots every path currently in this consumer's in-memory cache.
+// Deactivated paths are already absent from c.paths (applyDeactivated
+// deletes them), so every entry returned here is, by construction,
+// active. An empty or not-yet-ready cache returns an empty slice, never
+// an error — the same "missing data fails open" convention as
+// IsActive/CycleTimeP95/Eligibility.
+func (c *Consumer) ListActive() []shared.ActivePathCandidate {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := make([]shared.ActivePathCandidate, 0, len(c.paths))
+	for _, d := range c.paths {
+		out = append(out, shared.ActivePathCandidate{
+			PathId:         shared.PathId(d.Id),
+			CycleTimeP95:   d.CycleTimeP95,
+			CycleTimeKnown: d.CycleTimeKnown,
+			Eligibility:    d.Eligibility,
+		})
+	}
+	return out
+}
+
 // lookup resolves pathID against a fresh processpath.Catalogue built
 // from the current in-memory snapshot, so IsActive/CycleTimeP95/
 // Eligibility all share exactly the same matching semantics and can

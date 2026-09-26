@@ -200,6 +200,20 @@
 
 Other ADR-adjacent facts worth knowing without opening every file:
 
+- **0021 — ACCEPTED: multi-path attribute-driven routing, closing ADR-0013's
+  original deferral and ADR-0016 §4's named limitation.** `ports.ProcessPathCatalogue`
+  gains `ListActive() []shared.ActivePathCandidate`; `kafkacatalog.Consumer`
+  implements it directly from its existing in-memory cache (no new wire
+  decoding). `order.PathSelectionPolicy.Select` now enumerates every
+  currently active path, filters to the ones whose declared `Eligibility`
+  admits the line, and picks the shortest KNOWN `CycleTimeP95` among them
+  (ADR-0014 §4's original rule); ties break on the lower `PathId` for
+  determinism. A line ADR-0016 would have rejected outright (ineligible
+  for `shared.DefaultPathId`, no other candidate reachable) now routes to
+  a genuinely different active path when one exists and admits it. Nil
+  catalogue or an empty `ListActive()` still fails OPEN to
+  `shared.DefaultPathId`, exactly ADR-0013's original floor.
+
 - Gateway API `HTTPRoute` chart template exists (`charts/order-management`
   `values.yaml` `gatewayApi:` block, `enabled: false` by default) —
   it is not itself the subject of a numbered ADR in this list; check the

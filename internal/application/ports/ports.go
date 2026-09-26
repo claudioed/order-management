@@ -139,6 +139,21 @@ type ProcessPathCatalogue interface {
 	// it is made available now so step B (eligibility-driven
 	// PathSelectionPolicy) does not need another catalogue widening.
 	Eligibility(pathId shared.PathId) (shared.Eligibility, bool)
+
+	// ListActive returns every currently active path this catalogue
+	// knows about (ADR-0021), so order.PathSelectionPolicy can enumerate
+	// and rank candidates instead of only ever evaluating one hardcoded
+	// id. Order is unspecified — callers needing a deterministic pick
+	// must sort themselves. A source with an empty or not-yet-ready
+	// cache returns an empty slice, never an error, matching this port's
+	// existing "missing data fails open" convention. Returns the
+	// domain's own shared.ActivePathCandidate (rather than a
+	// ports-local type) so this method's return type is structurally
+	// identical to order.EligibilitySource.ListActive's — required for
+	// this adapter to satisfy that domain-owned interface directly, the
+	// same pattern PromisePolicy's CapabilitySource/ScheduleSource/
+	// CapacitySource already rely on.
+	ListActive() []shared.ActivePathCandidate
 }
 
 // CPTScheduleCache is the read-only outbound port for
