@@ -168,7 +168,7 @@
 20. **0020 — ACCEPTED: network-originated demand — release-on-allocation,
     deadline feasibility, and the `Network` promise basis.** Companion to
     `network-fulfillment` ADR 0001 (the bounded context that speaks
-    Amazon's Selling Partner API and owns the 24h acknowledgement clock);
+    a major e-commerce retailer's Selling Partner API and owns the 24h acknowledgement clock);
     neither is meaningful alone. Three additive capabilities here: (a) an
     optional `releaseOnAllocation` intake flag, DEFAULT `true` so every
     existing caller is byte-identical — `false` stops the ADR-0005 folded
@@ -187,7 +187,7 @@
     a whole-order accept/reject can send one). Hold state is deliberately
     "allocated, not released" — NOT a new `Held` status — so ADR 0004's
     cancellation boundary stays intact and rejection cancels cleanly.
-    Amazon/PO/ASIN/acknowledgement vocabulary and customer PII are
+    a major e-commerce retailer's PO/ASIN/acknowledgement vocabulary and customer PII are
     explicitly OUT: they live in `network-fulfillment`, and `arch-go`
     cannot catch a vocabulary leak — that check is human. Known gap
     recorded: nothing here sweeps an orphaned hold, which sits on real

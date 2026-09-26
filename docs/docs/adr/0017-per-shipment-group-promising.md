@@ -313,7 +313,7 @@ promise identity is not yet scheduled).
 **Easier**
 
 - `AllowPartialShipment=true` orders now get the real per-shipment
-  promise behaviour ADR 0014 always intended — the Amazon-style "two
+  promise behaviour ADR 0014 always intended — the e-commerce-retailer-style "two
   dates for a book and a bag of dog food" behaviour is finally live, not
   just documented as a future step.
 - `PromiseGroups()` is the new full-fidelity source of truth for any

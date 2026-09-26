@@ -56,7 +56,7 @@ fidelity gap in the fleet:
    read model.
 
 The products this service has used as its bar (Manhattan Active OM,
-Salesforce OMS, Amazon's order platform) all treat promise calculation
+Salesforce OMS, a major e-commerce retailer's order platform) all treat promise calculation
 as first-class domain logic fed by fulfillment capability. ADR 0013
 already recorded that standard; this ADR applies it to the promise
 itself.
@@ -97,7 +97,7 @@ so the domain stays free of Kafka and HTTP:
   Until wes-work-planning publishes capacity this port has one
   implementation, `unknown`, which always reports `known=false`.
 
-The rule, per shipment group (see §3), is the Amazon rule stated
+The rule, per shipment group (see §3), is a major e-commerce retailer's rule stated
 plainly: **the earliest cutoff that every line in the group can make.**
 A line can make a cutoff when (a) its path is in the cutoff's
 `eligiblePathIds`, (b) `now + cycleTimeP95 <= cutoffAt`, and (c) either

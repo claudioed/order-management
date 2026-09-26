@@ -14,7 +14,7 @@ Accepted.
 
 ## Context
 
-This platform's process-path reference material (the Amazon-fulfillment
+This platform's process-path reference material (the e-commerce-fulfillment
 DDD analysis this fleet's WES tier is modelled against) draws a sharp
 distinction between two things that look similar on the surface:
 
