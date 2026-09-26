@@ -168,7 +168,7 @@
 20. **0020 — ACCEPTED: network-originated demand — release-on-allocation,
     deadline feasibility, and the `Network` promise basis.** Companion to
     `network-fulfillment` ADR 0001 (the bounded context that speaks
-    Amazon's Selling Partner API and owns the 24h acknowledgement clock);
+    a major e-commerce retailer's Selling Partner API and owns the 24h acknowledgement clock);
     neither is meaningful alone. Three additive capabilities here: (a) an
     optional `releaseOnAllocation` intake flag, DEFAULT `true` so every
     existing caller is byte-identical — `false` stops the ADR-0005 folded
@@ -187,7 +187,7 @@
     a whole-order accept/reject can send one). Hold state is deliberately
     "allocated, not released" — NOT a new `Held` status — so ADR 0004's
     cancellation boundary stays intact and rejection cancels cleanly.
-    Amazon/PO/ASIN/acknowledgement vocabulary and customer PII are
+    a major e-commerce retailer's PO/ASIN/acknowledgement vocabulary and customer PII are
     explicitly OUT: they live in `network-fulfillment`, and `arch-go`
     cannot catch a vocabulary leak — that check is human. Known gap
     recorded: nothing here sweeps an orphaned hold, which sits on real
@@ -199,6 +199,20 @@
     `POST /orders`, `POST /orders/{id}/release`, `DELETE /orders/{id}`).
 
 Other ADR-adjacent facts worth knowing without opening every file:
+
+- **0021 — ACCEPTED: multi-path attribute-driven routing, closing ADR-0013's
+  original deferral and ADR-0016 §4's named limitation.** `ports.ProcessPathCatalogue`
+  gains `ListActive() []shared.ActivePathCandidate`; `kafkacatalog.Consumer`
+  implements it directly from its existing in-memory cache (no new wire
+  decoding). `order.PathSelectionPolicy.Select` now enumerates every
+  currently active path, filters to the ones whose declared `Eligibility`
+  admits the line, and picks the shortest KNOWN `CycleTimeP95` among them
+  (ADR-0014 §4's original rule); ties break on the lower `PathId` for
+  determinism. A line ADR-0016 would have rejected outright (ineligible
+  for `shared.DefaultPathId`, no other candidate reachable) now routes to
+  a genuinely different active path when one exists and admits it. Nil
+  catalogue or an empty `ListActive()` still fails OPEN to
+  `shared.DefaultPathId`, exactly ADR-0013's original floor.
 
 - Gateway API `HTTPRoute` chart template exists (`charts/order-management`
   `values.yaml` `gatewayApi:` block, `enabled: false` by default) —

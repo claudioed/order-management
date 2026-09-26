@@ -52,7 +52,7 @@ This also fell short of the products this service's own design
 discussions have used as the target bar. Sourcing/routing decisions,
 split-shipment policy, and promise-date calculation are treated as
 first-class domain logic in Manhattan Active OM, Salesforce OMS, and
-Amazon's own order platform — not hardcoded constants resolved at the
+a major e-commerce retailer's own order platform — not hardcoded constants resolved at the
 adapter boundary.
 
 ## Decision

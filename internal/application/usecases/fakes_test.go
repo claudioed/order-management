@@ -193,6 +193,36 @@ func (c *fakeCatalogue) Eligibility(pathID shared.PathId) (shared.Eligibility, b
 	return e, ok
 }
 
+// ListActive satisfies ports.ProcessPathCatalogue (ADR-0021): every
+// PathId this fake has been told about via eligibility or cycleTimes,
+// minus anything marked inactive. Tests that want PathSelectionPolicy to
+// see more than one active candidate populate eligibility/cycleTimes for
+// more than one PathId.
+func (c *fakeCatalogue) ListActive() []shared.ActivePathCandidate {
+	seen := map[shared.PathId]bool{}
+	for id := range c.eligibility {
+		seen[id] = true
+	}
+	for id := range c.cycleTimes {
+		seen[id] = true
+	}
+
+	out := make([]shared.ActivePathCandidate, 0, len(seen))
+	for id := range seen {
+		if c.inactive[id] {
+			continue
+		}
+		cycleTime, cycleTimeKnown := c.cycleTimes[id]
+		out = append(out, shared.ActivePathCandidate{
+			PathId:         id,
+			CycleTimeP95:   cycleTime,
+			CycleTimeKnown: cycleTimeKnown,
+			Eligibility:    c.eligibility[id],
+		})
+	}
+	return out
+}
+
 // fakeClassificationLookup is a scripted ports.ProductClassificationLookup.
 // By default every SKU reports Known=false (unclassified), matching
 // PermissiveLookup's own behaviour -- tests that want a specific line to

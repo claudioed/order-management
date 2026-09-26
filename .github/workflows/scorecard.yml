@@ -2,7 +2,7 @@ name: OpenSSF Scorecard
 
 on:
   push:
-    branches: [main]
+    branches: [develop]
   schedule:
     # Scorecard measures repo-level supply-chain hygiene (branch protection,
     # signed commits, dependency pinning, etc.) — a weekly cadence is the

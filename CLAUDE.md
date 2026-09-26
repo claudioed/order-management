@@ -12,7 +12,7 @@ and the fleet's shared DDD reference docs at `/Users/claudioed/docs/amazon-fulfi
 and `/Users/claudioed/warehouse-systems-ddd.md`. Honor their ubiquitous
 language and strategic classifications.
 
-Study project — not a production system, not affiliated with Amazon or any
+Study project — not a production system, not affiliated with any real-world
 company (see README.md banner).
 
 ## Project Overview
