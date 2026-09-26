@@ -199,3 +199,73 @@ func TestConsumer_IsActive_UnknownPath_ReturnsFalse(t *testing.T) {
 		t.Fatal("expected an undeclared path id to be inactive")
 	}
 }
+
+// TestConsumer_ListActive_EmptyCache_ReturnsEmptySlice (ADR-0021): a
+// not-yet-populated cache must fail open with an empty slice, never nil
+// treated as an error and never a panic on the caller's range loop.
+func TestConsumer_ListActive_EmptyCache_ReturnsEmptySlice(t *testing.T) {
+	c := newTestConsumer(&fakeReader{}, targetOffsets{})
+	got := c.ListActive()
+	if len(got) != 0 {
+		t.Fatalf("ListActive() = %v, want empty", got)
+	}
+}
+
+// TestConsumer_ListActive_ReturnsEveryUpsertedPath (ADR-0021): every path
+// upserted via ProcessPathCreated/Updated is enumerable, carrying the
+// same CycleTimeP95/Eligibility IsActive/CycleTimeP95/Eligibility would
+// each report individually for that id.
+func TestConsumer_ListActive_ReturnsEveryUpsertedPath(t *testing.T) {
+	c := newTestConsumer(&fakeReader{}, targetOffsets{})
+
+	if err := c.handle(envelopeMsg(t, 0, 0, eventTypeCreated, pathData{
+		PathId: "PICK", MatchPrefix: "pick", CycleTimeP95: "30m0s",
+		Eligibility: &eligibilityData{},
+	})); err != nil {
+		t.Fatalf("handle PICK: %v", err)
+	}
+	if err := c.handle(envelopeMsg(t, 0, 1, eventTypeCreated, pathData{
+		PathId: "SINGLES", MatchPrefix: "singles", CycleTimeP95: "10m0s",
+		Eligibility: &eligibilityData{},
+	})); err != nil {
+		t.Fatalf("handle SINGLES: %v", err)
+	}
+
+	got := c.ListActive()
+	if len(got) != 2 {
+		t.Fatalf("ListActive() returned %d entries, want 2: %+v", len(got), got)
+	}
+	byID := map[shared.PathId]shared.ActivePathCandidate{}
+	for _, a := range got {
+		byID[a.PathId] = a
+	}
+	pick, ok := byID["PICK"]
+	if !ok || !pick.CycleTimeKnown || pick.CycleTimeP95 != 30*time.Minute {
+		t.Fatalf("ListActive() PICK entry = %+v, want cycleTime=30m known=true", pick)
+	}
+	singles, ok := byID["SINGLES"]
+	if !ok || !singles.CycleTimeKnown || singles.CycleTimeP95 != 10*time.Minute {
+		t.Fatalf("ListActive() SINGLES entry = %+v, want cycleTime=10m known=true", singles)
+	}
+}
+
+// TestConsumer_ListActive_DeactivatedPath_IsExcluded (ADR-0021): a
+// deactivated path must disappear from ListActive, the same as it already
+// disappears from IsActive/CycleTimeP95/Eligibility.
+func TestConsumer_ListActive_DeactivatedPath_IsExcluded(t *testing.T) {
+	c := newTestConsumer(&fakeReader{}, targetOffsets{})
+
+	if err := c.handle(envelopeMsg(t, 0, 0, eventTypeCreated, pathData{
+		PathId: "PICK", MatchPrefix: "pick", CycleTimeP95: "30m0s",
+		Eligibility: &eligibilityData{},
+	})); err != nil {
+		t.Fatalf("handle create: %v", err)
+	}
+	if err := c.handle(envelopeMsg(t, 0, 1, eventTypeDeactivated, pathData{PathId: "PICK"})); err != nil {
+		t.Fatalf("handle deactivate: %v", err)
+	}
+
+	if got := c.ListActive(); len(got) != 0 {
+		t.Fatalf("ListActive() = %v, want empty after deactivation", got)
+	}
+}

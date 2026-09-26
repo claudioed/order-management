@@ -1,19 +1,27 @@
 package order
 
-import "github.com/claudioed/order-management/internal/domain/shared"
+import (
+	"sort"
 
-// EligibilitySource is the minimal catalogue question PathSelectionPolicy
-// needs: a path's declared Eligibility rule. Any adapter satisfying
+	"github.com/claudioed/order-management/internal/domain/shared"
+)
+
+// EligibilitySource is the catalogue question PathSelectionPolicy needs:
+// a path's declared Eligibility rule (single-id, kept for callers that
+// only need that), plus ListActive (ADR-0021) so this policy can
+// enumerate every currently active path rather than only ever evaluating
+// one hardcoded candidate. Any adapter satisfying
 // ports.ProcessPathCatalogue's superset of methods satisfies this
 // narrower domain-owned interface automatically (Go's structural
 // interface-to-interface assignability), exactly the pattern
 // PromisePolicy's CapabilitySource/ScheduleSource/CapacitySource already
-// use -- no adapter code needs to know this type exists. A nil
-// EligibilitySource is a legal, tested value (the catalogue is not yet
-// wired -- see ReceiveOrder's Catalogue field doc comment): Select then
-// falls back to today's behaviour, exactly ADR-0013's default.
+// use — no adapter code needs to know this type exists. A nil
+// EligibilitySource, or one whose ListActive returns nothing, is a
+// legal, tested value: Select then falls back to today's behaviour,
+// exactly ADR-0013's original floor.
 type EligibilitySource interface {
 	Eligibility(pathID shared.PathId) (shared.Eligibility, bool)
+	ListActive() []shared.ActivePathCandidate
 }
 
 // PathSelectionPolicy decides which wes-work-planning process path an
@@ -21,28 +29,23 @@ type EligibilitySource interface {
 // intake (SKU, Quantity, GiftWrap) and the line's derived product
 // attributes (e.g. "hazmat", "fragile", looked up via the fleet's
 // product-classification sync edge -- see ReceiveOrder), evaluated
-// against a candidate path's declared Eligibility. It is a pure domain
-// policy: no I/O of its own. The application layer (ReceiveOrder)
-// performs the classification lookup and passes plain values in, and
-// supplies the EligibilitySource so this type never touches Kafka/HTTP.
+// against every currently active path's declared Eligibility. It is a
+// pure domain policy: no I/O of its own. The application layer
+// (ReceiveOrder) performs the classification lookup and passes plain
+// values in, and supplies the EligibilitySource so this type never
+// touches Kafka/HTTP.
 //
-// ADR-0013 shipped v1 with exactly one rule ("every line resolves to
-// shared.DefaultPathId") and deliberately deferred attribute-driven
-// routing until real eligibility data existed. ADR-0016 (step B of
-// ADR-0014) is that phase: this type now actually evaluates Eligibility
-// rather than ignoring its inputs. What it does NOT do -- and this is a
-// documented, honest v1 limitation, not an oversight -- is choose AMONG
-// multiple real paths: ports.ProcessPathCatalogue has no "list every
-// known path" method today, so there is no way for this policy to
-// discover a genuinely different, eligible alternative when
-// shared.DefaultPathId's own Eligibility rejects a line. See ADR-0016's
-// Consequences section for what a real multi-path routing decision would
-// need. Given that constraint, the honest v1 rule is: evaluate the one
-// candidate this service can reach (shared.DefaultPathId) against the
-// line's attributes, and report whether it is eligible at all --
-// ReceiveOrder turns an ineligible result into a caller-facing rejection
-// (shared.ErrLineIneligibleForResolvedPath) rather than silently routing
-// a hazmat line onto a path whose Eligibility explicitly excludes it.
+// History: ADR-0013 shipped v1 with exactly one rule ("every line
+// resolves to shared.DefaultPathId") and deliberately deferred
+// attribute-driven routing until real eligibility data existed. ADR-0016
+// (step B of ADR-0014) made this type evaluate Eligibility for real, but
+// only against that one hardcoded candidate -- it had no way to discover
+// a genuinely different, eligible alternative when DefaultPathId's own
+// Eligibility rejected a line, a limitation ADR-0016 §4 documented
+// explicitly. ADR-0021 closes that gap: EligibilitySource.ListActive
+// gives this policy every currently active path, so it can filter to the
+// eligible subset and pick the best one, rather than reject a line the
+// fleet's real catalogue could actually carry on some other path.
 type PathSelectionPolicy struct{}
 
 // giftWrapAttribute is the product-attribute-vocabulary string this
@@ -60,27 +63,34 @@ const giftWrapAttribute = "giftWrap"
 // accepted for symmetry with ADR-0013's original signature and so a
 // future rule keyed directly on SKU needs no signature change again).
 //
-// catalogue is consulted for shared.DefaultPathId's declared Eligibility.
-// A nil catalogue, or a catalogue that does not (yet) know
-// DefaultPathId's eligibility, fails OPEN to today's ADR-0013 behaviour
-// (ok=true, shared.DefaultPathId) -- missing catalogue data is a "not yet
-// wired" state, never a rejection trigger, matching this fleet's
-// established convention for a read-only membership/eligibility check.
+// catalogue is consulted via ListActive (ADR-0021) for every currently
+// active path's declared Eligibility and CycleTimeP95. A nil catalogue,
+// or one whose ListActive() returns no candidates, fails OPEN to
+// shared.DefaultPathId (ok=true) -- missing catalogue data is a
+// "not yet wired" state, never a rejection trigger, matching this
+// fleet's established convention for a read-only membership/eligibility
+// check.
 //
-// ok=false means: this line's own attributes are not eligible for
-// shared.DefaultPathId, and this policy has no other real path to
-// consider (see the type doc comment's honest v1 limitation). The
-// returned PathId is the zero value in that case; callers must not use
-// it.
+// Among the candidates the line is eligible for, this policy picks the
+// one with the shortest KNOWN CycleTimeP95 (ADR-0014 §4's original
+// rule); a candidate whose cycle time is not yet known sorts after every
+// candidate with a known one, but remains pickable if it is the only
+// eligible candidate. Ties (identical known cycle time, or all
+// candidates cycle-time-unknown) break on the lower PathId, so the same
+// inputs against an unchanged catalogue always resolve the same way.
+//
+// ok=false means: no currently active path's declared Eligibility admits
+// this line. The returned PathId is the zero value in that case; callers
+// must not use it.
 func (PathSelectionPolicy) Select(sku shared.SKU, quantity int, giftWrap bool, productAttributes []string, catalogue EligibilitySource) (shared.PathId, bool) {
-	_ = sku // accepted for signature symmetry/future use; v1's rule does not key on it directly
+	_ = sku // accepted for signature symmetry/future use; this rule does not key on it directly
 
 	if catalogue == nil {
 		return shared.DefaultPathId, true
 	}
 
-	eligibility, known := catalogue.Eligibility(shared.DefaultPathId)
-	if !known {
+	candidates := catalogue.ListActive()
+	if len(candidates) == 0 {
 		return shared.DefaultPathId, true
 	}
 
@@ -89,10 +99,28 @@ func (PathSelectionPolicy) Select(sku shared.SKU, quantity int, giftWrap bool, p
 		attributes = append(append([]string(nil), productAttributes...), giftWrapAttribute)
 	}
 
-	if !lineEligible(eligibility, quantity, attributes) {
+	eligible := make([]shared.ActivePathCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		if lineEligible(c.Eligibility, quantity, attributes) {
+			eligible = append(eligible, c)
+		}
+	}
+	if len(eligible) == 0 {
 		return "", false
 	}
-	return shared.DefaultPathId, true
+
+	sort.Slice(eligible, func(i, j int) bool {
+		a, b := eligible[i], eligible[j]
+		if a.CycleTimeKnown != b.CycleTimeKnown {
+			// A known cycle time always sorts before an unknown one.
+			return a.CycleTimeKnown
+		}
+		if a.CycleTimeKnown && a.CycleTimeP95 != b.CycleTimeP95 {
+			return a.CycleTimeP95 < b.CycleTimeP95
+		}
+		return a.PathId < b.PathId
+	})
+	return eligible[0].PathId, true
 }
 
 // lineEligible reports whether a line with the given quantity and
