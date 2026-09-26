@@ -92,6 +92,8 @@ func problemFor(err error) problemInfo {
 
 	case errors.Is(err, shared.ErrNonPositiveQuantity):
 		return problemInfo{"non-positive-quantity", "Quantity must be greater than zero"}
+	case errors.Is(err, order.ErrHeldOrderMustBeShipComplete):
+		return problemInfo{"held-order-must-be-ship-complete", "A held order (releaseOnAllocation=false) must be ship-complete"}
 
 	case errors.Is(err, order.ErrOrderAlreadyReleased):
 		return problemInfo{"order-already-released", "Order already has released lines and can no longer be cancelled"}

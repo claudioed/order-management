@@ -31,6 +31,12 @@
 // those two wire fields (cycle_time_p95, eligibility). Direct and
 // RequiredCapabilities remain undecoded here — nothing in this service
 // has needed them yet; extend further only when a real feature does.
+//
+// DestinationLocationRole (ADR 0006 in process-path-management) is also
+// decoded, mirroring how WES/FE's own kafkacatalog copies decode Direct:
+// available on the read model for a future consumer, but not yet read by
+// any domain logic here — nothing in this service currently makes a
+// routing decision off it.
 package kafkacatalog
 
 import (
@@ -76,19 +82,25 @@ type envelope struct {
 }
 
 // pathData is the payload shape for all three event types on Topic.
-// PathId, MatchPrefix, CycleTimeP95 and Eligibility are decoded; Direct
-// and RequiredCapabilities are read by WES/FE/WFM's copies of this
-// consumer, not by order-management's (see package doc comment).
+// PathId, MatchPrefix, CycleTimeP95, Eligibility and
+// DestinationLocationRole are decoded; Direct and RequiredCapabilities
+// are read by WES/FE/WFM's copies of this consumer, not by
+// order-management's (see package doc comment).
 //
 // CycleTimeP95 is the wire's time.Duration.String() form (e.g.
 // "45m0s"), parsed with time.ParseDuration. Eligibility is nil ONLY on a
 // ProcessPathDeactivated event; present (possibly all-empty) on
-// Created/Updated.
+// Created/Updated. DestinationLocationRole is omitted on the wire (the
+// Go zero value "") both on a Deactivated event and on any path that
+// never declared a destination role — both cases decode identically to
+// the empty string, which is exactly process-path-management's own
+// "unset" value (shared.DestinationLocationRoleUnset there).
 type pathData struct {
-	PathId       string           `json:"path_id"`
-	MatchPrefix  string           `json:"match_prefix"`
-	CycleTimeP95 string           `json:"cycle_time_p95"`
-	Eligibility  *eligibilityData `json:"eligibility"`
+	PathId                  string           `json:"path_id"`
+	MatchPrefix             string           `json:"match_prefix"`
+	CycleTimeP95            string           `json:"cycle_time_p95"`
+	Eligibility             *eligibilityData `json:"eligibility"`
+	DestinationLocationRole string           `json:"destination_location_role"`
 }
 
 // eligibilityData is the wire shape of process-path-management's
@@ -422,11 +434,12 @@ func (c *Consumer) applyUpsert(data pathData) {
 	cycleTime, cycleTimeKnown := parseCycleTime(data.CycleTimeP95, data.PathId, c.Logger)
 
 	c.paths[strings.ToUpper(data.PathId)] = processpath.PathDefinition{
-		Id:             data.PathId,
-		MatchPrefix:    data.MatchPrefix,
-		CycleTimeP95:   cycleTime,
-		CycleTimeKnown: cycleTimeKnown,
-		Eligibility:    data.Eligibility.toShared(),
+		Id:                      data.PathId,
+		MatchPrefix:             data.MatchPrefix,
+		CycleTimeP95:            cycleTime,
+		CycleTimeKnown:          cycleTimeKnown,
+		Eligibility:             data.Eligibility.toShared(),
+		DestinationLocationRole: data.DestinationLocationRole,
 	}
 }
 
