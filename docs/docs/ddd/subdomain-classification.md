@@ -46,18 +46,22 @@ proxy.
 
 - **Build enough, not everything.** The orchestration rules (BR2/BR3/BR6)
   are implemented as explicit, tested domain code — they are not
-  commodity. But the *promise-date calculation* is deliberately simple (a
-  configurable static lead time, not a live carrier-rate integration),
-  because that piece genuinely is commodity and does not differentiate
-  this platform.
+  commodity. The promise stops at the building's door: a CPT window
+  derived from fulfillment capability
+  ([ADR 0014](/docs/adr/0014-promise-derived-from-fulfillment-capability)),
+  with a configurable lead time as fallback — there is no live
+  carrier-rate or transit-time integration, because that piece genuinely
+  is commodity and does not differentiate this platform.
 - **No local ownership of Supplier state.** Because this is not a Core
   subdomain claiming inventory or work-planning truth for itself, it holds
   only the references it needs (`ReservationId`) and calls out to the
   Core subdomains that actually own that truth.
-- **Real quality bar, scoped v1.** `lint`/`test` CI jobs, 90% coverage on
-  domain + application, and failing-path tests per named invariant — but
-  no mutation-testing gate, no BDD suite, no arch-go fitness tests yet
-  (all explicitly deferred, see the README).
+- **Real quality bar.** 90% coverage on domain + application,
+  failing-path tests per named invariant, a godog BDD suite, a gremlins
+  mutation gate on the domain (thresholds in `.gremlins.yaml`, below the
+  fleet's 99/99 target), and architecture fitness tests
+  (`internal/architecture`) — see
+  [Architecture](/docs/overview/architecture#quality-gates).
 
 ## Where the neighbours sit
 
@@ -99,5 +103,6 @@ machines on different aggregates. See the
 the full list of terms that mean something different across this
 boundary. The practical enforcement is that this repository shares **no
 Go types** with any sibling repository — integration happens entirely
-through HTTP JSON, never through an imported package (see
+through HTTP JSON and Kafka event payloads decoded into local structs,
+never through an imported package (see
 [ADR 0002](/docs/adr/0002-http-consumer-of-inventory-and-wes-not-shared-code)).

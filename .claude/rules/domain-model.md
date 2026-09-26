@@ -3,7 +3,11 @@
 ## Ubiquitous Language (use these exact names)
 
 - **Order** — the aggregate root. `OrderId`, `OrderLine[]`,
-  `AllowPartialShipment bool`, `Status`, `PromiseDate *time.Time`.
+  `AllowPartialShipment bool`, `Status`, the promise (`PromiseDate`,
+  `PromiseCptId`, `PromiseBasis`, and per-shipment-group
+  `PromiseGroups []PromiseGroup` — ADR-0014/0017), plus ADR-0020's
+  `ReleaseOnAllocation()` (stored inversely as `heldAtIntake`) and
+  optional `RequiredShipBy *time.Time`.
 - **OrderLine** — `SKU`, `Quantity`, `PathId` (internal-only default
   `"pick"` since ADR-0005 — never caller-settable, see below), `GiftWrap
   bool`, `LineStatus` (`Pending`/`Allocated`/`Backordered`/`Released`/
@@ -22,10 +26,21 @@
 - **Release** — since ADR-0005, announcing an allocated line as released
   work via a Kafka integration event, NOT a synchronous call.
   `wes-work-planning`'s own consumer reacts independently.
-- **Promise date** — computed at allocation time by a domain policy
-  function (`LeadTimePolicy`) using a configurable per-path lead time (no
-  live carrier integration exists — intentionally simple, but real code
-  with real tests, never a stub/hardcoded field).
+- **Promise** — computed at allocation time by `order.PromisePolicy`
+  (ADR-0014): a CPT window derived from process-path capability
+  (cycle time, eligibility, site CPT schedule) and wes-work-planning path
+  capacity, `PromiseBasis=Capability`. When those caches are cold or
+  `PATH_CATALOGUE_SOURCE=none`, it falls back to `LeadTimePolicy`
+  (configurable per-path lead time, `PromiseBasis=LeadTime`). With
+  `AllowPartialShipment=true` lines are promised per shipment group
+  (ADR-0017). An order with `RequiredShipBy` uses
+  `PromisePolicy.FeasibleBy` instead — the LATEST window at or before the
+  deadline, `PromiseBasis=Network`, and NO promise (never a lead-time
+  fallback) when the deadline cannot be met (ADR-0020).
+- **Hold** (ADR-0020) — `releaseOnAllocation=false` at intake: the order
+  allocates and stops ("allocated, not released" — deliberately NOT a new
+  status), until `ReleaseHeldOrder` commits it. A held order must be
+  ship-complete (`ErrHeldOrderMustBeShipComplete`).
 - **Backordered** — a line-level state set when inventory-storage's
   `POST /reservations` returns 409 (insufficient usable stock). This is a
   BUSINESS FACT, distinct from a transport/5xx error, which is NOT a
@@ -68,14 +83,15 @@
   `Released`, v1 does NOT claw back released work — a documented,
   deliberate known gap (ADR-0004), not an oversight.
 
-## Domain events (past tense, 9 total — `internal/domain/shared/events.go`)
+## Domain events (past tense, 10 total — `internal/domain/shared/events.go`)
 
 `ports.EventPublisher` has two real implementations selected by
 `EVENT_PUBLISHER` (env, default `log`):
 
 - **`log`**: every event logged as JSON, in-process only.
-- **`kafka`**: same local behavior PLUS `OrderAllocated` and
-  `OrderPartiallyAllocated` forwarded to the integration topic
+- **`kafka`**: same local behavior PLUS `OrderAllocated`,
+  `OrderPartiallyAllocated` and `OrderRepromised` forwarded to the
+  integration topic
   `warehouse.order-management.events`, and the full analytics-relevant
   event set fanned to `warehouse.order-management.analytics` (ADR-0006).
 
@@ -90,22 +106,25 @@
 | `OrderLineReleased` | A line transitioned to `Released` | No |
 | `OrderReleased` | Every line on the order released | No |
 | `OrderCancelled` | `CancelOrder` succeeds | No |
+| `OrderRepromised` | `RepromiseOrder` (ADR-0018) finds a shipment group's promise moved after an inbound `TaskCPTMissed`/`PackageManifested` | **Yes** — `{cpt_id_old, cpt_id_new, reason}` |
 
-Only 2 of the 9 are integration events, mirroring `inventory-storage`'s own
-precedent of forwarding a minimal subset. All 9 are analytics-relevant and
-fanned to the analytics topic when `EVENT_PUBLISHER=kafka` (see
-`api-contracts.md`).
+Only 3 of the 10 are integration events, mirroring `inventory-storage`'s own
+precedent of forwarding a minimal subset. All 10 are fanned to the
+analytics topic when `EVENT_PUBLISHER=kafka` (see `api-contracts.md`).
 
 ## Use cases (application layer) — folded flow since ADR-0005
 
-1. **`ReceiveOrder(lines[], allowPartialShipment)`** → validates lines,
-   mints `OrderId`, persists `Received`, publishes `OrderReceived`
-   unconditionally. **Immediately afterward, in the SAME call**, attempts
+1. **`ReceiveOrder(lines[], allowPartialShipment, releaseOnAllocation,
+   requiredShipBy)`** → validates lines, resolves each line's path
+   (`PathSelectionPolicy`, ADR-0013/0016 — unknown path 400, ineligible
+   line 422, both before anything persists), mints `OrderId`, persists
+   `Received`, publishes `OrderReceived` unconditionally. **Immediately afterward, in the SAME call**, attempts
    allocation-then-release as a best-effort next step (shared
    `allocateAndRelease` function in `internal/application/usecases/allocation.go`).
    A hard failure in that best-effort step does NOT fail `ReceiveOrder`
    itself — the order genuinely was received; the returned body reflects
-   whatever the pass actually achieved.
+   whatever the pass actually achieved. With `releaseOnAllocation=false`
+   the pass stops after allocation (ADR-0020).
 2. **`RetryAllocation(orderId)`** → re-attempts allocation for `Backordered`
    lines only, then ALSO attempts release in the same call on success. This
    is an explicit, on-purpose recovery action: unlike `ReceiveOrder`'s
@@ -114,6 +133,14 @@ fanned to the analytics topic when `EVENT_PUBLISHER=kafka` (see
    via `DELETE /reservations/{id}`; rejects with `ErrOrderAlreadyReleased`
    if any line is already `Released` (BR6, checked before any revoke call).
 4. **`GetOrder(orderId)`** → current Order state (read).
+5. **`ReleaseHeldOrder(orderId)`** (ADR-0020) → releases a HELD order's
+   allocated lines via `allocateAndRelease`'s release leg (same BR3 gate,
+   same promise recompute, same events). Idempotent for a held order;
+   `ErrOrderNotHeld` (409) for one that was never held.
+6. **`RepromiseOrder`** (ADR-0018) → driven by the inbound Kafka consumer,
+   not HTTP: recomputes the affected line's shipment-group promise and
+   publishes `OrderRepromised` if it moved; idempotent on the inbound
+   `event_id` (`ports.RepromiseProcessedEvents`).
 
 `AllocateOrder` and `ReleaseOrder` no longer exist as public use case
 types — their pure domain-transition logic (`Order.Allocate`,
@@ -127,3 +154,7 @@ unconditionally gets `shared.NewPathIdOrDefault("")`, which resolves to
 `shared.DefaultPathId` (`"pick"`). The response DTO still shows `pathId` on
 every line — callers can see it, never set it. A caller placing an order has
 no business supplying `wes-work-planning`'s internal routing vocabulary.
+Since ADR-0013/0016 the default is validated against the live
+process-path catalogue and its declared eligibility, but it is still the
+only path this policy can select (`ProcessPathCatalogue` has no "list
+active paths" method yet).

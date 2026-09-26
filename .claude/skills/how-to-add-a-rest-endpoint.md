@@ -107,13 +107,18 @@ Add the path to `apis/openapi.yaml` (request/response schemas, the RFC
 7807 problem-detail response for each error case — see the existing
 `/orders/{id}/retry-allocation` entry for the shape).
 
-Regenerate the Docusaurus REST reference — this repo's `docs-api-drift`
-CI job (`.github/workflows/ci.yml`) fails the PR if you skip this:
+Regenerate the Docusaurus REST reference. Do it by hand: the
+`docs-api-drift` CI job is meant to catch a skipped regen but currently
+diffs the wrong path and always passes (see `ci-quality-gates.md`) — that
+is how `releaseHeldOrder` shipped without a generated page. Clean first;
+a plain `gen-api-docs` will not add a new operation to the committed
+`sidebar.ts`:
 
 ```bash
 cd docs
 npm ci
-npm run gen-api-docs   # docusaurus gen-api-docs order
+npm run clean-api-docs order && npm run gen-api-docs order
+npm run build          # onBrokenLinks: 'throw'
 ```
 
 ## 5. Behaviour: add a godog scenario

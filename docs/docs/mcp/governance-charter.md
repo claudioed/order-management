@@ -93,7 +93,17 @@ across clients and **SHOULD** be used rather than leaving procedure implicit.
 
 ## 7. Security & authorization (current posture: no IdP)
 
-Per the MCP inbound-adapter ADR, the current posture for these internal,
+:::warning Not what this repository runs today
+The static-bearer layer described in items 1–4 below was adopted
+([ADR 0011](../adr/0011-adopt-fleet-rest-identity.md)) and then removed
+fleet-wide ([ADR 0012](../adr/0012-remove-rest-mcp-bearer-auth.md)).
+`cmd/mcp` currently serves every tool with **no authentication** and emits
+no per-call audit record (§9); both are unimplemented charter
+requirements, not current behaviour. The server's two tools, `get_order`
+and `get_promise_health`, are both read-only.
+:::
+
+Per the MCP inbound-adapter ADR, the charter's posture for these internal,
 non-user-facing servers:
 
 1. Every request **MUST** be authenticated with a static bearer API key held in

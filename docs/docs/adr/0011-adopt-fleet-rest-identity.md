@@ -10,7 +10,7 @@ description: "order-management adopts warehouse-ops-agent ADR 0005: every REST r
 
 ## Status
 
-**Accepted.** This is an adoption record: the decision itself is the
+**Superseded by [ADR 0012](0012-remove-rest-mcp-bearer-auth.md).** (Originally accepted.) This is an adoption record: the decision itself is the
 fleet-wide [warehouse-ops-agent ADR 0005 — Fleet REST identity: static
 bearer keys with read/read-write scopes, no IdP](https://github.com/claudioed/warehouse-ops-agent/blob/develop/docs/docs/adr/0005-rest-identity-static-bearer-scopes.md).
 Read that for the context, the alternatives (OIDC now, gateway-only auth, a

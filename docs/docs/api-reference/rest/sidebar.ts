@@ -44,6 +44,12 @@ const sidebar: SidebarsConfig = {
       items: [
         {
           type: "doc",
+          id: "api-reference/rest/release-held-order",
+          label: "Release an order held at intake",
+          className: "api-method post",
+        },
+        {
+          type: "doc",
           id: "api-reference/rest/retry-allocation",
           label: "Re-attempt allocation for backordered lines, then release",
           className: "api-method post",

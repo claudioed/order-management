@@ -56,9 +56,10 @@
     (their ADR 0010: `cycleTimeP95`, `eligibility`, site `CPTSchedule`)
     and wes-work-planning capacity; `LeadTimePolicy` stays as the tagged
     fallback (`basis=LeadTime`); per-shipment-group promising when
-    `AllowPartialShipment`; `OrderRepromised` closes the loop. Not
-    implemented yet — read it before touching `promise.go` or
-    `path_selection.go`.
+    `AllowPartialShipment`; `OrderRepromised` closes the loop. Implemented
+    across ADRs 0015-0019 (`order.PromisePolicy` in `promise_policy.go` is
+    the live policy in `cmd/order`) — read it before touching `promise.go`
+    or `path_selection.go`.
 15. **0015 — ACCEPTED: wes-work-planning's PathCapacityChanged wired as
     the real PathCapacity adapter.** Closes ADR-0014 step 3:
     `kafkapathcapacity.Consumer`, a third Kafka consumer (own
@@ -164,8 +165,7 @@
     separate repo/PR. Read the ADR before touching `funnel.go`,
     `ports.go`, `postgres_projection.go`, the analytics Kafka
     consumer/publisher, or `promise_health.go`.
-
-20. **0020 — network-originated demand — release-on-allocation,
+20. **0020 — ACCEPTED: network-originated demand — release-on-allocation,
     deadline feasibility, and the `Network` promise basis.** Companion to
     `network-fulfillment` ADR 0001 (the bounded context that speaks
     Amazon's Selling Partner API and owns the 24h acknowledgement clock);
@@ -191,11 +191,16 @@
     explicitly OUT: they live in `network-fulfillment`, and `arch-go`
     cannot catch a vocabulary leak — that check is human. Known gap
     recorded: nothing here sweeps an orphaned hold, which sits on real
-    inventory reservations.
+    inventory reservations. Shipped: `POST /orders/{id}/release`
+    (`releaseHeldOrder`), `releaseOnAllocation`/`requiredShipBy` on
+    `POST /orders`, `ErrOrderNotHeld` -> 409 `order-not-held`, migrations
+    `0005_release_on_allocation`/`0006_required_ship_by`. The caller is
+    `network-fulfillment` (`internal/adapters/outbound/ordermanagement`:
+    `POST /orders`, `POST /orders/{id}/release`, `DELETE /orders/{id}`).
 
 Other ADR-adjacent facts worth knowing without opening every file:
 
 - Gateway API `HTTPRoute` chart template exists (`charts/order-management`
-  `values.yaml` `gatewayApi:` block) but is additive/disabled by default —
+  `values.yaml` `gatewayApi:` block, `enabled: false` by default) —
   it is not itself the subject of a numbered ADR in this list; check the
   chart's own comments if you need its exact behavior.

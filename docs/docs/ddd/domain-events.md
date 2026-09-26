@@ -6,7 +6,10 @@ description: The past-tense domain events this context raises, and which three a
 
 # Domain Events
 
-Nine past-tense events, raised by the `Order` aggregate (plus
+Ten past-tense events (`internal/domain/shared/events.go`): the nine in
+the catalog below plus the operational-visibility event
+`OrderAllocationPartiallyFailed` (see the end of this page), raised by the
+`Order` aggregate's use cases (plus
 `RepromiseOrder`, a use case that reacts to an inbound event rather than
 an order lifecycle transition). Every event is
 published through `ports.EventPublisher`, which — since
@@ -20,7 +23,10 @@ implementations selected by the `EVENT_PUBLISHER` env var:
   — `OrderRepromised` are ADDITIONALLY
   forwarded to the shared Kafka broker, topic
   `warehouse.order-management.events`, for `wes-work-planning` (or any
-  other subscriber) to consume.
+  other subscriber) to consume. ALL ten events are also fanned out to a
+  separate topic, `warehouse.order-management.analytics`, for the
+  analytics data product
+  ([ADR 0006](/docs/adr/0006-analytical-data-product)).
 
 ```go
 // internal/domain/shared/events.go
@@ -44,7 +50,7 @@ type DomainEvent interface {
 | `OrderCancelled` | `CancelOrder` succeeds, revoking every allocated line's reservation | No — local only |
 | `OrderRepromised` | `RepromiseOrder` (ADR 0018) reacts to a fulfillment-execution `TaskCPTMissed`/`PackageManifested` fact and finds the affected shipment group's promise moved | **Yes** — `{cpt_id_old, cpt_id_new, reason}` payload |
 
-Three of the nine are integration events — mirroring
+Three of them are integration events — mirroring
 `inventory-storage`'s own precedent of forwarding only a subset of its
 several domain events (`StockReserved`, `ReservationRevoked`). The other
 six stay local: `OrderReceived` through `OrderLineBackordered` are
@@ -73,11 +79,22 @@ for the re-promise feedback loop. In short:
   {
     "order_id": "ord-a1b2c3d4-0000-0000-0000-000000000001",
     "promise_date": "2026-08-27T09:00:00Z",
+    "promise_cpt_id": "sp1-1200",
+    "promise_basis": "Capability",
     "lines": [
-      {"line_no": 1, "sku": "SKU-1", "path_id": "pick", "gift_wrap": false}
+      {"line_no": 1, "sku": "SKU-1", "path_id": "pick", "gift_wrap": false,
+       "fulfillment_class": "SINGLE", "promise_cpt_id": "sp1-1200",
+       "promise_basis": "Capability", "promise_cutoff_at": "2026-08-27T12:00:00Z"}
     ]
   }
   ```
+
+  The original four line fields are frozen; everything else is additive
+  and optional — `fulfillment_class`
+  ([ADR 0008](/docs/adr/0008-fulfillment-class-demand-shape-classifier)), the
+  order-level and per-line `promise_cpt_id`/`promise_basis`/
+  `promise_cutoff_at` (ADR 0014/0017; omitted for a `LeadTime`-basis
+  promise). `apis/asyncapi.yaml` is the authoritative schema.
 
 - **`data` shape** for `OrderRepromised` (ADR 0018, additive):
 
@@ -130,10 +147,13 @@ flowchart LR
   AR --> E3["OrderLineBackordered"]
   AR --> E4["OrderAllocated"]
   AR --> E5["OrderPartiallyAllocated"]
+  RH["ReleaseHeldOrder"] --> AR
+  AR --> E6["OrderLineReleased / OrderReleased"]
   CO["CancelOrder"] --> E8["OrderCancelled"]
+  RP["RepromiseOrder"] --> E9["OrderRepromised"]
 
-  E1 & E2 & E3 & E4 & E5 & E8 --> LOG["ports.EventPublisher<br/>log or Postgres (EVENT_PUBLISHER=log, default)"]
-  E4 & E5 --> KAFKA["Kafka topic<br/>warehouse.order-management.events<br/>(EVENT_PUBLISHER=kafka)"]
+  E1 & E2 & E3 & E4 & E5 & E6 & E8 & E9 --> LOG["ports.EventPublisher<br/>log or Postgres (EVENT_PUBLISHER=log, default)"]
+  E4 & E5 & E9 --> KAFKA["Kafka topic<br/>warehouse.order-management.events<br/>(EVENT_PUBLISHER=kafka)"]
 
   classDef local fill:#94a3b8,stroke:#475569,color:#0f172a;
   classDef kafka fill:#38bdf8,stroke:#0369a1,color:#0f172a;
@@ -141,7 +161,7 @@ flowchart LR
   class KAFKA kafka;
 ```
 
-## An operational-visibility event beyond the named eight
+## The operational-visibility event
 
 [ADR 0003](/docs/adr/0003-ship-complete-default-and-fail-closed-allocation)
 documents one further event, `OrderAllocationPartiallyFailed`: raised when

@@ -10,8 +10,9 @@ two values. It is a plain browser client of this service's own REST API —
 nothing in `web/` talks to any other bounded context, and nothing in
 `internal/` knows `web/` exists.
 
-- **v1 scope matches this service's actual 3-endpoint REST surface exactly**
-  (there is no list/search endpoint): a "place order" intake form
+- **v1 scope uses 3 of this service's REST endpoints** (there is no
+  list/search endpoint; retry-allocation and hold/release are not wired
+  into the UI): a "place order" intake form
   (`POST /orders`, rendering the created order's id/status/lines), and a
   "look up / cancel order" panel (`GET /orders/{id}` by id, then
   `DELETE /orders/{id}` when BR6 still permits it — a 409 there is a normal
