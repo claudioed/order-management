@@ -28,10 +28,11 @@ const FeatureList: FeatureItem[] = [
     to: '/docs/ddd/aggregates-and-invariants',
     description: (
       <>
-        <code>AllocateOrder</code> reserves stock per line via
+        The allocation pass inside <code>ReceiveOrder</code> and{' '}
+        <code>RetryAllocation</code> reserves stock per line via
         inventory-storage. Only a <code>409</code> is treated as a
-        backorder — a transport failure or 5xx fails the whole call rather
-        than silently marking a line backordered.
+        backorder — a transport failure or 5xx fails the pass rather than
+        silently marking a line backordered.
       </>
     ),
   },

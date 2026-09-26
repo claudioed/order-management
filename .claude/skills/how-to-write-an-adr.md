@@ -12,7 +12,8 @@ addition inside an already-decided architecture doesn't.
 sequential — check the highest existing number
 (`git ls-tree --name-only origin/develop -- docs/docs/adr/` and pick the
 next integer, never reuse or guess). As of this writing the highest is
-`0017-per-shipment-group-promising.md`, so the next ADR is `0018`.
+`0020-network-originated-demand-hold-and-deadline-feasibility.md`, so the
+next ADR is `0021`.
 `docs/docs/adr/about.md` explains the format to readers; you don't need to
 touch it when adding a new ADR.
 

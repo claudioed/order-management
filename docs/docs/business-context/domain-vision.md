@@ -25,8 +25,9 @@ becomes the upstream context that supplies it to the others.
 
 Order Management owns **Order** and **OrderLine** as first-class,
 validated aggregates: intake, per-line stock allocation (via
-inventory-storage), promise-date calculation, release of allocated work
-(via wes-work-planning), and cancellation up to the release boundary.
+inventory-storage), a capability-derived delivery promise, release of
+allocated work (announced to wes-work-planning over Kafka), and
+cancellation up to the release boundary.
 
 It is the **missing upstream Open Host Service** for the fleet — every
 other service answers "what is happening in the warehouse right now";
@@ -34,14 +35,15 @@ this one answers "what did the customer ask for, and how far along is it."
 
 ## Why fail-closed matters (BR2)
 
-`AllocateOrder` calls inventory-storage's `POST /reservations` once per
+The allocation pass (inside `ReceiveOrder`/`RetryAllocation`) calls
+inventory-storage's `POST /reservations` once per
 line. A `409` response is a **business fact**: inventory-storage has
 authoritatively decided there is not enough usable stock, and the line
 becomes `Backordered`. Anything else — a transport failure, a timeout, a
 5xx — is **not** a business fact. It is an absence of information, and
 treating it as a backorder would silently tell an operator "we are out of
 stock" for goods that may be sitting on the shelf. So the whole
-`AllocateOrder` call fails instead, loudly, and nothing is silently marked
+allocation pass fails instead, loudly, and nothing is silently marked
 backordered.
 
 ## Why ship-complete is the default (BR3)

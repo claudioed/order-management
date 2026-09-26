@@ -34,11 +34,26 @@ lifecycle at OrderLine granularity.
 | `ordersCancelled`           | `OrderCancelled`                   | Orders cancelled before release. Leakage. |
 | `linesAllocated`            | `OrderLineAllocated`               | Order lines reserved against inventory-storage. |
 | `linesBackordered`          | `OrderLineBackordered`             | Order lines with insufficient stock (409). Leakage. |
-| `linesReleased`            | `OrderLineReleased`                | Order lines enqueued as wes-work-planning work. |
+| `linesReleased`            | `OrderLineReleased`                | Order lines released as wes-work-planning work. |
 
-Each metric counts events per `(path_id, hour_bucket)`. Only these funnel-moving
-event types populate the report; any other analytics event is acknowledged and
-ignored.
+Each metric counts events per `(path_id, hour_bucket)`.
+
+### Promise KPIs (ADR 0019)
+
+[ADR 0019](/docs/adr/0019-promise-kpis-on-order-funnel) adds promise-quality
+columns to the same rows:
+
+| Field                       | Source event                                   | Meaning |
+| --------------------------- | ---------------------------------------------- | ------- |
+| `promiseBasisCapability`    | `OrderAllocated` / `OrderPartiallyAllocated`   | Allocations whose promise basis was `Capability`. |
+| `promiseBasisLeadTime`      | `OrderAllocated` / `OrderPartiallyAllocated`   | Allocations whose promise basis was the `LeadTime` fallback. |
+| `ordersSplitShipment`       | `OrderAllocated` / `OrderPartiallyAllocated`   | Allocations whose order had more than one promise group (ADR 0017). |
+| `promiseToCutoffGapSeconds` | `OrderAllocated` / `OrderPartiallyAllocated`   | Mean of (cutoff − allocation time) over Capability-basis promises; `0` when none. |
+| `ordersRepromised`          | `OrderRepromised`                              | Re-promises in the hour. **Not path-dimensioned:** always lands on the `pathId: ""` row. |
+
+Only `Capability` and `LeadTime` are counted as bases; the ADR 0020
+`Network` basis has no column of its own. Any other analytics event type
+is acknowledged and ignored.
 
 ## Path enrichment
 
@@ -75,7 +90,12 @@ Query parameters:
       "ordersCancelled": 1,
       "linesAllocated": 8,
       "linesBackordered": 2,
-      "linesReleased": 6
+      "linesReleased": 6,
+      "promiseBasisCapability": 3,
+      "promiseBasisLeadTime": 1,
+      "ordersRepromised": 0,
+      "ordersSplitShipment": 0,
+      "promiseToCutoffGapSeconds": 5400
     }
   ]
 }

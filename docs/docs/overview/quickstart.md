@@ -33,21 +33,27 @@ boot; there is no separate migrate step to remember.
 
 ### Option C — wired to the real Suppliers
 
-Both outbound clients default to **permissive (no-op) mode**, so tests and
-CI never reach the network. Permissive here does not mean fail-open:
-allocating real stock or releasing real work must never appear to succeed
-against a no-op, so a permissive client refuses the operation with a clear
-`downstream-not-configured` problem response. Only `http` mode is suitable
-for a real integration test or deployment:
+Both inventory-storage clients default to **permissive (no-op) mode**, so
+tests and CI never reach the network. For reservations, permissive does
+not mean fail-open: allocating real stock must never appear to succeed
+against a no-op, so the implicit allocation pass fails with
+`downstream-not-configured` (the order is still received; an explicit
+`retry-allocation` returns 503). Only `http` mode is suitable for a real
+integration test or deployment:
 
 ```bash
 export INVENTORY_STORAGE_MODE=http
 export INVENTORY_STORAGE_BASE_URL=http://localhost:8080
-export WES_WORK_PLANNING_MODE=http
-export WES_WORK_PLANNING_BASE_URL=http://localhost:8081
+export PRODUCT_CLASSIFICATION_MODE=http     # optional, ADR 0016
+export EVENT_PUBLISHER=kafka                # optional: publish release events
+export PATH_CATALOGUE_SOURCE=kafka          # optional: capability-derived promise
+export KAFKA_BROKERS=localhost:9092
 export HTTP_ADDR=:8082
 go run ./cmd/order
 ```
+
+Without `PATH_CATALOGUE_SOURCE=kafka` the promise always comes from the
+`LeadTimePolicy` fallback (`PROMISE_DEFAULT_LEAD_TIME`, default `48h`).
 
 ## Walk the API
 
@@ -58,8 +64,11 @@ curl -s localhost:8080/healthz
 # {"status":"ok"}
 ```
 
-**ReceiveOrder** — `pathId` defaults to `pick`; `allowPartialShipment`
-defaults to `false` (ship-complete):
+**ReceiveOrder** — `allowPartialShipment` defaults to `false`
+(ship-complete). There is no `pathId` in the request: the path is chosen
+by `PathSelectionPolicy` (today always `pick`, ADR 0013/0016). Intake
+runs allocation and release in the same call (ADR 0005), so the response
+already reflects that pass:
 
 ```bash
 curl -s -X POST localhost:8080/orders \
@@ -67,15 +76,21 @@ curl -s -X POST localhost:8080/orders \
   -d '{
         "allowPartialShipment": false,
         "lines": [
-          {"sku": "SKU-1", "quantity": 2, "pathId": "pick"},
+          {"sku": "SKU-1", "quantity": 2},
           {"sku": "SKU-2", "quantity": 1, "giftWrap": true}
         ]
       }'
 # 201 Created, Location: /orders/ord-...
-# {"id":"ord-...","status":"Received","allowPartialShipment":false,
+# {"id":"ord-...","status":"Released","allowPartialShipment":false,
+#  "releaseOnAllocation":true,"promiseDate":"...",
 #  "lines":[{"lineNo":1,"sku":"SKU-1","quantity":2,"pathId":"pick",
-#            "giftWrap":false,"status":"Pending"}, ...]}
+#            "giftWrap":false,"status":"Released","reservationId":"res-..."}, ...]}
 ```
+
+A backordered line is a successful outcome reported in the body, not an
+error. If the allocation pass hits a hard failure (e.g. permissive
+inventory client), the order is still `201` in `Received` with pending
+lines.
 
 **GetOrder:**
 
@@ -84,39 +99,29 @@ ORDER_ID=ord-...   # from the response above
 curl -s localhost:8080/orders/$ORDER_ID
 ```
 
-**AllocateOrder** — reserves each pending line against inventory-storage. A
-backordered line is a successful outcome reported in the body, not an
-error:
-
-```bash
-curl -s -X POST localhost:8080/orders/$ORDER_ID/allocate
-# 200 OK
-# {"id":"ord-...","status":"Allocated","promiseDate":"2026-08-27T09:00:00Z",
-#  "lines":[{"lineNo":1,...,"status":"Allocated","reservationId":"res-..."}, ...]}
-```
-
-**RetryAllocation** — re-attempts the backordered lines and only those:
+**RetryAllocation** — re-attempts the backordered lines and only those,
+releasing whatever becomes releasable:
 
 ```bash
 curl -s -X POST localhost:8080/orders/$ORDER_ID/retry-allocation
 ```
 
-**ReleaseOrder** — enqueues each allocated line as work on its process
-path:
+**Held order + ReleaseHeldOrder** (ADR 0020) — `releaseOnAllocation:
+false` allocates and stops; `requiredShipBy` constrains the promise to a
+window that meets the deadline (no `promiseDate` in the response means the
+deadline cannot be met):
 
 ```bash
-curl -s -X POST localhost:8080/orders/$ORDER_ID/release
-# 200 OK — status becomes Released (or PartiallyReleased)
-```
+curl -s -X POST localhost:8080/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"releaseOnAllocation": false,
+       "requiredShipBy": "2026-10-01T18:00:00Z",
+       "lines": [{"sku": "SKU-1", "quantity": 1}]}'
 
-Blocked by BR3 while a ship-complete order still has an unallocated line:
-
-```bash
 curl -s -X POST localhost:8080/orders/$ORDER_ID/release
-# 409 Conflict, application/problem+json
-# {"type":"https://errors.order-management.warehouse-systems.dev/ship-complete-blocked",
-#  "title":"Ship-complete order cannot be released while any line is unallocated",
-#  "status":409,"detail":"...","instance":"/orders/ord-.../release"}
+# 200 OK — the allocated lines are released
+# 409 order-not-held if the order was never held;
+# 409 ship-complete-blocked while a line is still unallocated (BR3)
 ```
 
 **CancelOrder** — revokes every allocated line's reservation, then

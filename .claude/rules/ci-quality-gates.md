@@ -12,9 +12,14 @@
   suite, `features/*.feature`).
 - **`integration`** — `go build/vet -tags=integration ./...` then
   `go test -tags=integration ./internal/adapters/outbound/kafka` (+
-  `kafkacatalog`, `kafkacptschedule`) against a **Testcontainers** Kafka
+  `kafkacatalog`, `kafkacptschedule`, `kafkapathcapacity`, and
+  `./internal/adapters/inbound/kafka`) against a **Testcontainers** Kafka
   broker (no external Kafka service in this workflow — do not write a
-  `KAFKA_BROKERS`-skip-gated test, it silently no-ops in CI).
+  `KAFKA_BROKERS`-skip-gated test, it silently no-ops in CI). NOTE: the
+  job provisions no Postgres either, so the `DATABASE_URL`/
+  `ANALYTICS_DATABASE_URL`-skip-gated Postgres integration tests
+  (`outbound/postgres`, `outbound/analyticsstore`) are compiled/vetted but
+  never executed in CI.
 - **`mutation-fast`** — blocking gremlins subset over `internal/domain/order`
   only, every push/PR. Thresholds in `.gremlins.yaml` (gremlins fails when
   the measured value is `<=` the threshold, so the threshold sits strictly
@@ -28,8 +33,22 @@
 - **`arch-test`** — `go test ./internal/architecture/... -v` (arch-go
   fitness tests: hexagonal dependency rule, analytics isolation, ports
   customer-owned).
-- **`docs-api-drift`** — regenerates the Docusaurus REST reference from
-  `apis/openapi.yaml` and fails the PR on any diff.
+- **`docs-api-drift`** — `npm run clean-api-docs order && npm run
+  gen-api-docs order` in `docs/`, then `git diff --exit-code -- docs/docs/
+  api-reference/rest`. **Known defect:** that step runs with
+  `working-directory: docs`, so the pathspec resolves to
+  `docs/docs/docs/api-reference/rest` (nonexistent) and the check always
+  passes — it let ADR-0020's `releaseHeldOrder` endpoint land with no
+  generated page. The working pathspec from `docs/` is
+  `docs/api-reference/rest`. Until the workflow is fixed, run the
+  procedure below by hand after any `apis/openapi.yaml` change.
+- **`web`** — builds `warehouse-ui-kit` (checked out at `develop`), then
+  `npm ci`, `npm run lint`, `npx tsc -b`, `npm test`, `npm run build` in
+  `web/`.
+- **`drift`** — advisory, `schedule`/`workflow_dispatch` only, never blocks
+  a PR: `deadcode`, `go mod tidy -diff`, `knip` over `web/`, and
+  `scripts/coverage-quality.py` (high-coverage functions with a surviving
+  gremlins mutant) written to the job summary.
 - **`helm-lint`** — `ct lint --charts charts/order-management` — runs ONLY
   for a `pull_request` with `base_ref == 'main'` (i.e. the develop→main
   release PR), never on develop pushes/PRs.
@@ -92,8 +111,8 @@ untouched fields. The reliable check is:
 ```bash
 cd docs
 npm ci
-npm run clean-api-docs   # removes every generated file first
-npm run gen-api-docs     # docusaurus gen-api-docs order — regenerates from apis/openapi.yaml
+npm run clean-api-docs order   # removes every generated file first
+npm run gen-api-docs order     # regenerates from apis/openapi.yaml
 cd ..
 git status --short docs/docs/api-reference   # non-empty => real drift existed
 ```
@@ -118,7 +137,7 @@ reserved for the fleet aggregator repo per the fleet's docs convention).
 Instead, `apis/asyncapi.yaml`'s channels/events are documented **narratively**
 in plain markdown under `docs/docs/ddd/domain-events.md`,
 `docs/docs/analytics/order-funnel-report.md`, and the relevant ADRs
-(0005, 0006, 0008). When editing `apis/asyncapi.yaml` (new channel, renamed
+(0005, 0006, 0008, 0018, 0019). When editing `apis/asyncapi.yaml` (new channel, renamed
 event, changed payload shape), grep those narrative docs for the old
 name(s) and update them by hand — there is no automated generation or CI
 gate to catch this drift, unlike the OpenAPI case above.
